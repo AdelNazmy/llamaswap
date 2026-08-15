@@ -7,21 +7,35 @@ command:
     - "--model"
     - "/opt/models/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf"
     - "--ctx-size"
-    - "8192"
+    - "200000"
     - "--n-gpu-layers"
-    - "99"
+    - "999"
+    - "--cache-type-k"
+    - "q8_0"
+    - "--cache-type-v"
+    - "q8_0"
     - "--flash-attn"
     - "on"
+    - "--parallel"
+    - "1"
+    - "-lv"
+    - "4"
+    - "--spec-type"
+    - "ngram-mod"
+    - "--log-colors"
+    - "on"
+    - "--reasoning-budget"
+    - "1024"
+    - "--kv-unified"
+    - "--cache-idle-slots"
+    - "--mmap"
+    - "--mlock"
     - "--jinja"
-    - "--batch-size"
-    - "2048"
-    - "--ubatch-size"
-    - "512"
   env:
     CUDA_VISIBLE_DEVICES: "0"
 host: 127.0.0.1
 port: 8101
 meta:
-  context_length: 8192
+  context_length: 200000
   family: qwen
   capabilities: [chat]

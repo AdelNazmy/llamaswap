@@ -1,0 +1,31 @@
+# Persistent embedding model: Octen Embedding 0.6B (Q8_0)
+# Managed by the EmbeddingManager, NOT the LLM swap path. Runs for the
+# lifetime of the proxy on its own port; only stopped to make VRAM room
+# for a chat LLM, and best-effort relaunched afterwards.
+name: octen-embedding-0.6b
+description: "Octen Embedding 0.6B, Q8_0 quant, dedicated embedding server"
+role: embedding
+command:
+  binary: /opt/llama.cpp/build/bin/llama-server
+  args:
+    - "--model"
+    - "/opt/models/Octen-Embedding-0.6B-Q8_0.gguf"
+    - "--embedding"
+    - "--ctx-size"
+    - "8192"
+    - "--n-gpu-layers"
+    - "99"
+    - "--flash-attn"
+    - "on"
+    - "--batch-size"
+    - "2048"
+    - "--ubatch-size"
+    - "512"
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8102
+meta:
+  context_length: 8192
+  family: octen
+  capabilities: [embeddings]

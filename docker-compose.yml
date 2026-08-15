@@ -1,0 +1,27 @@
+services:
+  llamaswap:
+    image: llamaswap:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        llamacpp-bin: /opt/llama.cpp/build/bin
+    init: true
+    container_name: llamaswap
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      LLAMASWAP_HOST: "0.0.0.0"
+      LLAMASWAP_PORT: "11434"
+    volumes:
+      - /opt/models:/opt/models:ro
+      - ./backend:/app/backend
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu

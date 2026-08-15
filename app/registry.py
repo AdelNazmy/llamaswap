@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -32,6 +32,9 @@ class ModelConfig(BaseModel):
 
     name: str
     description: str = ""
+    # "llm" models are swapped in/out by the ProcessManager;
+    # "embedding" models are run persistently by the EmbeddingManager.
+    role: str = "llm"
     command: CommandSpec
     host: str = "127.0.0.1"
     port: int = 8101
@@ -114,6 +117,13 @@ class Registry:
 
     def names(self) -> list[str]:
         return list(self.models)
+
+    def embedding_config(self) -> Optional[ModelConfig]:
+        """The dedicated embedding model config, or None if not defined."""
+        for cfg in self.models.values():
+            if cfg.role == "embedding":
+                return cfg
+        return None
 
     def list_openai(self) -> list[dict[str, Any]]:
         return [self._to_openai(cfg) for cfg in self.models.values()]
