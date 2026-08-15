@@ -58,6 +58,7 @@ llamaswap/
 │   ├── proxy.py              # async reverse proxy (stream / non-stream)
 │   └── main.py               # FastAPI routes (OpenAI API)
 ├── requirements.txt
+├── docs/images/              # screenshots referenced by this README
 └── README.md
 ```
 
@@ -93,6 +94,50 @@ should use its own port, usually `8102`, plus `--embedding` in `args`.
 
 `host`/`port` are always enforced by the proxy (any `--host`/`--port` in
 `args` is stripped) so models never fight over the internal port.
+
+## Getting and compiling llama.cpp
+
+llamaswap does not bundle llama.cpp — each model YAML in `backend/` points at
+a `llama-server` binary you compile (or install) yourself. The default
+configs expect it at `/opt/llama.cpp/build/bin/llama-server`.
+
+Prerequisites for both backends: git, cmake (≥ 3.13) and a C++17 compiler
+(`g++`/`clang++`).
+
+### CUDA (NVIDIA)
+
+Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+(`nvcc`) and your GPU driver, then:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build --config Release -j
+```
+
+### ROCm (AMD)
+
+Install [ROCm](https://rocm.docs.amd.com/) (`hipcc`) and your GPU driver,
+then:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIPBLAS=ON
+cmake --build build --config Release -j
+```
+
+Notes:
+
+- The binary ends up at `build/bin/llama-server`; either run llama.cpp from
+  its clone location or move it and update `binary:` in the model YAMLs.
+- Verify the GPU backend before pointing llamaswap at it — the server logs
+  `CUDA is initialized` (or the ROCm equivalent) on startup. The proxy
+  mirrors those lines into its own log, so a missing/wrong backend shows up
+  there as `llama-server[<model>]: ...`.
+- The Docker image in this repo ships a prebuilt CUDA `llama-server`
+  instead, so the steps above are only for building it locally.
 
 ## Run
 
@@ -203,3 +248,6 @@ print(emb.data[0].embedding[:8])
 - `llama-server` stderr is mirrored to the proxy log as
   `llama-server[<model>]: ...`; embedding server lines are tagged
   `llama-server[embed <model>]: ...`.
+
+## Utilization and logs
+  ![llama-server starting with the CUDA backend](docs/images/llama-server-cuda.png)
