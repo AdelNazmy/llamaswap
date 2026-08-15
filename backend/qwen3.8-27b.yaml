@@ -1,0 +1,28 @@
+# Text chat model: Qwen3.8 27B (Q3_K_XL)
+name: qwen3.8-27b
+description: "Qwen3.8 27B dense, Q3_K_XL quant, text chat"
+command:
+  binary: /opt/llama.cpp/build/bin/llama-server
+  args:
+    - "--model"
+    - "/opt/models/Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    - "--ctx-size"
+    - "8192"
+    - "--n-gpu-layers"
+    - "99"
+    - "--flash-attn"
+    - "on"
+    - "--jinja"
+    - "--batch-size"
+    - "2048"
+    - "--ubatch-size"
+    - "512"
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+# internal llama-server binding (enforced by the proxy; one model at a time)
+host: 127.0.0.1
+port: 8101
+meta:
+  context_length: 8192
+  family: qwen
+  capabilities: [chat]
