@@ -64,11 +64,11 @@ class ProcessManager:
     def _health_url(self, cfg: ModelConfig) -> str:
         return f"http://{cfg.host}:{cfg.port}/health"
 
-    def _stderr_line(self, chunk: bytes) -> None:
+    def _stderr_line(self, entry: "RunningModel", chunk: bytes) -> None:
         for line in chunk.decode(errors="replace").splitlines():
             line = line.strip()
             if line:
-                logger.info("llama-server[%s]: %s", self._current.name, line)
+                logger.info("llama-server[%s]: %s", entry.name, line)
 
     async def _wait_healthy(self, cfg: ModelConfig,
                             proc: asyncio.subprocess.Process) -> None:
@@ -163,7 +163,7 @@ class ProcessManager:
         try:
             async for chunk in entry.process.stderr:
                 if chunk:
-                    self._stderr_line(chunk)
+                    self._stderr_line(entry, chunk)
         except asyncio.CancelledError:
             raise
         rc = await entry.process.wait()
