@@ -95,7 +95,16 @@ should use its own port, usually `8102`, plus `--embedding` in `args`.
 `host`/`port` are always enforced by the proxy (any `--host`/`--port` in
 `args` is stripped) so models never fight over the internal port.
 
-## Getting and compiling llama.cpp
+# Installation
+## LLMs download
+
+```bash
+mkdir -p /opt/models
+hf download hf://unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf --local-dir /opt/models
+hf download hf://unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --local-dir /opt/models
+```
+
+### Getting and compiling llama.cpp
 
 llamaswap does not bundle llama.cpp — each model YAML in `backend/` points at
 a `llama-server` binary you compile (or install) yourself. The default
@@ -110,6 +119,8 @@ Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
 (`nvcc`) and your GPU driver, then:
 
 ```bash
+mkdir -p /opt/llamacpp
+cd /opt/llamacpp
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
@@ -120,7 +131,6 @@ cmake --build build --config Release -j
 
 Install [ROCm](https://rocm.docs.amd.com/) (`hipcc`) and your GPU driver,
 then:
-
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
@@ -128,6 +138,22 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIPBLAS=ON
 cmake --build build --config Release -j
 ```
 
+### Embedding model tensores download amd GGUF convert
+```bash
+hf download Octen/Octen-Embedding-0.6B --local-dir /opt/models/Octen-Embedding-0.6B
+
+python3 /opt/llama.cpp/convert_hf_to_gguf.py \
+  /opt/models/Octen-Embedding-0.6B \
+  --outtype q8_0 \
+  --outfile /opt/models/Octen-Embedding-0.6B-Q8_0.gguf
+```
+### LlamaSwap Docker Instllation
+```bash
+cd ~
+git clone https://github.com/AdelNazmy/llamaswap.git
+cd llamaswap
+docker compose up --build
+```
 Notes:
 
 - The binary ends up at `build/bin/llama-server`; either run llama.cpp from
@@ -139,8 +165,17 @@ Notes:
 - The Docker image in this repo ships a prebuilt CUDA `llama-server`
   instead, so the steps above are only for building it locally.
 
-## Run
+## Local Run
+### Install Prerequisites
+```bash
+cd ~
+pip install uv
+uv venv .venv -p3.12 --seed
+source .venv/bin/activate
+uv pip install -r ~/llamaswap/requirements.txt
+```
 
+### Launch Application
 ```bash
 cd ~/llamaswap
 ~/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 11434
