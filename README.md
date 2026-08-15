@@ -1,4 +1,4 @@
-# llamaswap
+# LlamaSwap
 
 An OpenAI-compatible proxy in front of `llama-server` (llama.cpp) with a
 YAML-driven model registry. Point any OpenAI client at it and switch chat
