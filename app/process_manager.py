@@ -16,7 +16,7 @@ import httpx
 
 from .registry import ModelConfig, UnknownModelError
 
-logger = logging.getLogger("custom_ollama.process_manager")
+logger = logging.getLogger("llamaswap.process_manager")
 
 
 class ModelState(str, Enum):

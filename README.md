@@ -1,4 +1,4 @@
-# custom_ollama
+# llamaswap
 
 An OpenAI-compatible proxy in front of `llama-server` (llama.cpp) with a
 YAML-driven model registry. Point any OpenAI client at it and switch models
@@ -11,7 +11,7 @@ transparently with the launch command of the requested model.
 OpenAI client (port 11434)
         │  /v1/chat/completions, /v1/embeddings, /v1/models
         ▼
-custom_ollama (FastAPI)
+llamaswap (FastAPI)
   • model registry        ← backend/*.yaml
   • process manager       ← start / stop / swap llama-server
         │  HTTP (streaming pass-through)
@@ -33,13 +33,13 @@ llama-server (127.0.0.1:8101, one model at a time)
 ## Layout
 
 ```
-custom_ollama/
+llamaswap/
 ├── backend/                  # model registry — one YAML per model
 │   ├── qwen3.8-27b.yaml
 │   ├── qwen3.6-35b.yaml
 │   └── qwen3.6-35b-vision.yaml
 ├── app/
-│   ├── config.py             # settings (env prefix CUSTOM_OLLAMA_)
+│   ├── config.py             # settings (env prefix LLAMASWAP_)
 │   ├── registry.py           # YAML → validated ModelConfig objects
 │   ├── process_manager.py    # subprocess lifecycle + health checks
 │   ├── proxy.py              # async reverse proxy (stream / non-stream)
@@ -79,7 +79,7 @@ meta:
 ## Run
 
 ```bash
-cd ~/custom_ollama
+cd ~/llamaswap
 ~/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 11434
 ```
 
@@ -89,9 +89,9 @@ Or with an explicit python:
 ~/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 11434
 ```
 
-Environment overrides (prefix `CUSTOM_OLLAMA_`): `CUSTOM_OLLAMA_PORT`,
-`CUSTOM_OLLAMA_BACKEND_DIR`, `CUSTOM_OLLAMA_STARTUP_TIMEOUT`,
-`CUSTOM_OLLAMA_STOP_TIMEOUT`, `CUSTOM_OLLAMA_LOG_LEVEL`.
+Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
+`LLAMASWAP_BACKEND_DIR`, `LLAMASWAP_STARTUP_TIMEOUT`,
+`LLAMASWAP_STOP_TIMEOUT`, `LLAMASWAP_LOG_LEVEL`.
 
 ## API
 

@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
-logger = logging.getLogger("custom_ollama.registry")
+logger = logging.getLogger("llamaswap.registry")
 
 
 class CommandSpec(BaseModel):
@@ -128,7 +128,7 @@ class Registry:
             "id": cfg.name,
             "object": "model",
             "created": 0,
-            "owned_by": "custom_ollama",
+            "owned_by": "llamaswap",
             "description": cfg.description,
             "context_length": meta.context_length,
             "family": meta.family,

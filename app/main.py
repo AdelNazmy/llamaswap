@@ -1,4 +1,4 @@
-"""custom_ollama — an OpenAI-compatible proxy in front of llama-server.
+"""llamaswap — an OpenAI-compatible proxy in front of llama-server.
 
 Model registry lives in backend/*.yaml; the requested model is launched
 (or swapped in) transparently on demand.
@@ -9,8 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import ValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import get_settings
 from .process_manager import ModelLoadError, ProcessManager
@@ -23,7 +22,7 @@ from .proxy import (
 from .registry import Registry, RegistryError, UnknownModelError
 
 ROOT = Path(__file__).resolve().parent.parent
-logger = logging.getLogger("custom_ollama")
+logger = logging.getLogger("llamaswap")
 
 
 def _error(status: int, message: str, etype: str = "invalid_request_error"):
@@ -47,7 +46,7 @@ async def lifespan(app: FastAPI):
         health_interval=settings.health_interval,
     )
     logger.info(
-        "custom_ollama ready on %s:%d (%d models)",
+        "llamaswap ready on %s:%d (%d models)",
         settings.host, settings.port, len(app.state.registry.models),
     )
     try:
@@ -56,7 +55,7 @@ async def lifespan(app: FastAPI):
         await app.state.manager.shutdown()
 
 
-app = FastAPI(title="custom_ollama", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="llamaswap", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -96,7 +95,7 @@ async def reload_registry(request: Request):
 
 async def _ensure_and_route(
     request: Request, path: str,
-) -> Response:
+):
     registry: Registry = request.app.state.registry
     manager: ProcessManager = request.app.state.manager
     body = await request.body()

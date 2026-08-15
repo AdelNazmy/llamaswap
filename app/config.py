@@ -1,4 +1,4 @@
-"""Application settings, overridable via env vars prefixed CUSTOM_OLLAMA_."""
+"""Application settings, overridable via env vars prefixed LLAMASWAP_."""
 
 from functools import lru_cache
 
@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="CUSTOM_OLLAMA_", env_file=".env", extra="ignore"
+        env_prefix="LLAMASWAP_", env_file=".env", extra="ignore"
     )
 
     # Proxy (OpenAI-compatible) listener

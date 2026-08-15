@@ -14,19 +14,9 @@ from typing import Any, AsyncIterator, Optional
 
 import httpx
 
-logger = logging.getLogger("custom_ollama.proxy")
+logger = logging.getLogger("llamaswap.proxy")
 
 UPSTREAM_TIMEOUT = 600.0
-
-
-class UpstreamError(Exception):
-    """Upstream returned a non-2xx response."""
-
-    def __init__(self, status: int, payload: Any, raw: bytes):
-        self.status = status
-        self.payload = payload
-        self.raw = raw
-        super().__init__(f"upstream returned {status}")
 
 
 def _model_field(obj: Any) -> Optional[str]:
@@ -85,9 +75,9 @@ def _rewrite_chunk(chunk: bytes, request_model: str) -> bytes:
                             for c in obj["choices"]:
                                 if isinstance(c, dict) and "model" not in c:
                                     c["model"] = request_model
-                        data = json.dumps(obj, separators=(",", ":"),
-                                          ensure_ascii=False).encode()
-                    line = b"data: " + data
+                        line = b"data: " + json.dumps(
+                            obj, separators=(",", ":"), ensure_ascii=False
+                        ).encode()
                 except (ValueError, TypeError):
                     pass
         out += line
