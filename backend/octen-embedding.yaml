@@ -12,7 +12,7 @@ command:
     - "/opt/models/Octen-Embedding-0.6B-Q8_0.gguf"
     - "--embedding"
     - "--ctx-size"
-    - "8192"
+    - "4096"
     - "--n-gpu-layers"
     - "99"
     - "--flash-attn"
