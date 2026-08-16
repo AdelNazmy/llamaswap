@@ -7,7 +7,7 @@ command:
     - "--model"
     - "/opt/models/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf"
     - "--ctx-size"
-    - "200000"
+    - "150000"
     - "--n-gpu-layers"
     - "999"
     - "--cache-type-k"
@@ -24,6 +24,10 @@ command:
     - "ngram-mod"
     - "--log-colors"
     - "on"
+    - "--batch-size"
+    - "1024"
+    - "--ubatch-size"
+    - "256"
     - "--reasoning-budget"
     - "1024"
     - "--kv-unified"
@@ -36,6 +40,6 @@ command:
 host: 127.0.0.1
 port: 8101
 meta:
-  context_length: 200000
+  context_length: 150000
   family: qwen
   capabilities: [chat]
