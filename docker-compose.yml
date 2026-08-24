@@ -12,8 +12,16 @@ services:
     ports:
       - "11434:11434"
     environment:
-      LLAMASWAP_HOST: "0.0.0.0"
-      LLAMASWAP_PORT: "11434"
+      # Each value uses ${VAR:-default} so a .env file (or shell env) can
+      # override any of them. Defaults mirror app/config.py; see .env.example.
+      LLAMASWAP_HOST: "${LLAMASWAP_HOST:-0.0.0.0}"
+      LLAMASWAP_PORT: "${LLAMASWAP_PORT:-11434}"
+      LLAMASWAP_BACKEND_DIR: "${LLAMASWAP_BACKEND_DIR:-backend}"
+      LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-600.0}"
+      LLAMASWAP_STOP_TIMEOUT: "${LLAMASWAP_STOP_TIMEOUT:-30.0}"
+      LLAMASWAP_HEALTH_INTERVAL: "${LLAMASWAP_HEALTH_INTERVAL:-1.0}"
+      LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
+      LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
     volumes:
       - /opt/models:/opt/models:ro
       - ./backend:/app/backend

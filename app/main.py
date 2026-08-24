@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
         startup_timeout=settings.startup_timeout,
         stop_timeout=settings.stop_timeout,
         health_interval=settings.health_interval,
+        idle_unload_seconds=settings.idle_unload_seconds,
     )
     # Persistent embedding server: launched at boot, kept running for the
     # lifetime of the proxy (only stopped to free VRAM for an LLM).

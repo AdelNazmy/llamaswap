@@ -43,12 +43,19 @@ class ProcessManager:
     """Starts, monitors and swaps the llama-server subprocess."""
 
     def __init__(self, startup_timeout: float, stop_timeout: float,
-                 health_interval: float):
+                 health_interval: float, idle_unload_seconds: float = 0.0):
         self._startup_timeout = startup_timeout
         self._stop_timeout = stop_timeout
         self._health_interval = health_interval
+        self._idle_unload_seconds = idle_unload_seconds
         self._lock = asyncio.Lock()
         self._current: Optional[RunningModel] = None
+        self._last_activity: float = 0.0
+        self._idle_task: Optional[asyncio.Task] = None
+        if idle_unload_seconds > 0:
+            self._idle_task = asyncio.get_running_loop().create_task(
+                self._idle_watcher()
+            )
 
     @property
     def current_name(self) -> Optional[str]:
@@ -59,7 +66,14 @@ class ProcessManager:
         cur = self._current
         if cur is None:
             return {"state": "stopped", "model": None, "detail": ""}
-        return {"state": cur.state.value, "model": cur.name, "detail": cur.detail}
+        info: dict[str, Any] = {
+            "state": cur.state.value, "model": cur.name, "detail": cur.detail,
+        }
+        if cur.state is ModelState.READY and self._idle_unload_seconds > 0:
+            elapsed = asyncio.get_running_loop().time() - self._last_activity
+            info["idle_seconds"] = max(0.0, round(elapsed, 1))
+            info["idle_unload_seconds"] = self._idle_unload_seconds
+        return info
 
     def _health_url(self, cfg: ModelConfig) -> str:
         return f"http://{cfg.host}:{cfg.port}/health"
@@ -120,6 +134,7 @@ class ProcessManager:
         """Make sure `name` is the loaded model; returns (name, port)."""
         cfg = registry.get(name)  # raises UnknownModelError
         async with self._lock:
+            self._last_activity = asyncio.get_running_loop().time()
             cur = self._current
             if cur is not None and cur.name == name and cur.state is ModelState.READY:
                 return name, cfg.port
@@ -175,6 +190,38 @@ class ProcessManager:
                 entry.name, rc,
             )
 
+    async def _idle_watcher(self) -> None:
+        """Unload the loaded model once it has been idle past the timeout."""
+        try:
+            while True:
+                await asyncio.sleep(self._health_interval)
+                if self._current is None:
+                    continue
+                elapsed = asyncio.get_running_loop().time() - self._last_activity
+                if elapsed < self._idle_unload_seconds:
+                    continue
+                async with self._lock:
+                    cur = self._current
+                    if cur is None or cur.state is not ModelState.READY:
+                        continue
+                    elapsed = asyncio.get_running_loop().time() - \
+                        self._last_activity
+                    if elapsed < self._idle_unload_seconds:
+                        continue
+                    logger.info(
+                        "unloading model '%s' after %.0fs idle",
+                        cur.name, elapsed,
+                    )
+                    await self._stop_current()
+        except asyncio.CancelledError:
+            raise
+
     async def shutdown(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except asyncio.CancelledError:
+                pass
         async with self._lock:
             await self._stop_current()
