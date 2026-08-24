@@ -10,7 +10,7 @@ services:
     container_name: llamaswap
     restart: unless-stopped
     ports:
-      - "11434:11434"
+      - ${LLAMASWAP_PORT:-11434}:11434
     environment:
       # Each value uses ${VAR:-default} so a .env file (or shell env) can
       # override any of them. Defaults mirror app/config.py; see .env.example.
