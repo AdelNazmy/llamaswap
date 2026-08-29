@@ -45,7 +45,70 @@ llamaswap (FastAPI)
         ├── audiocpp_server ASR (127.0.0.1:8104, on-demand, swappable)
         └── whisper-server ASR  (127.0.0.1:8105, on-demand, swappable)
 ```
+## The flow, simplified
 
+```mermaid
+flowchart LR
+    C["Any OpenAI client<br/>(SDK · curl · Open WebUI)"] --> L[("llamaswap<br/>:11434/v1")]
+
+    subgraph G["one GPU"]
+        direction TB
+        CH["CHAT<br/>one model at a time"]
+        EM["EMBED<br/>persistent"]
+        AU["AUDIO<br/>TTS + ASR"]
+        V["VRAM guard<br/>(3 deterministic rules)"]
+    end
+
+    L --> CH
+    L --> EM
+    L --> AU
+
+    CH -->|"swap per request:<br/>stop → boot → serve"| B1["llama-server"]
+    EM -->|"own port, never evicted"| B2["llama-server (embed)"]
+    AU -->|"swap backend per request"| B3["audiocpp · whisper.cpp"]
+
+    V -. "① big LLM ⇒ unload TTS / ASR first" .-> CH
+    V -. "② TTS + ASR loaded ⇒ serve smallest LLM" .-> CH
+    V -. "③ big LLM loaded ⇒ reject audio (409)" .-> AU
+
+    CH -. "idle 300s" .-> OFF["unload → VRAM freed"]
+    AU -. "idle 300s" .-> OFF
+    EM -. "survives LLM swaps" .-> ON["embeddings stay up"]
+```
+
+Read it left to right:
+
+1. **One door, one dialect.** Any OpenAI client talks to `:11434/v1` — chat,
+   embeddings, audio, models — nothing else changes.
+2. **CHAT** = single `llama-server`. A request for a *different* model stops
+   the running one, boots the new one from its YAML, waits for `/health`,
+   then serves. A 13 GB model never needs to fit twice.
+3. **EMBED** = its own persistent process on its own port, so embeddings
+   never disturb — and are never evicted by — the loaded chat model.
+4. **AUDIO** = per-role TTS and ASR servers that boot on first use and swap
+   backends per request (Qwen3-ASR ↔ whisper.cpp; OuteTTS ↔ Supertonic ↔
+   Qwen3-TTS voice clone). Ollama has none of this natively.
+5. **VRAM guard** — three deterministic rules (below) instead of hoping the
+   GPU evicts the right thing.
+
+### The VRAM guard — three deterministic rules
+
+No `OOM` roulette. Three rules keep a 16 GB card from ever being
+over-subscribed (each a toggle, all on by default):
+
+1. **Unload on big model.** A request for a "big" chat LLM — anything bigger
+   than the smallest weights file — stops the running TTS/ASR servers first
+   (the embedding server stays up), so the model always fits.
+2. **Downgrade while audio is loaded.** When TTS *and* ASR are both
+   resident, chat is transparently served by the smallest LLM, whatever
+   model was asked for.
+3. **Block audio while a big LLM is resident.** While a big model holds the
+   GPU, `/v1/audio/*` returns `409` until it idle-unloads.
+
+> `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM` · `LLAMASWAP_AUDIO_VRAM_GUARD` ·
+> `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM` — all default to `true`.
+
+## The flow detailed
 - **One chat LLM at a time.** A 13 GB model does not fit twice on a 16 GB
   GPU, so when a request names a different chat model than the one currently
   loaded, the proxy gracefully stops the running chat `llama-server`, spawns
