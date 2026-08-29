@@ -229,6 +229,18 @@ class AudioManager:
             await self._launch(cfg)
             return cfg
 
+    async def unload(self) -> bool:
+        """Stop the loaded server for this role, if any.
+
+        Non-destructive: the idle watcher stays armed, so a later request
+        simply boots the role again. Returns True if a server was running
+        (or loading) and is now stopped.
+        """
+        async with self._lock:
+            had = self._current is not None
+            await self._stop_current()
+            return had
+
     async def _wait_loading_settled(self, prev: _RunningAudio) -> None:
         deadline = asyncio.get_running_loop().time() + self._startup_timeout + 30.0
         while self._current is prev and prev.state is AudioState.LOADING:

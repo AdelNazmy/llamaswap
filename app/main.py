@@ -192,6 +192,31 @@ async def reload_registry(request: Request):
     return {"reloaded": True, "models": request.app.state.registry.names()}
 
 
+@app.post("/v1/reset")
+async def reset(request: Request):
+    """Unload every loaded backend: chat LLM, TTS/ASR audio servers, and
+    the persistent embedding server. Everything boots again on its next
+    request (the embedding server also best-effort relaunches after a
+    chat request, per its persistent role)."""
+    chat_manager = request.app.state.manager
+    audio_managers = request.app.state.audio_managers
+    embedding_manager = request.app.state.embedding_manager
+
+    chat = await chat_manager.unload()
+    audio = {
+        role: await mgr.unload() for role, mgr in audio_managers.items()
+    }
+    emb = False
+    if embedding_manager is not None:
+        emb = embedding_manager.is_running or embedding_manager.is_loading
+        await embedding_manager.stop()
+
+    return {
+        "reset": True,
+        "unloaded": {"chat": chat, "audio": audio, "embedding": emb},
+    }
+
+
 async def _ensure_and_route(
     request: Request, path: str,
 ):

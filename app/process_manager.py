@@ -143,6 +143,18 @@ class ProcessManager:
             await self._launch(cfg)
             return name, cfg.port
 
+    async def unload(self) -> bool:
+        """Stop the currently loaded chat LLM, if any.
+
+        Non-destructive: the idle watcher stays armed, so a later request
+        simply boots the model again. Returns True if a model was running
+        (or loading) and is now stopped.
+        """
+        async with self._lock:
+            had = self._current is not None
+            await self._stop_current()
+            return had
+
     async def _launch(self, cfg: ModelConfig) -> None:
         argv = cfg.build_argv()
         logger.info(
