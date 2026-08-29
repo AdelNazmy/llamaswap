@@ -17,9 +17,11 @@ LLM:
 
 While tts AND asr are both loaded, a VRAM guard substitutes the smallest
 chat LLM for any requested chat model (see Settings.audio_vram_guard).
-The inverse guard also holds: while a "big" chat LLM (any LLM other than
-the smallest by weights-file size) is loaded, TTS/ASR requests are
-rejected with 409 (see Settings.block_audio_on_big_llm).
+Requesting a "big" chat LLM (any LLM other than the smallest by
+weights-file size) unloads the running TTS/ASR servers first to free VRAM,
+leaving the embedding server up (see Settings.unload_audio_on_big_llm);
+conversely, while a big chat LLM is loaded, TTS/ASR requests are rejected
+with 409 (see Settings.block_audio_on_big_llm).
 """
 
 import asyncio
@@ -247,16 +249,26 @@ async def _ensure_and_route(
             "/v1/audio/transcriptions instead",
         )
         return JSONResponse(status_code=status, content=payload)
+    settings: Settings = request.app.state.settings
+    smallest = registry.smallest_llm()
+    # Big-model request: stop TTS/ASR first to free VRAM (the embedding
+    # server stays up). The big model then loads instead of being
+    # downgraded by the audio_vram_guard below. Disable via
+    # LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM=false.
+    if settings.unload_audio_on_big_llm and smallest is not None \
+            and model != smallest:
+        logger.info("big model '%s' requested; unloading TTS/ASR", model)
+        await asyncio.gather(*(
+            mgr.unload() for mgr in request.app.state.audio_managers.values()
+        ))
     # VRAM guard: while BOTH audio roles are loaded, only the smallest
     # chat LLM may be served (TTS + ASR + a big LLM may not fit on one
     # GPU). The requested model is transparently substituted and the swap
     # happens as usual; disable via LLAMASWAP_AUDIO_VRAM_GUARD=false.
-    settings: Settings = request.app.state.settings
     if settings.audio_vram_guard:
         tts_mgr = request.app.state.audio_managers["tts"]
         asr_mgr = request.app.state.audio_managers["asr"]
         if tts_mgr.is_running and asr_mgr.is_running:
-            smallest = registry.smallest_llm()
             if smallest is not None and smallest != model:
                 logger.warning(
                     "audio_vram_guard: tts+asr loaded; serving smallest "

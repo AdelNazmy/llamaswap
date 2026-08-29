@@ -34,6 +34,8 @@ services:
       # Reject TTS/ASR (409) while a big chat LLM (anything other than the
       # smallest by weights-file size) is loaded.
       LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM: "${LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM:-true}"
+      # Unload TTS/ASR when a big chat LLM is requested (embedding stays up).
+      LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM: "${LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM:-true}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
     volumes:

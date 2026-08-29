@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # rejected with 409 so audio cannot stack on top of a large model.
     # Set false to allow audio alongside a big LLM.
     block_audio_on_big_llm: bool = True
+    # When a "big" chat LLM (any LLM other than the smallest by
+    # weights-file size) is requested, stop the running TTS/ASR servers
+    # first to free VRAM (the embedding server stays up). Set false to
+    # keep audio loaded instead — then audio_vram_guard may downgrade
+    # the request.
+    unload_audio_on_big_llm: bool = True
     # Where the proxy stages uploaded audio files for backends whose
     # transcription API takes a server-side path (audio.cpp). Must be
     # writable by llamaswap AND readable by the backend process.

@@ -18,11 +18,13 @@ TTS/ASR server are on-demand: nothing boots until a request names them,
 and each is stopped again after `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default
 300 s) with no requests — the same idle-unload policy everywhere.
 
-A **two-way VRAM guard** keeps the GPU from being oversubscribed: while
-both TTS and ASR are loaded, chat is transparently served by the smallest
-LLM; conversely, while a bigger (non-smallest) chat LLM is loaded, TTS/ASR
-requests are rejected with `409` (see `LLAMASWAP_AUDIO_VRAM_GUARD` and
-`LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`).
+A three-part VRAM policy keeps the GPU from being oversubscribed:
+requesting a "big" chat LLM (any model larger than the smallest) unloads
+the running TTS/ASR servers first — the embedding server stays up — so the
+big model fits; while both TTS and ASR are loaded, chat is served by the
+smallest LLM; and while a big chat LLM is loaded, TTS/ASR requests are
+rejected with `409` (see `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`,
+`LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`).
 
 ## How it works
 
@@ -56,11 +58,17 @@ llamaswap (FastAPI)
 - **Resource fallback.** If a chat model fails to load while the embedding
   server is running, llamaswap stops the embedding server, retries the chat
   load once, and then best-effort relaunches embeddings in the background.
+- **VRAM policy (unload on big request).** When a request names a "big"
+  chat LLM (any model other than the smallest by weights-file size),
+  llamaswap stops the running TTS/ASR servers first to free VRAM — the
+  embedding server stays up — then loads the big model. Controlled by
+  `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM` (default true).
 - **VRAM guard (chat direction).** While tts AND asr servers are both
   loaded, only the smallest chat LLM (smallest weights file on disk) is
   served — a request for a bigger chat model transparently loads the
-  smallest one instead, and the audio servers keep running. Once either
-  audio role idle-unloads, normal model selection resumes. Controlled by
+  smallest one instead. (By default the unload rule above frees the audio
+  first, so this downgrade mainly applies when
+  `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM=false`.) Controlled by
   `LLAMASWAP_AUDIO_VRAM_GUARD` (default true).
 - **VRAM guard (audio direction).** While a "big" chat LLM (any model
   other than the smallest by weights-file size) is loaded — or mid-load —
@@ -87,6 +95,57 @@ llamaswap (FastAPI)
   audio.cpp's transcription endpoint takes a server-side file path
   (`request_format: json_path`), so llamaswap saves the uploaded audio and
   rewrites the request. Clients always talk plain OpenAI.
+
+### Request flow
+
+```mermaid
+flowchart TD
+    IN["OpenAI-compatible request (port 11434)"] --> R{Route by path}
+
+    R -->|"/v1/chat/completions /v1/completions"| CH
+    R -->|"/v1/embeddings"| EM
+    R -->|"/v1/audio/speech /transcriptions ..."| AU
+    R -->|"/v1/reset"| RS
+    R -->|"/v1/models /health"| OUT
+
+    subgraph CH["Chat path"]
+        CH1["extract model from body"] --> CH2{"known and role = llm?"}
+        CH2 -->|"no"| CH2x["400 / 404"]
+        CH2 -->|"yes"| CH3{"big model requested?<br/>model != smallest"}
+        CH3 -->|"yes — unload_audio_on_big_llm"| CH4["unload TTS + ASR<br/>embedding stays up"]
+        CH3 -->|"no"| CH5{"both TTS and ASR loaded?"}
+        CH4 --> CH5
+        CH5 -->|"yes — audio_vram_guard"| CH6["serve smallest LLM instead"]
+        CH5 -->|"no"| CH7
+        CH6 --> CH7
+        CH7["ProcessManager: stop / swap / boot<br/>chat llama-server, await /health"] --> CH8["proxy JSON / SSE, rewrite model field"]
+        CH8 --> OUT
+        CH7 -.->|"load failed + embedding running"| CH9["stop embedding, retry once, relaunch in background"]
+    end
+
+    subgraph AU["Audio path (TTS / ASR)"]
+        AU1["extract model<br/>default: first of role"] --> AU2{"loaded chat model is big?"}
+        AU2 -->|"yes — block_audio_on_big_llm"| AU3["409 audio blocked"]
+        AU2 -->|"no"| AU4["AudioManager: boot / swap<br/>TTS or ASR server, await /health"]
+        AU4 --> AU5["translate dialect<br/>ffmpeg transcode response_format"]
+        AU5 --> OUT
+    end
+
+    subgraph EM["Embedding path"]
+        EM1["persistent embedding server"] --> EM2{"running?"}
+        EM2 -->|"no"| EM3["ensure_running (relaunch)"]
+        EM3 --> EM4["proxy to embedding server"]
+        EM2 -->|"yes"| EM4
+        EM4 --> OUT
+    end
+
+    subgraph RS["Reset"]
+        RS1["unload chat + TTS + ASR + embedding"] --> RS2["return post-reset /health"]
+        RS2 --> OUT
+    end
+
+    OUT(["response to client"])
+```
 
 ## Layout
 
@@ -488,7 +547,7 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_BACKEND_DIR`, `LLAMASWAP_STARTUP_TIMEOUT`,
 `LLAMASWAP_STOP_TIMEOUT`, `LLAMASWAP_LOG_LEVEL`,
 `LLAMASWAP_IDLE_UNLOAD_SECONDS`, `LLAMASWAP_AUDIO_VRAM_GUARD`,
-`LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`.
+`LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`, `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`.
 
 ## API
 
@@ -626,6 +685,11 @@ with open("speech.wav", "rb") as fh:
   start, the proxy still starts and reports the embedding state in
   `/health`. The chat LLM and TTS/ASR servers start on first use instead
   of booting with the proxy.
+- Requesting a "big" chat LLM (anything other than the smallest by
+  weights-file size) unloads any running TTS/ASR servers first to free
+  VRAM — the embedding server is left running. Disable with
+  `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM=false` (then the
+  `LLAMASWAP_AUDIO_VRAM_GUARD` downgrade applies instead).
 - While a "big" chat LLM (anything other than the smallest by
   weights-file size) is loaded, the proxy answers `/v1/audio/speech`,
   `/v1/audio/speech/stream`, `/v1/audio/transcriptions` and

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llamaswap — request flow</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0; padding: 2rem; color: #1f2937; background: #f9fafb;
+  }
+  .wrap { max-width: 1150px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+  .sub { color: #6b7280; margin: 0 0 1.5rem; font-size: 0.95rem; }
+  .card {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 10px;
+    padding: 1.25rem 1.5rem; overflow: auto;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  footer { margin-top: 1.25rem; color: #9ca3af; font-size: 0.85rem; }
+  code { background:#eef2f6; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <h1>llamaswap — request flow</h1>
+  <p class="sub">How an OpenAI-compatible request routes through the proxy, including the on-demand swap path and the three-part VRAM policy.</p>
+  <div class="card" id="diagram">Rendering diagram…</div>
+  <footer>
+    Guard toggles: <code>LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM</code> ·
+    <code>LLAMASWAP_AUDIO_VRAM_GUARD</code> ·
+    <code>LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM</code> — see README.
+  </footer>
+</div>
+<script>
+  const src = `flowchart TD
+    IN["OpenAI-compatible request (port 11434)"] --> R{Route by path}
+
+    R -->|"/v1/chat/completions /v1/completions"| CH
+    R -->|"/v1/embeddings"| EM
+    R -->|"/v1/audio/speech /transcriptions ..."| AU
+    R -->|"/v1/reset"| RS
+    R -->|"/v1/models /health"| OUT
+
+    subgraph CH["Chat path"]
+        CH1["extract model from body"] --> CH2{"known and role = llm?"}
+        CH2 -->|"no"| CH2x["400 / 404"]
+        CH2 -->|"yes"| CH3{"big model requested?<br/>model != smallest"}
+        CH3 -->|"yes — unload_audio_on_big_llm"| CH4["unload TTS + ASR<br/>embedding stays up"]
+        CH3 -->|"no"| CH5{"both TTS and ASR loaded?"}
+        CH4 --> CH5
+        CH5 -->|"yes — audio_vram_guard"| CH6["serve smallest LLM instead"]
+        CH5 -->|"no"| CH7
+        CH6 --> CH7
+        CH7["ProcessManager: stop / swap / boot<br/>chat llama-server, await /health"] --> CH8["proxy JSON / SSE, rewrite model field"]
+        CH8 --> OUT
+        CH7 -.->|"load failed + embedding running"| CH9["stop embedding, retry once, relaunch in background"]
+    end
+
+    subgraph AU["Audio path (TTS / ASR)"]
+        AU1["extract model<br/>default: first of role"] --> AU2{"loaded chat model is big?"}
+        AU2 -->|"yes — block_audio_on_big_llm"| AU3["409 audio blocked"]
+        AU2 -->|"no"| AU4["AudioManager: boot / swap<br/>TTS or ASR server, await /health"]
+        AU4 --> AU5["translate dialect<br/>ffmpeg transcode response_format"]
+        AU5 --> OUT
+    end
+
+    subgraph EM["Embedding path"]
+        EM1["persistent embedding server"] --> EM2{"running?"}
+        EM2 -->|"no"| EM3["ensure_running (relaunch)"]
+        EM3 --> EM4["proxy to embedding server"]
+        EM2 -->|"yes"| EM4
+        EM4 --> OUT
+    end
+
+    subgraph RS["Reset"]
+        RS1["unload chat + TTS + ASR + embedding"] --> RS2["return post-reset /health"]
+        RS2 --> OUT
+    end
+
+    OUT(["response to client"])`;
+
+  mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: "default" });
+  mermaid.render("llamaswapFlow", src)
+    .then(function (r) {
+      document.getElementById("diagram").innerHTML = r.svg;
+    })
+    .catch(function (err) {
+      document.getElementById("diagram").innerHTML =
+        "<pre style='color:#b91c1c;white-space:pre-wrap'>" + err.message + "</pre>";
+    });
+</script>
+</body>
+</html>
