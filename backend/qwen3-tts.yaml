@@ -37,5 +37,17 @@ host: 127.0.0.1
 port: 8107
 meta:
   family: qwen3_tts
-  capabilities: [tts]
+  capabilities: [tts, clone]
   request_format: json
+  # Qwen3-TTS Base clones a target voice from reference audio. The proxy
+  # injects this WAV as the audio.cpp `voice_ref` (resolved to an absolute
+  # server-side path at request time) for every /v1/audio/speech request,
+  # unless the client supplies its own `voice_ref`.
+  #
+  # Note: the Base model clones from a short clip (Qwen3-TTS is built for
+  # ~3-10 s references), so we use a trimmed 4.7 s segment of the original
+  # 8-minute script (the first clean phrase, cut at a natural pause).
+  reference_voice: data/script_scarlette_ref.wav
+  # Transcript of the reference clip — required by the Base model's
+  # in-context-learning (ICL) clone mode (it throws without it).
+  reference_text: "Today I'm excited to introduce a significant advancement in our software testing capabilities."

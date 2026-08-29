@@ -37,6 +37,7 @@ from .process_manager import ModelLoadError, ProcessManager
 from .proxy import (
     extract_model,
     extract_stream_flag,
+    json_inject_field,
     multipart_inject_field,
     proxy_json,
     proxy_raw,
@@ -44,7 +45,7 @@ from .proxy import (
     remove_audio_upload,
     save_audio_upload,
 )
-from .registry import Registry, RegistryError, UnknownModelError
+from .registry import ModelConfig, Registry, RegistryError, UnknownModelError
 
 ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("llamaswap")
@@ -345,6 +346,37 @@ async def embeddings(request: Request):
 # OpenAI audio API (TTS / ASR)
 # ---------------------------------------------------------------------------
 
+def _apply_clone_reference(cfg: ModelConfig, body: bytes) -> bytes:
+    """Inject backend clone-reference fields for voice-cloning TTS models.
+
+    Clone-capable audio.cpp backends (``qwen3_tts`` base, ``outetts``, ...)
+    synthesize from a reference WAV plus an optional transcript
+    (``voice_ref`` / ``reference_text``). Those are upstream request fields,
+    not OpenAI ``/v1/audio/speech`` parameters, so llamaswap keeps them off
+    the public surface and supplies them internally from the model config
+    (``meta.reference_voice`` / ``meta.reference_text``), only for models
+    declaring the ``clone`` capability. Preset-voice TTS models never get
+    them.
+
+    Returns ``body`` unchanged when the model is not clone-capable or has no
+    reference configured (or the client already supplied the field).
+    """
+    capabilities = getattr(cfg.meta, "capabilities", None) or []
+    if "clone" not in capabilities:
+        return body
+    reference_voice = getattr(cfg.meta, "reference_voice", None)
+    if reference_voice:
+        voice_path = Path(reference_voice)
+        voice_ref = str(
+            voice_path if voice_path.is_absolute() else ROOT / voice_path
+        )
+        body = json_inject_field(body, "voice_ref", voice_ref)
+    reference_text = getattr(cfg.meta, "reference_text", None)
+    if reference_text:
+        body = json_inject_field(body, "reference_text", reference_text)
+    return body
+
+
 async def _route_audio(
     request: Request, role: str, backend_path: str, *,
     expect_body_model: bool = True,
@@ -463,6 +495,16 @@ async def _route_audio(
             except (ValueError, TypeError):
                 pass
         backend_path = target
+
+    # audio.cpp clone-capable TTS backends clone a speaker from a reference
+    # WAV + transcript. Those are upstream request fields, not part of the
+    # OpenAI /v1/audio/speech surface, so they are injected internally here
+    # from the model config — and only for models that declare the `clone`
+    # capability (e.g. qwen3-tts, outetts). Preset-voice TTS models
+    # (e.g. supertonic-3) never receive them.
+    if backend_path in ("/v1/audio/speech", "/v1/audio/speech/stream") \
+            and "application/json" in content_type.lower():
+        out_body = _apply_clone_reference(cfg, out_body)
 
     try:
         if backend_path in ("/v1/audio/speech", "/v1/audio/speech/stream"):

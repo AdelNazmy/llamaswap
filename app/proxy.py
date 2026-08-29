@@ -174,6 +174,22 @@ def extract_stream_flag(body: bytes) -> bool:
     return bool(obj.get("stream"))
 
 
+def json_inject_field(body: bytes, key: str, value: Any) -> bytes:
+    """Inject ``key=value`` into a JSON request body (no-op if already set).
+
+    Returns the re-serialized body, or the original bytes unchanged when the
+    body is not a JSON object or already carries ``key``.
+    """
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(obj, dict) or key in obj:
+        return body
+    obj[key] = value
+    return json.dumps(obj).encode()
+
+
 def extract_model(body: bytes, content_type: str = "") -> Optional[str]:
     """Model id from a JSON body or a multipart/form-data upload."""
     try:
