@@ -10,7 +10,11 @@ services:
     container_name: llamaswap
     restart: unless-stopped
     ports:
+      # Published twice: the repo-default port (overridable via
+      # LLAMASWAP_PORT) plus the legacy graphify port 9090. The container
+      # itself always listens on 11434.
       - ${LLAMASWAP_PORT:-11434}:11434
+      - 9090:11434
     environment:
       # Each value uses ${VAR:-default} so a .env file (or shell env) can
       # override any of them. Defaults mirror app/config.py; see .env.example.

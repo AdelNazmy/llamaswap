@@ -422,13 +422,22 @@ their (missing) binaries — the proxy keeps running and reports the roles
 as stopped in `/health`. Delete the audio YAMLs to hide them from
 `/v1/models` entirely.
 
-### LlamaSwap Docker Instllation
+### LlamaSwap Docker Installation
 ```bash
 cd ~
 git clone https://github.com/AdelNazmy/llamaswap.git
 cd llamaswap
 docker compose up --build
 ```
+The container publishes the proxy on **two host ports**:
+
+- `11434` — the repo default (overridable via `LLAMASWAP_PORT`);
+- `9090` — a convenience alias for tooling already pointed at it
+  (e.g. `http://127.0.0.1:9090/v1`).
+
+Both map to the container's internal `11434`, so the examples below work
+against either one (`localhost:11434` ↔ `localhost:9090`).
+
 Notes:
 
 - The binary ends up at `build/bin/llama-server`; either run llama.cpp from
