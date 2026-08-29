@@ -15,6 +15,7 @@ services:
       # itself always listens on 11434.
       - ${LLAMASWAP_PORT:-11434}:11434
       - 9090:11434
+      - 1234:11434
     environment:
       # Each value uses ${VAR:-default} so a .env file (or shell env) can
       # override any of them. Defaults mirror app/config.py; see .env.example.
@@ -30,6 +31,9 @@ services:
       # While tts AND asr are both loaded, serve only the smallest chat
       # LLM (weights-file size) instead of the requested one.
       LLAMASWAP_AUDIO_VRAM_GUARD: "${LLAMASWAP_AUDIO_VRAM_GUARD:-true}"
+      # Reject TTS/ASR (409) while a big chat LLM (anything other than the
+      # smallest by weights-file size) is loaded.
+      LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM: "${LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM:-true}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
     volumes:

@@ -17,6 +17,9 @@ LLM:
 
 While tts AND asr are both loaded, a VRAM guard substitutes the smallest
 chat LLM for any requested chat model (see Settings.audio_vram_guard).
+The inverse guard also holds: while a "big" chat LLM (any LLM other than
+the smallest by weights-file size) is loaded, TTS/ASR requests are
+rejected with 409 (see Settings.block_audio_on_big_llm).
 """
 
 import asyncio
@@ -431,6 +434,25 @@ async def _route_audio(
             f"(role: {cfg.role})",
         )
         return JSONResponse(status_code=status, content=payload)
+    # Inverse VRAM guard: while a "big" chat LLM (anything other than the
+    # smallest by weights-file size) is loaded — or mid-load — refuse audio
+    # so TTS/ASR cannot stack on top of a large model. Disable via
+    # LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM=false.
+    if request.app.state.settings.block_audio_on_big_llm:
+        smallest = registry.smallest_llm()
+        chat_status = request.app.state.manager.status()
+        loaded = chat_status.get("model")
+        state = chat_status.get("state")
+        if (smallest is not None and loaded is not None
+                and state in ("loading", "ready") and loaded != smallest):
+            status, payload = _error(
+                409,
+                f"audio {role} is blocked while big chat model '{loaded}' "
+                f"is loaded; unload it (or wait for idle unload) before "
+                f"using {role}",
+                "server_error",
+            )
+            return JSONResponse(status_code=status, content=payload)
     try:
         cfg = await manager.ensure_model(model, registry)
     except AudioLoadError as exc:

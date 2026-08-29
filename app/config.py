@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # with the smallest one and the swap happens as usual; set false to
     # disable.
     audio_vram_guard: bool = True
+    # Inverse guard: while a "big" chat LLM (any LLM other than the
+    # smallest by weights-file size) is loaded, TTS/ASR requests are
+    # rejected with 409 so audio cannot stack on top of a large model.
+    # Set false to allow audio alongside a big LLM.
+    block_audio_on_big_llm: bool = True
     # Where the proxy stages uploaded audio files for backends whose
     # transcription API takes a server-side path (audio.cpp). Must be
     # writable by llamaswap AND readable by the backend process.

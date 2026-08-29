@@ -18,6 +18,12 @@ TTS/ASR server are on-demand: nothing boots until a request names them,
 and each is stopped again after `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default
 300 s) with no requests — the same idle-unload policy everywhere.
 
+A **two-way VRAM guard** keeps the GPU from being oversubscribed: while
+both TTS and ASR are loaded, chat is transparently served by the smallest
+LLM; conversely, while a bigger (non-smallest) chat LLM is loaded, TTS/ASR
+requests are rejected with `409` (see `LLAMASWAP_AUDIO_VRAM_GUARD` and
+`LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`).
+
 ## How it works
 
 ```
@@ -50,11 +56,18 @@ llamaswap (FastAPI)
 - **Resource fallback.** If a chat model fails to load while the embedding
   server is running, llamaswap stops the embedding server, retries the chat
   load once, and then best-effort relaunches embeddings in the background.
-- **VRAM guard.** While tts AND asr servers are both loaded, only the
-  smallest chat LLM (smallest weights file on disk) is served — a
-  request for a bigger chat model transparently loads the smallest one
-  instead, and the audio servers keep running. Once either audio role
-  idle-unloads, normal model selection resumes
+- **VRAM guard (chat direction).** While tts AND asr servers are both
+  loaded, only the smallest chat LLM (smallest weights file on disk) is
+  served — a request for a bigger chat model transparently loads the
+  smallest one instead, and the audio servers keep running. Once either
+  audio role idle-unloads, normal model selection resumes. Controlled by
+  `LLAMASWAP_AUDIO_VRAM_GUARD` (default true).
+- **VRAM guard (audio direction).** While a "big" chat LLM (any model
+  other than the smallest by weights-file size) is loaded — or mid-load —
+  `/v1/audio/*` requests are rejected with `409` so TTS/ASR cannot stack
+  on top of a large model. Audio works again once the big LLM idle-unloads
+  or the smallest model is served. Controlled by
+  `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM` (default true).
 - **Registry.** Every file in `backend/` is one model: the exact
   binary + arguments + env + port. Add a file, reload, done. Works for any
   OpenAI-compatible backend, not just llama-server.
@@ -473,7 +486,9 @@ Or with an explicit python:
 
 Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_BACKEND_DIR`, `LLAMASWAP_STARTUP_TIMEOUT`,
-`LLAMASWAP_STOP_TIMEOUT`, `LLAMASWAP_LOG_LEVEL`.
+`LLAMASWAP_STOP_TIMEOUT`, `LLAMASWAP_LOG_LEVEL`,
+`LLAMASWAP_IDLE_UNLOAD_SECONDS`, `LLAMASWAP_AUDIO_VRAM_GUARD`,
+`LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`.
 
 ## API
 
@@ -610,6 +625,14 @@ with open("speech.wav", "rb") as fh:
   start, the proxy still starts and reports the embedding state in
   `/health`. The chat LLM and TTS/ASR servers start on first use instead
   of booting with the proxy.
+- While a "big" chat LLM (anything other than the smallest by
+  weights-file size) is loaded, the proxy answers `/v1/audio/speech`,
+  `/v1/audio/speech/stream`, `/v1/audio/transcriptions` and
+  `/v1/audio/translations` with `409` and a message telling you to unload
+  the chat model first. This is the inverse of
+  `LLAMASWAP_AUDIO_VRAM_GUARD`, and it only blocks *new* requests — an
+  audio server that was already resident keeps running until its idle
+  timeout. Disable with `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM=false`.
 - The chat LLM and TTS/ASR servers are stopped after
   `LLAMASWAP_IDLE_UNLOAD_SECONDS` with no requests (`/health` shows
   `idle_seconds`); only the embedding server stays up. Switching between
