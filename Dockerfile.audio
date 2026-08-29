@@ -31,7 +31,7 @@ COPY --from=whispercpp-bin ./ /opt/whisper.cpp/build/bin/
 # spec, so the runtime falls back to <family>.json next to the binary or
 # in these dirs; outetts-tts.yaml passes --model-spec-override here.
 COPY --from=audiocpp-src ./model_specs /opt/audio.cpp/model_specs
-
+COPY data /app/data
 
 RUN chmod 0755 /opt/audio.cpp/build/bin/audiocpp_server \
     /opt/whisper.cpp/build/bin/whisper-server
