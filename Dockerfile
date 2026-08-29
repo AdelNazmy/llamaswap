@@ -14,7 +14,11 @@ RUN apt-get update \
         libgomp1 \
         libstdc++6 \
         libssl3 \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# The Dockerfile.audio overlay (docker-compose.audio.yml) stamps the
+# audio.cpp / whisper.cpp binaries into this image; see README.
 
 RUN mkdir -p /usr/local/cuda/lib64 /opt/llama.cpp/build/bin
 

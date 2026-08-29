@@ -1,0 +1,38 @@
+# ASR model: Whisper via whisper.cpp whisper-server
+#
+# One of the two switchable ASR backends (the other is qwen3-asr via
+# audio.cpp). `model` in the transcription request picks which one loads.
+#
+# whisper-server speaks the OpenAI multipart dialect directly (/v1/audio/
+# transcriptions is just its /inference path remapped), so the proxy passes
+# the request body through untouched (request_format: multipart).
+#
+# Build / install:
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml build   (or on host:)
+#   git clone https://github.com/ggml-org/whisper.cpp /opt/whisper.cpp
+#   cmake -B /opt/whisper.cpp/build -S /opt/whisper.cpp -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+#   cmake --build /opt/whisper.cpp/build --config Release --target whisper-server -j
+#   ./scripts/download-models.sh whisper   # -> /opt/models/ggml-base.en.bin
+#
+# --convert requires ffmpeg on the server (the Docker image installs it).
+name: whisper-asr
+description: "Whisper base.en (whisper.cpp) — speech-to-text"
+role: asr
+command:
+  binary: /opt/whisper.cpp/build/bin/whisper-server
+  args:
+    - "-m"
+    - "/opt/models/ggml-base.en.bin"
+    - "--inference-path"
+    - "/v1/audio/transcriptions"
+    - "--language"
+    - "auto"
+    - "--convert"
+  env:
+    WHISPER_ARG_DEVICE: "0"
+host: 127.0.0.1
+port: 8105
+meta:
+  family: whisper
+  capabilities: [asr]
+  request_format: multipart

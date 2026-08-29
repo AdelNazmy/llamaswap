@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Unload the loaded LLM after this many seconds with no requests.
     # 0 disables idle unload (default).
     idle_unload_seconds: float = 300
+    # Where the proxy stages uploaded audio files for backends whose
+    # transcription API takes a server-side path (audio.cpp). Must be
+    # writable by llamaswap AND readable by the backend process.
+    audio_tmp_dir: str = "/tmp/llamaswap-audio"
     log_level: str = "INFO"
 
 

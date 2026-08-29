@@ -1,0 +1,43 @@
+# ASR model: Qwen3-ASR 0.6B via audio.cpp audiocpp_server
+#
+# One of the two switchable ASR backends (the other is whisper-asr via
+# whisper.cpp). The `model` field in a /v1/audio/transcriptions request
+# selects which one is loaded; llamaswap stops the running ASR server and
+# launches the requested one.
+#
+# audio.cpp's transcription endpoint is NOT OpenAI-multipart: it takes a
+# JSON body whose `file` is a *server-side path*. llamaswap hides this: it
+# accepts the standard OpenAI multipart upload, saves the audio to
+# LLAMASWAP_AUDIO_TMP_DIR, rewrites the request into audio.cpp's dialect
+# and forwards it (request_format: json_path selects this behaviour).
+#
+# Install the model:
+#   ./scripts/download-models.sh asr  # -> /opt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
+name: qwen3-asr
+description: "Qwen3-ASR 0.6B (audio.cpp) — speech-to-text"
+role: asr
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: qwen3_asr
+        path: /opt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
+        task: asr
+        mode: offline
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8104
+meta:
+  family: qwen3_asr
+  capabilities: [asr]
+  request_format: json_path

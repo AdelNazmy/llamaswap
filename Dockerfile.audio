@@ -1,0 +1,37 @@
+# Opt-in overlay that stamps the TTS/ASR backend binaries into the image.
+#
+# The audio binaries are NOT compiled in the image build anymore. Build them
+# on the host first (see README: "Building audio.cpp (TTS + ASR)" and
+# "Building whisper.cpp (ASR)"), then docker-compose.audio.yml passes the
+# result dirs as build contexts — the same pattern the base Dockerfile uses
+# for llama.cpp's `llamacpp-bin` context.
+#
+# Expected host layouts (overridable in docker-compose.audio.yml):
+#   /opt/audio.cpp/build/bin/audiocpp_server
+#   /opt/whisper.cpp/build/bin/whisper-server
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml up -d
+
+FROM llamaswap:local
+
+RUN mkdir -p /opt/audio.cpp/build/bin /opt/whisper.cpp/build/bin /opt/audio.cpp/model_specs
+
+# `audiocpp-bin` and `whispercpp-bin` are named build contexts whose root is
+# the respective build/bin dir; sources are relative to the context root
+# (same syntax as COPY --from=llamacpp-bin ./llama-server ...).
+COPY --from=audiocpp-bin   ./audiocpp_server   /opt/audio.cpp/build/bin/audiocpp_server
+# whisper-server resolves libwhisper.so.1 / libggml*.so.* via its RUNPATH
+# (/opt/whisper.cpp/build/bin), so the whole build/bin dir must come along.
+COPY --from=whispercpp-bin ./ /opt/whisper.cpp/build/bin/
+
+# Schema-v1 model specs (family contracts) consumed by audiocpp_server.
+# Legacy GGUFs (e.g. the OuteTTS 1.0 snapshot) embed only an old model
+# spec, so the runtime falls back to <family>.json next to the binary or
+# in these dirs; outetts-tts.yaml passes --model-spec-override here.
+COPY --from=audiocpp-src ./model_specs /opt/audio.cpp/model_specs
+
+
+RUN chmod 0755 /opt/audio.cpp/build/bin/audiocpp_server \
+    /opt/whisper.cpp/build/bin/whisper-server

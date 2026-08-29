@@ -1,0 +1,55 @@
+# Opt-in compose overlay that enables TTS/ASR in the llamaswap container.
+#
+# The audio backend binaries are built on the HOST (see README: "Building
+# audio.cpp (TTS + ASR)" / "Building whisper.cpp (ASR)") — nothing is
+# compiled inside the image. The overlay just stamps the host-built binaries
+# into the image via build contexts (same pattern as llama.cpp's
+# `llamacpp-bin` in the base Dockerfile):
+#
+#   audiocpp-bin:   /opt/audio.cpp/build/bin   (audiocpp_server)
+#   whispercpp-bin: /opt/whisper.cpp/build/bin (whisper-server)
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml up -d
+#
+# On `up`, the models-init one-shot service downloads the missing model
+# weights into the shared /opt/models directory (host dir) before llamaswap
+# starts. You can also run it manually:
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml run --rm models-init
+services:
+  models-init:
+    image: alpine:3.20
+    container_name: llamaswap-models-init
+    init: true
+    restart: "no"
+    environment:
+      MODEL_ROOT: /opt/models
+    volumes:
+      - ./scripts:/scripts:ro
+      - /opt/models:/opt/models # rw: download into the shared model root
+    command:
+      - /bin/sh
+      - -c
+      - "apk add --no-cache curl >/dev/null 2>&1 && exec sh /scripts/download-models.sh"
+
+  llamaswap:
+    build:
+      # Stamps host-built audio binaries into llamaswap:local (no compile).
+      # The base image must exist first (docker compose build on
+      # docker-compose.yml alone) and the audio binaries must exist at the
+      # context paths below (build them first — see README).
+      context: .
+      dockerfile: Dockerfile.audio
+      additional_contexts:
+        llamacpp-bin: /opt/llama.cpp/build/bin
+        audiocpp-bin: /opt/audio.cpp/build/bin
+        audiocpp-src: /opt/audio.cpp
+        whispercpp-bin: /opt/whisper.cpp/build/bin
+    depends_on:
+      models-init:
+        condition: service_completed_successfully
+    volumes:
+      # Shared staging area: the proxy saves OpenAI multipart uploads here
+      # so audio.cpp can read them as server-side file paths.
+      - /tmp/llamaswap-audio:/tmp/llamaswap-audio

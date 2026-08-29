@@ -1,26 +1,39 @@
 """llamaswap — an OpenAI-compatible proxy in front of llama-server.
 
 Model registry lives in backend/*.yaml; the requested model is launched
-(or swapped in) transparently on demand.
+(or swapped in) transparently on demand. Alongside the chat LLM swap
+path there are persistent per-role servers:
+
+  * ``embedding`` — a dedicated embedding llama-server (EmbeddingManager)
+  * ``tts`` / ``asr`` — persistent audio servers (AudioManager) that can
+    swap between backends per request (e.g. qwen3-asr vs whisper-server)
+    and are proxied through the OpenAI audio endpoints
+    (/v1/audio/speech, /v1/audio/transcriptions, ...).
 """
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .config import get_settings
+from .audio_manager import AudioLoadError, AudioManager
+from .config import Settings, get_settings
 from .embedding_manager import EmbeddingLoadError, EmbeddingManager
 from .process_manager import ModelLoadError, ProcessManager
 from .proxy import (
     extract_model,
     extract_stream_flag,
     proxy_json,
+    proxy_raw,
     proxy_stream,
+    remove_audio_upload,
+    save_audio_upload,
 )
 from .registry import Registry, RegistryError, UnknownModelError
 
@@ -30,6 +43,13 @@ logger = logging.getLogger("llamaswap")
 
 def _error(status: int, message: str, etype: str = "invalid_request_error"):
     return status, {"error": {"message": message, "type": etype}}
+
+
+def _fwd_headers(request: Request) -> dict[str, str]:
+    return {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "accept-encoding")
+    }
 
 
 @asynccontextmanager
@@ -42,6 +62,7 @@ async def lifespan(app: FastAPI):
     backend_dir = Path(settings.backend_dir)
     if not backend_dir.is_absolute():
         backend_dir = ROOT / backend_dir
+    app.state.settings = settings
     app.state.registry = Registry(backend_dir)
     app.state.manager = ProcessManager(
         startup_timeout=settings.startup_timeout,
@@ -49,6 +70,20 @@ async def lifespan(app: FastAPI):
         health_interval=settings.health_interval,
         idle_unload_seconds=settings.idle_unload_seconds,
     )
+    # Audio (tts/asr) managers: one per role, booted with the first
+    # configured model and swapped per request.
+    app.state.audio_managers: dict[str, AudioManager] = {}
+    for role in ("tts", "asr"):
+        manager = AudioManager(
+            role,
+            startup_timeout=settings.startup_timeout,
+            stop_timeout=settings.stop_timeout,
+            health_interval=settings.health_interval,
+            config_dir=settings.audio_tmp_dir,
+        )
+        manager.configure(app.state.registry.role_configs(role))
+        app.state.audio_managers[role] = manager
+
     # Persistent embedding server: launched at boot, kept running for the
     # lifetime of the proxy (only stopped to free VRAM for an LLM).
     app.state.embedding_manager = None
@@ -67,6 +102,14 @@ async def lifespan(app: FastAPI):
             logger.error(
                 "embedding server failed to start at boot: %s", exc
             )
+    for role in ("tts", "asr"):
+        manager = app.state.audio_managers[role]
+        first = manager.first_config_name()
+        if first is not None:
+            try:
+                await manager.ensure_model(first, app.state.registry)
+            except (AudioLoadError, UnknownModelError) as exc:
+                logger.error("%s server failed to start at boot: %s", role, exc)
     logger.info(
         "llamaswap ready on %s:%d (%d models)",
         settings.host, settings.port, len(app.state.registry.models),
@@ -74,6 +117,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        for manager in app.state.audio_managers.values():
+            await manager.shutdown()
         if app.state.embedding_manager is not None:
             await app.state.embedding_manager.shutdown()
         await app.state.manager.shutdown()
@@ -95,6 +140,10 @@ async def health(request: Request):
             if embedding_manager is not None
             else None
         ),
+        "audio": {
+            role: manager.status()
+            for role, manager in request.app.state.audio_managers.items()
+        },
     }
 
 
@@ -117,12 +166,31 @@ async def get_model(model: str, request: Request):
 
 @app.post("/v1/registry/reload")
 async def reload_registry(request: Request):
+    registry: Registry = request.app.state.registry
     try:
-        request.app.state.registry.reload()
+        registry.reload()
     except RegistryError as exc:
         status, body = _error(500, str(exc), "server_error")
         return JSONResponse(status_code=status, content=body)
+    # Refresh per-role audio configs; ensure at least one model is loaded
+    # (best-effort, non-blocking on failure).
+    for role, manager in request.app.state.audio_managers.items():
+        manager.configure(registry.role_configs(role))
+        first = manager.first_config_name()
+        if first is not None and not manager.is_running:
+            asyncio.get_running_loop().create_task(
+                _ensure_audio_best_effort(manager, first, registry)
+            )
     return {"reloaded": True, "models": request.app.state.registry.names()}
+
+
+async def _ensure_audio_best_effort(
+    manager: AudioManager, name: str, registry: Registry,
+) -> None:
+    try:
+        await manager.ensure_model(name, registry)
+    except (AudioLoadError, UnknownModelError) as exc:
+        logger.warning("%s server could not be (re)loaded: %s", manager.role, exc)
 
 
 async def _ensure_and_route(
@@ -146,11 +214,12 @@ async def _ensure_and_route(
             404, f"model '{exc.name}' not found; available: {known}"
         )
         return JSONResponse(status_code=status, content=payload)
-    if cfg.role == "embedding":
+    if cfg.role in ("embedding", "tts", "asr"):
         status, payload = _error(
             400,
-            f"model '{model}' is an embedding model; "
-            "use /v1/embeddings instead",
+            f"model '{model}' is a {cfg.role} model; "
+            "use /v1/embeddings, /v1/audio/speech or "
+            "/v1/audio/transcriptions instead",
         )
         return JSONResponse(status_code=status, content=payload)
     embedding_manager: Optional[EmbeddingManager] = (
@@ -189,10 +258,7 @@ async def _ensure_and_route(
         asyncio.get_running_loop().create_task(
             embedding_manager.ensure_running()
         )
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "accept-encoding")
-    }
+    headers = _fwd_headers(request)
     if extract_stream_flag(body):
         gen = proxy_stream(
             port, cfg.host, path, body, model, headers
@@ -237,17 +303,15 @@ async def embeddings(request: Request):
                 )
                 return JSONResponse(status_code=status, content=payload)
         body = await request.body()
+        content_type = request.headers.get("content-type", "")
         try:
-            model = extract_model(body)
+            model = extract_model(body, content_type)
         except Exception:  # noqa: BLE001
             model = None
         if model is None:
             model = embedding_manager.name
         cfg = embedding_manager.config
-        headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in ("host", "content-length", "accept-encoding")
-        }
+        headers = _fwd_headers(request)
         if extract_stream_flag(body):
             gen = proxy_stream(
                 cfg.port, cfg.host, "/v1/embeddings", body, model, headers
@@ -270,6 +334,175 @@ async def embeddings(request: Request):
     return await _ensure_and_route(request, "/v1/embeddings")
 
 
+# ---------------------------------------------------------------------------
+# OpenAI audio API (TTS / ASR)
+# ---------------------------------------------------------------------------
+
+async def _route_audio(
+    request: Request, role: str, backend_path: str, *,
+    expect_body_model: bool = True,
+):
+    """Route an OpenAI audio request to the persistent ``role`` manager.
+
+    ``role`` is "tts" or "asr". The request body may be JSON (speech) or
+    multipart/form-data (transcriptions). The model field (JSON or form)
+    selects which backend of the role to load; llamaswap swaps the running
+    server when it differs.
+    """
+    registry: Registry = request.app.state.registry
+    manager: AudioManager = request.app.state.audio_managers[role]
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    try:
+        model = extract_model(body, content_type)
+    except Exception:  # noqa: BLE001
+        model = None
+    if model is None:
+        if expect_body_model:
+            status, payload = _error(
+                400, "'model' is required in the request body"
+            )
+            return JSONResponse(status_code=status, content=payload)
+        # Single configured model of this role: fall back to it.
+        configs = registry.role_configs(role)
+        if not configs:
+            status, payload = _error(
+                404, f"no {role} model configured", "server_error"
+            )
+            return JSONResponse(status_code=status, content=payload)
+        model = configs[0].name
+    try:
+        cfg = registry.get(model)
+    except UnknownModelError as exc:
+        status, payload = _error(
+            404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=payload)
+    if cfg.role != role:
+        status, payload = _error(
+            400,
+            f"model '{model}' is not a {role} model "
+            f"(role: {cfg.role})",
+        )
+        return JSONResponse(status_code=status, content=payload)
+    try:
+        cfg = await manager.ensure_model(model, registry)
+    except AudioLoadError as exc:
+        status, payload = _error(
+            503, f"failed to load {role} model '{model}': {exc}",
+            "server_error",
+        )
+        return JSONResponse(status_code=status, content=payload)
+    except UnknownModelError as exc:
+        status, payload = _error(
+            404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=payload)
+
+    headers = _fwd_headers(request)
+
+    # Backends whose transcription API expects a server-side file path
+    # (audio.cpp) instead of the OpenAI multipart upload: translate.
+    translated: Optional[str] = None
+    out_body = body
+    if backend_path == "/v1/audio/transcriptions" \
+            and cfg.meta.request_format == "json_path":
+        if "multipart/form-data" in content_type.lower():
+            saved = save_audio_upload(body, content_type,
+                                      request.app.state.settings.audio_tmp_dir)
+            if saved is None:
+                status, payload = _error(
+                    400, "multipart request is missing a 'file' upload"
+                )
+                return JSONResponse(status_code=status, content=payload)
+            translated = saved
+            out_body = json.dumps({
+                "model": model,
+                "file": saved,
+            }).encode()
+            headers["Content-Type"] = "application/json"
+        elif "application/json" in content_type.lower():
+            # Client already sent the audio.cpp JSON dialect; pass through.
+            pass
+
+    try:
+        if backend_path in ("/v1/audio/speech", "/v1/audio/speech/stream"):
+            status, data, ctype = await proxy_raw(
+                cfg.port, cfg.host, backend_path, out_body, headers
+            )
+            if status != 200:
+                return JSONResponse(
+                    status_code=status,
+                    content=_maybe_json(data),
+                )
+            return Response(content=data, media_type=ctype)
+        # transcriptions / translations → JSON
+        status, data = await proxy_json(
+            cfg.port, cfg.host, backend_path, out_body, model, headers
+        )
+        return JSONResponse(status_code=status, content=data)
+    finally:
+        remove_audio_upload(translated)
+
+
+def _maybe_json(data: bytes):
+    try:
+        return json.loads(data)
+    except (ValueError, TypeError):
+        return {"error": {"message": data.decode(errors="replace")[:500]}}
+
+
+@app.post("/v1/audio/speech")
+async def audio_speech(request: Request):
+    return await _route_audio(request, "tts", "/v1/audio/speech")
+
+
+@app.post("/v1/audio/speech/stream")
+async def audio_speech_stream(request: Request):
+    return await _route_audio(request, "tts", "/v1/audio/speech/stream")
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(request: Request):
+    return await _route_audio(request, "asr", "/v1/audio/transcriptions")
+
+
+@app.post("/v1/audio/translations")
+async def audio_translations(request: Request):
+    # Whisper.cpp's whisper-server accepts a `translate` form field; other
+    # backends may reject it — the upstream error is passed through.
+    return await _route_audio(request, "asr", "/v1/audio/translations")
+
+
+@app.get("/v1/audio/voices")
+async def audio_voices(request: Request):
+    """List voices from the TTS backend, if it exposes such an endpoint."""
+    manager: AudioManager = request.app.state.audio_managers["tts"]
+    if not manager.is_running:
+        status, payload = _error(
+            503, "tts server is not running", "server_error"
+        )
+        return JSONResponse(status_code=status, content=payload)
+    cfg = manager.current_config
+    if cfg is None:
+        status, payload = _error(503, "tts server is not ready", "server_error")
+        return JSONResponse(status_code=status, content=payload)
+    headers = _fwd_headers(request)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0)
+        ) as client:
+            resp = await client.get(
+                f"http://{cfg.host}:{cfg.port}/v1/audio/voices",
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        status, payload = _error(502, f"voices lookup failed: {exc}")
+        return JSONResponse(status_code=status, content=payload)
+    return Response(content=resp.content, media_type=resp.headers.get(
+        "content-type", "application/json"), status_code=resp.status_code)
+
+
 @app.exception_handler(UnknownModelError)
 async def unknown_model_handler(request: Request, exc: UnknownModelError):
     status, payload = _error(
@@ -280,5 +513,11 @@ async def unknown_model_handler(request: Request, exc: UnknownModelError):
 
 @app.exception_handler(ModelLoadError)
 async def model_load_handler(request: Request, exc: ModelLoadError):
+    status, payload = _error(503, str(exc), "server_error")
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.exception_handler(AudioLoadError)
+async def audio_load_handler(request: Request, exc: AudioLoadError):
     status, payload = _error(503, str(exc), "server_error")
     return JSONResponse(status_code=status, content=payload)

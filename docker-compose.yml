@@ -22,6 +22,7 @@ services:
       LLAMASWAP_HEALTH_INTERVAL: "${LLAMASWAP_HEALTH_INTERVAL:-1.0}"
       LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
+      LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
     volumes:
       - /opt/models:/opt/models:ro
       - ./backend:/app/backend

@@ -1,13 +1,13 @@
 # Text chat model: Qwen3.8 27B (Q3_K_XL)
-name: qwen3.8-27b
-description: "Qwen3.8 27B dense, Q3_K_XL quant, text chat"
+name: qwen3.8-27b-32k
+description: "Qwen3.8 27B dense, Q3_K_XL quant, optimized for 16GB VRAM"
 command:
   binary: /opt/llama.cpp/build/bin/llama-server
   args:
     - "--model"
     - "/opt/models/Qwen3.8-27B-UD-Q3_K_XL.gguf"
     - "--ctx-size"
-    - "65000"
+    - "32000"
     - "--n-gpu-layers"
     - "999"
     - "--cache-type-k"
@@ -28,7 +28,7 @@ command:
     - "1024"
     - "--mmap"
     - "--mlock"
-    - "--jinja"
+
   env:
     CUDA_VISIBLE_DEVICES: "0"
 # internal llama-server binding (enforced by the proxy; one model at a time)

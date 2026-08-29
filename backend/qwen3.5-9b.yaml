@@ -1,0 +1,32 @@
+# Text chat model: qwen3.5-9b
+name: qwen3.5-9b
+description: "Qwen3.5-9B Multimodal dense, Q8_0 quant, Image & Text chat"
+command:
+  binary: /opt/llama.cpp/build/bin/llama-server
+  args:
+    - "--model"
+    - "/opt/models/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q4_K_M.gguf"
+    - "--mmproj"
+    - "/opt/models/qwen3.5-mmproj.gguf"
+    - "--spec-type"
+    - "draft-mtp"
+    - "--spec-draft-n-max"
+    - "3"
+    - "-ngl"
+    - "999"
+    - "-c"
+    - "65000"
+    - "--reasoning-budget"
+    - "0"
+    - "--reasoning"
+    - "off"
+    - "--image-min-tokens"
+    - "1024"
+
+# internal llama-server binding (enforced by the proxy; one model at a time)
+host: 127.0.0.1
+port: 8101
+meta:
+  context_length: 65000
+  family: qwen
+  capabilities: [chat,vision]

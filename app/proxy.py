@@ -10,13 +10,19 @@ pass-through that:
 import asyncio
 import json
 import logging
+import os
+import re
 from typing import Any, AsyncIterator, Optional
+from uuid import uuid4
 
 import httpx
 
 logger = logging.getLogger("llamaswap.proxy")
 
 UPSTREAM_TIMEOUT = 600.0
+
+# boundary=... inside a multipart/form-data Content-Type header
+_MULTIPART_RE = re.compile(r'boundary="?([^";]+)"?', re.IGNORECASE)
 
 
 def _model_field(obj: Any) -> Optional[str]:
@@ -124,6 +130,37 @@ async def proxy_json(
     return resp.status_code, resp.json() if _is_json(resp.content) else resp.text
 
 
+async def proxy_raw(
+    port: int, host: str, path: str, body: Any,
+    headers: dict[str, str],
+) -> tuple[int, bytes, str]:
+    """Non-streaming binary pass-through (e.g. audio/wav TTS output).
+
+    Returns (status_code, body_bytes, content_type).
+    """
+    url = f"http://{host}:{port}{path}"
+    fwd_headers = {k: v for k, v in headers.items()
+                   if k.lower() not in ("host", "content-length", "accept-encoding")}
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=10.0)
+        ) as client:
+            resp = await client.post(url, content=body, headers=fwd_headers)
+    except httpx.ConnectError:
+        return 503, json.dumps({
+            "error": {"message": "backend audio server is not reachable"}
+        }).encode(), "application/json"
+    except httpx.HTTPError as exc:
+        return 502, json.dumps({
+            "error": {"message": str(exc)}
+        }).encode(), "application/json"
+    return (
+        resp.status_code,
+        resp.content,
+        resp.headers.get("content-type", "application/octet-stream"),
+    )
+
+
 def _is_json(content: bytes) -> bool:
     head = content.lstrip()[:1]
     return head in (b"{", b"[")
@@ -137,9 +174,92 @@ def extract_stream_flag(body: bytes) -> bool:
     return bool(obj.get("stream"))
 
 
-def extract_model(body: bytes) -> Optional[str]:
+def extract_model(body: bytes, content_type: str = "") -> Optional[str]:
+    """Model id from a JSON body or a multipart/form-data upload."""
     try:
         obj = json.loads(body)
     except (ValueError, TypeError):
+        pass
+    else:
+        return obj.get("model") if isinstance(obj, dict) else None
+    if "multipart/form-data" in content_type.lower():
+        return multipart_field(body, content_type, "model")
+    return None
+
+
+def _multipart_parts(body: bytes, content_type: str) -> list[tuple[bytes, bytes]]:
+    """Split a multipart body into (headers, payload) per part."""
+    m = _MULTIPART_RE.search(content_type or "")
+    if not m:
+        return []
+    boundary = f"--{m.group(1)}".encode()
+    parts: list[tuple[bytes, bytes]] = []
+    for raw in body.split(boundary):
+        head, sep, payload = raw.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        head = head.strip(b"\r\n -")
+        if not head:
+            continue
+        parts.append((head, payload))
+    return parts
+
+
+def multipart_field(body: bytes, content_type: str, name: str) -> Optional[str]:
+    """Value of a named text field in a multipart/form-data body."""
+    for head, payload in _multipart_parts(body, content_type):
+        if f'name="{name}"'.encode() in head:
+            # Form field values are terminated by CRLF (or boundary): take
+            # the first line and strip any trailing CR/LF.
+            value = payload.strip(b"\r\n").split(b"\r\n", 1)[0].strip()
+            if value:
+                return value.decode(errors="replace")
+    return None
+
+
+def multipart_file(body: bytes, content_type: str) -> Optional[tuple[str, bytes]]:
+    """Filename and content of the uploaded 'file' part, or None."""
+    for head, payload in _multipart_parts(body, content_type):
+        if b'name="file"' not in head:
+            continue
+        fn = "upload"
+        m = re.search(r'filename="([^"]*)"', head.decode(errors="replace"))
+        if m:
+            fn = m.group(1) or "upload"
+        # Strip the trailing CRLF that precedes the closing boundary.
+        payload = payload.rstrip(b"\r\n")
+        return fn, payload
+    return None
+
+
+def save_audio_upload(body: bytes, content_type: str,
+                      tmp_dir: str) -> Optional[str]:
+    """Save the uploaded audio to ``tmp_dir`` and return its absolute path.
+
+    Used for backends whose transcription API takes a server-side file path
+    (audio.cpp ``/v1/audio/transcriptions``) instead of the OpenAI
+    multipart upload. Returns None if there is no file part.
+    """
+    part = multipart_file(body, content_type)
+    if part is None:
         return None
-    return obj.get("model")
+    filename, content = part
+    suffix = os.path.splitext(filename)[1] or ".wav"
+    os.makedirs(tmp_dir, exist_ok=True)
+    path = os.path.join(tmp_dir, f"{uuid4().hex}{suffix}")
+    try:
+        with open(path, "wb") as fh:
+            fh.write(content)
+    except OSError as exc:
+        logger.warning("failed to save audio upload: %s", exc)
+        return None
+    return path
+
+
+def remove_audio_upload(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

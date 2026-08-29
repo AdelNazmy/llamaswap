@@ -1,0 +1,50 @@
+# TTS model: OuteTTS 1.0 1B via audio.cpp audiocpp_server
+#
+# NOTE: Kokoro itself is NOT yet loadable by audio.cpp (README lists it as
+# "integration" but no loader is wired in the runtime). audio.cpp's TTS
+# families that work today include `outetts` (OuteTTS 1.0 1B) and
+# `qwen3_tts` (Qwen3-TTS). Point `family:` + `path:` at whichever you build.
+#
+# Managed by the AudioManager (persistent per-role server, role: tts).
+# /v1/audio/speech is proxied here (JSON in, binary audio/wav out).
+#
+# Install the model (scripts/download-models.sh, or by hand):
+#   ./scripts/download-models.sh tts          # -> /opt/models/Llama-OuteTTS-1.0-1B_Q8/...
+# (GGUF from hf.co/mirek190/audio.cpp, "Text to audio (TTS)" dir; the config/
+#  tokenizer/dac metadata is embedded in the GGUF itself)
+name: outetts
+description: "OuteTTS 1.0 1B (audio.cpp) — text-to-speech"
+role: tts
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+    # The OuteTTS 1.0 snapshot GGUF embeds a legacy model spec; audio.cpp's
+    # current runtime needs the schema-v1 contract (model_specs/outetts.json,
+    # stamped into the image by Dockerfile.audio).
+    - "--model-spec-override"
+    - "/opt/audio.cpp/model_specs"
+  # Rendered to a temp file at launch; {host}/{port}/{name}/{config_path}
+  # placeholders are substituted and host/port are always enforced to the
+  # YAML values below (audiocpp_server also accepts --host/--port overrides).
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: outetts
+        path: /opt/models/Llama-OuteTTS-1.0-1B_Q8/Text to audio (TTS)/Llama-OuteTTS-1.0-1B_Q8.gguf
+        task: tts
+        mode: offline
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8103
+meta:
+  family: outetts
+  capabilities: [tts]
+  request_format: json
