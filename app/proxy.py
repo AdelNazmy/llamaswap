@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
@@ -304,3 +305,258 @@ def remove_audio_upload(path: Optional[str]) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+def extract_text_field(body: bytes, content_type: str, name: str) -> Optional[str]:
+    """Value of a request field from a JSON body or a multipart upload."""
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        pass
+    else:
+        if isinstance(obj, dict):
+            val = obj.get(name)
+            if val is not None:
+                return str(val)
+    if "multipart/form-data" in content_type.lower():
+        return multipart_field(body, content_type, name)
+    return None
+
+
+def extract_response_format(body: bytes, content_type: str = "") -> str:
+    """Transcription ``response_format`` from JSON/multipart (default "json").
+
+    Accepts the legacy ``format`` alias too.
+    """
+    return (
+        extract_text_field(body, content_type, "response_format")
+        or extract_text_field(body, content_type, "format")
+        or "json"
+    ).strip().lower()
+
+
+def extract_speech_format(body: bytes) -> Optional[str]:
+    """Speech ``response_format`` from a JSON body (None if unspecified)."""
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(obj, dict):
+        val = obj.get("response_format")
+        if isinstance(val, str) and val.strip():
+            return val.strip().lower()
+    return None
+
+
+def json_remove_key(body: bytes, key: str) -> bytes:
+    """Return ``body`` with ``key`` removed from a JSON object (no-op otherwise)."""
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if isinstance(obj, dict) and key in obj:
+        obj.pop(key)
+        return json.dumps(obj).encode()
+    return body
+
+
+# --------------------------------------------------------------------------
+# ASR response-format normalisation
+# --------------------------------------------------------------------------
+# OpenAI's /v1/audio/transcriptions accepts ``response_format`` =
+# json | text | srt | verbose_json | vtt. whisper-server renders those
+# natively; audio.cpp backends only ever return ``{"text": ...}``. The proxy
+# normalises every ASR backend to the requested format so clients always get
+# plain-OpenAI behaviour regardless of which backend is loaded.
+
+_SUBTITLE_CT = {"srt": "application/x-subrip", "vtt": "text/vtt"}
+
+
+def format_transcription(
+    data: Any, fmt: str, language: Optional[str] = None,
+) -> tuple[Any, str]:
+    """Normalise an ASR backend result into the OpenAI-requested format.
+
+    ``data`` is whatever ``proxy_json`` decoded from the backend (a dict for
+    JSON backends, or a plain `str` for backends that already returned
+    text/srt/vtt — e.g. whisper-server). Returns ``(content, content_type)``
+    where ``content`` is a dict for JSON responses and a `str` otherwise.
+    """
+    fmt = (fmt or "json").strip().lower()
+    if fmt not in ("json", "text", "srt", "vtt", "verbose_json"):
+        fmt = "json"
+
+    if isinstance(data, str):
+        # Backend already returned a non-JSON body (whisper text/srt/vtt).
+        if fmt in ("srt", "vtt"):
+            return data, _SUBTITLE_CT[fmt]
+        if fmt == "text":
+            return data, "text/plain"
+        if fmt == "verbose_json":
+            return _verbose_json(data, language), "application/json"
+        return {"text": data}, "application/json"
+
+    if not isinstance(data, dict):
+        return {"text": str(data)}, "application/json"
+
+    text = data.get("text") or ""
+    if not isinstance(text, str):
+        text = str(text)
+
+    if fmt == "text":
+        return text.rstrip("\n") + "\n", "text/plain"
+    if fmt == "verbose_json":
+        return _verbose_dict(data, text, language), "application/json"
+    if fmt in ("srt", "vtt"):
+        segments = data.get("segments") or []
+        if segments:
+            return _render_subtitles(segments, fmt), _SUBTITLE_CT[fmt]
+        # No timing info: fall back to a single untimed cue only when the
+        # backend provided a duration, otherwise degrade to plain text.
+        duration = _as_float(data.get("duration"))
+        if duration > 0:
+            return _render_subtitles(
+                [{"start": 0.0, "end": duration, "text": text}], fmt
+            ), _SUBTITLE_CT[fmt]
+        return text.rstrip("\n") + "\n", "text/plain"
+    # json (default): keep the backend's JSON payload as-is.
+    return data, "application/json"
+
+
+def _verbose_dict(data: dict, text: str, language: Optional[str]) -> dict:
+    obj: dict[str, Any] = {
+        "task": data.get("task", "transcribe"),
+        "language": data.get("language") or language or "",
+        "duration": _as_float(data.get("duration")),
+        "text": text,
+        "segments": data.get("segments") or [],
+    }
+    if data.get("words") is not None:
+        obj["words"] = data["words"]
+    return obj
+
+
+def _verbose_json(text: str, language: Optional[str]) -> dict:
+    return {
+        "task": "transcribe",
+        "language": language or "",
+        "duration": 0.0,
+        "text": text,
+        "segments": [],
+    }
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _render_subtitles(segments: list, fmt: str) -> str:
+    lines: list[str] = []
+    if fmt == "vtt":
+        lines.extend(("WEBVTT", ""))
+    for i, seg in enumerate(segments, start=1):
+        if not isinstance(seg, dict):
+            continue
+        start = _as_float(seg.get("start"))
+        end = _as_float(seg.get("end"))
+        if end <= start:
+            end = start
+        text = str(seg.get("text", "")).strip()
+        if fmt == "srt":
+            lines.extend((
+                str(i),
+                f"{_ts_srt(start)} --> {_ts_srt(end)}",
+                text,
+                "",
+            ))
+        else:
+            lines.extend((
+                f"{_ts_vtt(start)} --> {_ts_vtt(end)}",
+                text,
+                "",
+            ))
+    return "\n".join(lines)
+
+
+def _ts_srt(t: float) -> str:
+    t = max(0.0, t)
+    ms = int(round((t - int(t)) * 1000))
+    s = int(t)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def _ts_vtt(t: float) -> str:
+    t = max(0.0, t)
+    ms = int(round((t - int(t)) * 1000))
+    s = int(t)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
+
+
+# --------------------------------------------------------------------------
+# Speech response-format transcoding (WAV → mp3/opus/aac/flac/pcm)
+# --------------------------------------------------------------------------
+# audio.cpp backends emit WAV only. OpenAI's /v1/audio/speech accepts
+# ``response_format``; the proxy honours it locally via ffmpeg so clients
+# requesting mp3/opus/aac/flac/pcm get the requested codec instead of a
+# mislabelled WAV.
+
+# destination codec -> (content-type, extra ffmpeg argv past `-i pipe:0`)
+_SPEECH_FORMATS: dict[str, tuple[str, list[str]]] = {
+    "mp3": ("audio/mpeg", ["-f", "mp3"]),
+    "opus": ("audio/ogg", ["-f", "ogg", "-c:a", "libopus"]),
+    "aac": ("audio/aac", ["-f", "adts", "-c:a", "aac"]),
+    "flac": ("audio/x-flac", ["-f", "flac"]),
+    "pcm": ("audio/x-pcm", ["-f", "s16le", "-acodec", "pcm_s16le"]),
+}
+
+
+async def transcode_audio(data: bytes, dst: str) -> Optional[tuple[bytes, str]]:
+    """Transcode ``data`` (expected WAV) to OpenAI speech format ``dst``.
+
+    Returns ``(bytes, content_type)`` on success or ``None`` when the
+    conversion cannot be performed (ffmpeg missing, unknown format, or a
+    failed encode) — callers then pass the source bytes through unchanged.
+    """
+    dst = (dst or "wav").strip().lower()
+    if dst == "wav":
+        return data, "audio/wav"
+    spec = _SPEECH_FORMATS.get(dst)
+    if spec is None:
+        return None
+    ctype, args = spec
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        logger.warning("ffmpeg not found; returning %s audio untranscoded", dst)
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0", *args, "-y", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        logger.warning("failed to spawn ffmpeg: %s", exc)
+        return None
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(data), timeout=120.0
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return None
+    if proc.returncode != 0 or not out:
+        logger.warning(
+            "ffmpeg transcode to %s failed: %s", dst, err[:300]
+        )
+        return None
+    return out, ctype

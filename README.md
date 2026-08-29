@@ -475,10 +475,10 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 | `POST /v1/chat/completions` | Chat; `stream: true` for SSE |
 | `POST /v1/completions` | Text completions |
 | `POST /v1/embeddings` | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path |
-| `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out (wav/mp3 depending on backend) |
+| `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out. `response_format` (mp3/opus/aac/flac/pcm/wav) is transcoded from WAV internally via ffmpeg |
 | `POST /v1/audio/speech/stream` | TTS streaming variant (if the backend exposes one) |
-| `POST /v1/audio/transcriptions` | ASR (`role: asr`); OpenAI multipart upload → `{"text": ...}` |
-| `POST /v1/audio/translations` | ASR translate-to-English (whisper.cpp supports via a `translate` form field; others pass through) |
+| `POST /v1/audio/transcriptions` | ASR (`role: asr`); OpenAI multipart upload → `{"text": ...}`. `response_format` = `json`/`text`/`srt`/`vtt`/`verbose_json` is honoured by the proxy regardless of backend |
+| `POST /v1/audio/translations` | ASR translate-to-English (whisper.cpp supports via a `translate` form field; others pass through). Same `response_format` normalisation as transcriptions |
 | `GET /v1/audio/voices` | List TTS voices (pass-through to the tts backend) |
 | `POST /v1/registry/reload` | Re-read `backend/*.yaml` (admin) |
 | `GET /health` | Proxy, current chat llama-server, embedding, and TTS/ASR status (audio/chat report `idle_seconds` while loaded) |
@@ -609,7 +609,15 @@ with open("speech.wav", "rb") as fh:
   seconds.
 - `/v1/audio/speech` returns whatever the backend returns (audio.cpp
   returns WAV; Kokoro-FastAPI would return mp3 — the proxy passes the
-  `Content-Type` through).
+  `Content-Type` through) **unless** the request asks for a different
+  `response_format`, in which case llamaswap transcodes the WAV to
+  mp3/opus/aac/flac/pcm locally with `ffmpeg` (falls back to WAV if
+  `ffmpeg` is not installed).
+- Transcriptions always honour `response_format` (json/text/srt/vtt/
+  verbose_json): whisper.cpp renders these natively, audio.cpp backends get
+  the conversion done inside the proxy, so clients see plain-OpenAI output
+  whichever `model:` is selected. `srt`/`vtt` on a backend without timing
+  data degrade to plain text.
 - Whisper.cpp's whisper-server needs `ffmpeg` for `--convert` (ships in the
   Docker image). The first ASR request after boot loads the model.
 - Chat model first request loads it (13 GB → VRAM); expect 1–3 minutes.

@@ -36,14 +36,20 @@ from .embedding_manager import EmbeddingLoadError, EmbeddingManager
 from .process_manager import ModelLoadError, ProcessManager
 from .proxy import (
     extract_model,
+    extract_response_format,
+    extract_speech_format,
     extract_stream_flag,
+    extract_text_field,
+    format_transcription,
     json_inject_field,
+    json_remove_key,
     multipart_inject_field,
     proxy_json,
     proxy_raw,
     proxy_stream,
     remove_audio_upload,
     save_audio_upload,
+    transcode_audio,
 )
 from .registry import ModelConfig, Registry, RegistryError, UnknownModelError
 
@@ -508,6 +514,11 @@ async def _route_audio(
 
     try:
         if backend_path in ("/v1/audio/speech", "/v1/audio/speech/stream"):
+            # ``response_format`` is an OpenAI-only construct: audio.cpp emits
+            # WAV and does not understand it, so honour it locally via ffmpeg
+            # instead of forwarding it upstream.
+            speech_format = extract_speech_format(out_body)
+            out_body = json_remove_key(out_body, "response_format")
             status, data, ctype = await proxy_raw(
                 cfg.port, cfg.host, backend_path, out_body, headers
             )
@@ -516,12 +527,25 @@ async def _route_audio(
                     status_code=status,
                     content=_maybe_json(data),
                 )
+            if speech_format and speech_format != "wav":
+                transcoded = await transcode_audio(data, speech_format)
+                if transcoded is not None:
+                    data, ctype = transcoded
             return Response(content=data, media_type=ctype)
-        # transcriptions / translations → JSON
+        # transcriptions / translations → normalise to the requested format
         status, data = await proxy_json(
             cfg.port, cfg.host, backend_path, out_body, model, headers
         )
-        return JSONResponse(status_code=status, content=data)
+        if status != 200:
+            return JSONResponse(status_code=status, content=data)
+        fmt = extract_response_format(body, content_type)
+        language = extract_text_field(body, content_type, "language")
+        content, ctype = format_transcription(data, fmt, language=language)
+        if ctype == "application/json":
+            return JSONResponse(status_code=status, content=content)
+        return Response(
+            content=content, media_type=ctype, status_code=status
+        )
     finally:
         remove_audio_upload(translated)
 
