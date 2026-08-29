@@ -1,14 +1,13 @@
-"""Per-role persistent audio servers (TTS / ASR).
+"""Per-role on-demand audio servers (TTS / ASR).
 
-One AudioManager exists per audio role (``tts``, ``asr``). At boot it
-launches the first configured model of the role and keeps it running;
-when a request names a *different* audio model of the same role, the
-manager transparently stops the running server and launches the
-requested one (exactly like the chat-LLM swap path, but scoped to the
-role and without idle unload).
-
-Unlike the embedding server there is no VRAM-fallback interplay: TTS/ASR
-models are tiny, so they simply run alongside the chat LLM.
+One AudioManager exists per audio role (``tts``, ``asr``). Like the
+chat-LLM swap path — and unlike the persistent embedding server — the
+audio servers are **on-demand**: nothing boots with the proxy. The
+first request for a role launches the first configured model; a request
+naming a *different* audio model of the same role transparently stops
+the running server and launches the requested one. After
+``idle_unload_seconds`` with no requests the running server is stopped
+to free VRAM (same idle-unload policy as the chat LLM; 0 disables it).
 
 Health checking is generic — every supported backend (llama-server,
 audio.cpp audiocpp_server, whisper.cpp whisper-server) exposes
@@ -58,15 +57,22 @@ class AudioManager:
 
     def __init__(self, role: str, startup_timeout: float,
                  stop_timeout: float, health_interval: float,
-                 config_dir: str | Path):
+                 config_dir: str | Path, idle_unload_seconds: float = 0.0):
         self.role = role
         self._startup_timeout = startup_timeout
         self._stop_timeout = stop_timeout
         self._health_interval = health_interval
+        self._idle_unload_seconds = idle_unload_seconds
         self._lock = asyncio.Lock()
         self._config_dir = Path(config_dir)
         self._current: Optional[_RunningAudio] = None
         self._configs: dict[str, ModelConfig] = {}
+        self._last_activity: float = 0.0
+        self._idle_task: Optional[asyncio.Task] = None
+        if idle_unload_seconds > 0:
+            self._idle_task = asyncio.get_running_loop().create_task(
+                self._idle_watcher()
+            )
 
     @property
     def name(self) -> Optional[str]:
@@ -108,7 +114,7 @@ class AudioManager:
         if cur is None:
             return {"role": self.role, "state": "stopped", "model": None,
                     "detail": ""}
-        return {
+        info: dict[str, Any] = {
             "role": self.role,
             "state": cur.state.value,
             "model": cur.config.name if cur.state in (
@@ -117,6 +123,11 @@ class AudioManager:
             "port": cur.config.port,
             "detail": cur.detail,
         }
+        if cur.state is AudioState.READY and self._idle_unload_seconds > 0:
+            elapsed = asyncio.get_running_loop().time() - self._last_activity
+            info["idle_seconds"] = max(0.0, round(elapsed, 1))
+            info["idle_unload_seconds"] = self._idle_unload_seconds
+        return info
 
     def _health_url(self, cfg: ModelConfig) -> str:
         return cfg.health_url()
@@ -197,6 +208,7 @@ class AudioManager:
                 [c.name for c in self._configs.values()],
             )
         async with self._lock:
+            self._last_activity = asyncio.get_running_loop().time()
             cur = self._current
             if cur is not None and cur.config.name == name:
                 # Already this model: wait out an in-flight load if needed.
@@ -283,7 +295,39 @@ class AudioManager:
                 self.role, entry.config.name, rc,
             )
 
+    async def _idle_watcher(self) -> None:
+        """Stop the loaded audio server once it has been idle past the timeout."""
+        try:
+            while True:
+                await asyncio.sleep(self._health_interval)
+                if self._current is None:
+                    continue
+                elapsed = asyncio.get_running_loop().time() - self._last_activity
+                if elapsed < self._idle_unload_seconds:
+                    continue
+                async with self._lock:
+                    cur = self._current
+                    if cur is None or cur.state is not AudioState.READY:
+                        continue
+                    elapsed = asyncio.get_running_loop().time() - \
+                        self._last_activity
+                    if elapsed < self._idle_unload_seconds:
+                        continue
+                    logger.info(
+                        "unloading %s model '%s' after %.0fs idle",
+                        self.role, cur.config.name, elapsed,
+                    )
+                    await self._stop_current()
+        except asyncio.CancelledError:
+            raise
+
     async def shutdown(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except asyncio.CancelledError:
+                pass
         async with self._lock:
             await self._stop_current()
 

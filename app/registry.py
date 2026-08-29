@@ -47,7 +47,9 @@ class ModelMeta(BaseModel):
 ROLES = {"llm", "embedding", "tts", "asr"}
 # Roles served by the ProcessManager (one process, swapped on request).
 SWAP_ROLES = {"llm"}
-# Roles served by dedicated persistent managers (boot with the proxy).
+# Roles served by dedicated managers. Only "embedding" is persistent
+# (boots with the proxy); "tts"/"asr" are on-demand and idle-unloaded
+# like the chat LLM, so nothing else runs without a request.
 PERSISTENT_ROLES = {"embedding", "tts", "asr"}
 
 

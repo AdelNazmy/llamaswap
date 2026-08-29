@@ -217,6 +217,31 @@ def multipart_field(body: bytes, content_type: str, name: str) -> Optional[str]:
     return None
 
 
+def multipart_inject_field(body: bytes, content_type: str,
+                           name: str, value: str) -> bytes:
+    """Return ``body`` with a text form field ("name=value") appended.
+
+    The field becomes a new multipart part just before the closing
+    boundary; if a part with the same name already exists (or the body is
+    not a parseable multipart payload), the body is returned unchanged.
+    """
+    m = _MULTIPART_RE.search(content_type or "")
+    if not m:
+        return body
+    if multipart_field(body, content_type, name) is not None:
+        return body
+    boundary = f"--{m.group(1)}".encode()
+    closing = boundary + b"--"
+    if closing not in body:
+        return body
+    part = (
+        boundary + b"\r\n"
+        + f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        + value.encode() + b"\r\n" + closing
+    )
+    return body.replace(closing, part)
+
+
 def multipart_file(body: bytes, content_type: str) -> Optional[tuple[str, bytes]]:
     """Filename and content of the uploaded 'file' part, or None."""
     for head, payload in _multipart_parts(body, content_type):

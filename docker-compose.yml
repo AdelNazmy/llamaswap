@@ -20,6 +20,8 @@ services:
       LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-600.0}"
       LLAMASWAP_STOP_TIMEOUT: "${LLAMASWAP_STOP_TIMEOUT:-30.0}"
       LLAMASWAP_HEALTH_INTERVAL: "${LLAMASWAP_HEALTH_INTERVAL:-1.0}"
+      # Unload the chat LLM AND audio (tts/asr) servers after this many
+      # idle seconds; only the embedding server stays up.
       LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"

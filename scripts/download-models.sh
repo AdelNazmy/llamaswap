@@ -17,6 +17,9 @@
 #   asr      Qwen3-ASR 0.6B Q8_0 GGUF  (audio.cpp family `qwen3_asr`,
 #            used by backend/qwen3-asr.yaml)
 #   whisper  ggml-base.en (whisper.cpp, used by backend/whisper-asr.yaml)
+#   whisper-multi  ggml-base (multilingual whisper.cpp; enables real
+#            translation for /v1/audio/translations — point whisper-asr.yaml's
+#            -m at ggml-base.bin to use it)
 #
 # Env:
 #   MODEL_ROOT  model directory (default: /opt/models)
@@ -34,6 +37,7 @@ tts|https://huggingface.co/mirek190/audio.cpp/resolve/main/Text%20to%20audio%20(
 tts-qwen3|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf|Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf
 asr|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf|Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
 whisper|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin|ggml-base.en.bin
+whisper-multi|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin|ggml-base.bin
 nemotron_asr|https://huggingface.co/audio-cpp/audio.cpp-gguf/blob/main/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf|Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf
 supertonic_3|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Supertonic-3-GGUF/supertonic-3-q8_0.gguf|Supertonic-3-GGUF/supertonic-3-q8_0.gguf
 '
@@ -60,14 +64,14 @@ download_one() {
 
 main() {
     if [ $# -eq 0 ]; then
-        set -- tts asr whisper tts-qwen3 nemotron_asr supertonic_3
+        set -- tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3
     fi
     echo "Model root: $MODEL_ROOT"
     rc=0
     for name in "$@"; do
         spec=$(resolve "$name")
         if [ -z "$spec" ]; then
-            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper)" >&2
+            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi)" >&2
             rc=1
             continue
         fi

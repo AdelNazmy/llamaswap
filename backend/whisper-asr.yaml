@@ -34,5 +34,9 @@ host: 127.0.0.1
 port: 8105
 meta:
   family: whisper
-  capabilities: [asr]
+  capabilities: [asr, translate]
   request_format: multipart
+  # The OpenAI /v1/audio/translations endpoint is rewritten by the proxy to
+  # this backend route with a `translate` form field injected (whisper.cpp's
+  # translate lives on its inference path, not a dedicated route).
+  translation_target: /v1/audio/transcriptions

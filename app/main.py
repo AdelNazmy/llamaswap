@@ -1,14 +1,19 @@
 """llamaswap — an OpenAI-compatible proxy in front of llama-server.
 
 Model registry lives in backend/*.yaml; the requested model is launched
-(or swapped in) transparently on demand. Alongside the chat LLM swap
-path there are persistent per-role servers:
+(or swapped in) transparently on demand. Only the embedding server is
+persistent; everything else is on-demand and idle-unloaded like the chat
+LLM:
 
-  * ``embedding`` — a dedicated embedding llama-server (EmbeddingManager)
-  * ``tts`` / ``asr`` — persistent audio servers (AudioManager) that can
-    swap between backends per request (e.g. qwen3-asr vs whisper-server)
-    and are proxied through the OpenAI audio endpoints
-    (/v1/audio/speech, /v1/audio/transcriptions, ...).
+  * ``embedding`` — dedicated embedding llama-server (EmbeddingManager),
+    started at boot and kept running (only stopped to free VRAM for an LLM)
+  * ``chat`` — one LLM at a time (ProcessManager), swapped on request and
+    unloaded after ``idle_unload_seconds`` with no requests
+  * ``tts`` / ``asr`` — audio servers (AudioManager) that boot on first
+    use, swap between backends per request (e.g. qwen3-asr vs
+    whisper-server) and idle-unload like the chat LLM; proxied through
+    the OpenAI audio endpoints (/v1/audio/speech,
+    /v1/audio/transcriptions, ...).
 """
 
 import asyncio
@@ -29,6 +34,7 @@ from .process_manager import ModelLoadError, ProcessManager
 from .proxy import (
     extract_model,
     extract_stream_flag,
+    multipart_inject_field,
     proxy_json,
     proxy_raw,
     proxy_stream,
@@ -70,8 +76,9 @@ async def lifespan(app: FastAPI):
         health_interval=settings.health_interval,
         idle_unload_seconds=settings.idle_unload_seconds,
     )
-    # Audio (tts/asr) managers: one per role, booted with the first
-    # configured model and swapped per request.
+    # Audio (tts/asr) managers: one per role, on-demand like the chat
+    # LLM — nothing boots here, the first request launches a server
+    # (see _route_audio and AudioManager.ensure_model).
     app.state.audio_managers: dict[str, AudioManager] = {}
     for role in ("tts", "asr"):
         manager = AudioManager(
@@ -79,6 +86,7 @@ async def lifespan(app: FastAPI):
             startup_timeout=settings.startup_timeout,
             stop_timeout=settings.stop_timeout,
             health_interval=settings.health_interval,
+            idle_unload_seconds=settings.idle_unload_seconds,
             config_dir=settings.audio_tmp_dir,
         )
         manager.configure(app.state.registry.role_configs(role))
@@ -102,14 +110,6 @@ async def lifespan(app: FastAPI):
             logger.error(
                 "embedding server failed to start at boot: %s", exc
             )
-    for role in ("tts", "asr"):
-        manager = app.state.audio_managers[role]
-        first = manager.first_config_name()
-        if first is not None:
-            try:
-                await manager.ensure_model(first, app.state.registry)
-            except (AudioLoadError, UnknownModelError) as exc:
-                logger.error("%s server failed to start at boot: %s", role, exc)
     logger.info(
         "llamaswap ready on %s:%d (%d models)",
         settings.host, settings.port, len(app.state.registry.models),
@@ -172,25 +172,11 @@ async def reload_registry(request: Request):
     except RegistryError as exc:
         status, body = _error(500, str(exc), "server_error")
         return JSONResponse(status_code=status, content=body)
-    # Refresh per-role audio configs; ensure at least one model is loaded
-    # (best-effort, non-blocking on failure).
+    # Refresh per-role audio configs only — servers boot on first use and
+    # are idle-unloaded, so never pre-start them here.
     for role, manager in request.app.state.audio_managers.items():
         manager.configure(registry.role_configs(role))
-        first = manager.first_config_name()
-        if first is not None and not manager.is_running:
-            asyncio.get_running_loop().create_task(
-                _ensure_audio_best_effort(manager, first, registry)
-            )
     return {"reloaded": True, "models": request.app.state.registry.names()}
-
-
-async def _ensure_audio_best_effort(
-    manager: AudioManager, name: str, registry: Registry,
-) -> None:
-    try:
-        await manager.ensure_model(name, registry)
-    except (AudioLoadError, UnknownModelError) as exc:
-        logger.warning("%s server could not be (re)loaded: %s", manager.role, exc)
 
 
 async def _ensure_and_route(
@@ -342,12 +328,13 @@ async def _route_audio(
     request: Request, role: str, backend_path: str, *,
     expect_body_model: bool = True,
 ):
-    """Route an OpenAI audio request to the persistent ``role`` manager.
+    """Route an OpenAI audio request to the on-demand ``role`` manager.
 
     ``role`` is "tts" or "asr". The request body may be JSON (speech) or
     multipart/form-data (transcriptions). The model field (JSON or form)
-    selects which backend of the role to load; llamaswap swaps the running
-    server when it differs.
+    selects which backend of the role to load; llamaswap starts the
+    server on first use (or swaps the running one when the model differs)
+    and idle-unloads it after ``idle_unload_seconds`` with no requests.
     """
     registry: Registry = request.app.state.registry
     manager: AudioManager = request.app.state.audio_managers[role]
@@ -425,6 +412,37 @@ async def _route_audio(
             # Client already sent the audio.cpp JSON dialect; pass through.
             pass
 
+    # /v1/audio/translations: OpenAI semantics = transcribe + translate to
+    # English. No backend exposes a dedicated translations route; those that
+    # can translate accept a flag on their transcription route instead, so
+    # rewrite the request to that route (meta.translation_target) with the
+    # flag set. Backends without translation support get a clear error.
+    if backend_path == "/v1/audio/translations":
+        # pydantic extra="allow": unset extras raise AttributeError on
+        # attribute access, so go through getattr.
+        target = getattr(cfg.meta, "translation_target", None)
+        if not target:
+            status, payload = _error(
+                400,
+                f"model '{model}' does not support translation "
+                f"(backend '{cfg.meta.family or cfg.name}' has no "
+                "translate-capable route)",
+            )
+            return JSONResponse(status_code=status, content=payload)
+        if "multipart/form-data" in content_type.lower():
+            out_body = multipart_inject_field(
+                body, content_type, "translate", "true"
+            )
+        elif "application/json" in content_type.lower():
+            # JSON-dialect backend that translates: flag it in the body.
+            try:
+                obj = json.loads(body)
+                obj["translate"] = True
+                out_body = json.dumps(obj).encode()
+            except (ValueError, TypeError):
+                pass
+        backend_path = target
+
     try:
         if backend_path in ("/v1/audio/speech", "/v1/audio/speech/stream"):
             status, data, ctype = await proxy_raw(
@@ -469,8 +487,11 @@ async def audio_transcriptions(request: Request):
 
 @app.post("/v1/audio/translations")
 async def audio_translations(request: Request):
-    # Whisper.cpp's whisper-server accepts a `translate` form field; other
-    # backends may reject it — the upstream error is passed through.
+    # OpenAI semantics: transcribe *and* translate to English. Backends
+    # don't expose a /v1/audio/translations route directly; models that can
+    # translate (meta.translation_target set, e.g. whisper.cpp) get the
+    # request rewritten onto their transcription route with the translate
+    # flag set; models without translation support get a clear 400.
     return await _route_audio(request, "asr", "/v1/audio/translations")
 
 

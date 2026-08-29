@@ -5,13 +5,18 @@ YAML-driven model registry. Point any OpenAI client at it and switch chat
 models per request — the backend chat `llama-server` is stopped and
 relaunched transparently with the launch command of the requested model.
 
-A dedicated embedding `llama-server` can also run persistently on its own
-port, so `/v1/embeddings` does not disturb the currently loaded chat model.
+A dedicated embedding `llama-server` runs persistently on its own port, so
+`/v1/embeddings` does not disturb the currently loaded chat model.
 
-The same idea powers the OpenAI **audio API**: persistent per-role TTS/ASR
-servers (`/v1/audio/speech`, `/v1/audio/transcriptions`) that can be
-switched between backends per request — e.g. audio.cpp's Qwen3-ASR vs
+The OpenAI **audio API** is served by per-role TTS/ASR servers
+(`/v1/audio/speech`, `/v1/audio/transcriptions`) that can be switched
+between backends per request — e.g. audio.cpp's Qwen3-ASR vs
 whisper.cpp's whisper-server — without touching the loaded chat LLM.
+
+**Only the embedding server is persistent.** The chat LLM and every
+TTS/ASR server are on-demand: nothing boots until a request names them,
+and each is stopped again after `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default
+300 s) with no requests — the same idle-unload policy everywhere.
 
 ## How it works
 
@@ -22,15 +27,15 @@ OpenAI client (port 11434)
         ▼
 llamaswap (FastAPI)
   • model registry        ← backend/*.yaml
-  • LLM process manager   ← start / stop / swap chat llama-server
+  • LLM process manager   ← start / stop / swap chat llama-server (on-demand)
   • embedding manager     ← persistent embedding llama-server
-  • audio managers        ← persistent per-role TTS/ASR servers (t+r)
+  • audio managers        ← on-demand per-role TTS/ASR servers (t+r)
         │  HTTP (streaming pass-through / binary pass-through)
-        ├── llama-server chat   (127.0.0.1:8101, one at a time)
+        ├── llama-server chat   (127.0.0.1:8101, on-demand + idle unload)
         ├── llama-server embed (127.0.0.1:8102, persistent)
-        ├── audiocpp_server TTS (127.0.0.1:8103, persistent, swappable)
-        ├── audiocpp_server ASR (127.0.0.1:8104, persistent, swappable)
-        └── whisper-server ASR  (127.0.0.1:8105, persistent, swappable)
+        ├── audiocpp_server TTS (127.0.0.1:8103, on-demand, swappable)
+        ├── audiocpp_server ASR (127.0.0.1:8104, on-demand, swappable)
+        └── whisper-server ASR  (127.0.0.1:8105, on-demand, swappable)
 ```
 
 - **One chat LLM at a time.** A 13 GB model does not fit twice on a 16 GB
@@ -51,12 +56,14 @@ llamaswap (FastAPI)
 - **OpenAI compatible.** llama-server already speaks the OpenAI protocol; the
   proxy passes it through (SSE streams included) and rewrites response
   `model` fields to the model named in the request.
-- **TTS / ASR with a switch.** A `role: tts` or `role: asr` model runs as a
-  persistent server. When a request names a different audio model of the
-  same role, the running server is stopped and the requested one launched —
-  e.g. `/v1/audio/transcriptions` with `model: "whisper-asr"` loads
-  whisper.cpp, with `model: "qwen3-asr"` loads audio.cpp. Both appear in
-  `/v1/models`; whichever is requested gets loaded.
+- **TTS / ASR with a switch.** A `role: tts` or `role: asr` model is
+  on-demand: the first request of a role boots its server, a request
+  naming a different audio model of the same role stops the running server
+  and launches the requested one, and after `idle_unload_seconds` with no
+  requests it is stopped again — e.g. `/v1/audio/transcriptions` with
+  `model: "whisper-asr"` loads whisper.cpp, with `model: "qwen3-asr"`
+  loads audio.cpp. Both appear in `/v1/models`; whichever is requested
+  gets loaded.
 - **Backend dialect translation.** whisper.cpp's whisper-server speaks the
   OpenAI multipart upload natively (`request_format: multipart`);
   audio.cpp's transcription endpoint takes a server-side file path
@@ -78,7 +85,7 @@ llamaswap/
 │   ├── registry.py           # YAML → validated ModelConfig objects
 │   ├── process_manager.py    # chat llama-server lifecycle + health checks
 │   ├── embedding_manager.py  # persistent embedding llama-server lifecycle
-│   ├── audio_manager.py      # persistent per-role TTS/ASR lifecycle + swap
+│   ├── audio_manager.py      # on-demand per-role TTS/ASR lifecycle + swap + idle unload
 │   ├── proxy.py              # async reverse proxy (stream / raw / multipart)
 │   └── main.py               # FastAPI routes (OpenAI API)
 ├── requirements.txt
@@ -125,11 +132,13 @@ meta:
 `role: embedding` model runs persistently on its own port (usually `8102`)
 and should pass `--embedding` in `args`.
 
-`role: tts` / `role: asr` models are persistent per-role servers. Any
-number of them can be defined; the first one boots with the proxy and a
-request naming a different audio model of the same role swaps the server
-(`/v1/audio/speech` → the `tts` role; `/v1/audio/transcriptions` → the
-`asr` role). Each audio model needs its own port (`8103`+ recommended).
+`role: tts` / `role: asr` models are on-demand per-role servers: nothing
+boots with the proxy — the first request of a role launches its first
+configured model, a request naming a different audio model of the same
+role swaps the server (`/v1/audio/speech` → the `tts` role;
+`/v1/audio/transcriptions` → the `asr` role), and the server is stopped
+after `LLAMASWAP_IDLE_UNLOAD_SECONDS` with no requests (same policy as
+the chat LLM). Each audio model needs its own port (`8103`+ recommended).
 
 `meta.request_format` tells the proxy which request dialect the backend
 speaks (default `json`):
@@ -458,7 +467,7 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 | `POST /v1/audio/translations` | ASR translate-to-English (whisper.cpp supports via a `translate` form field; others pass through) |
 | `GET /v1/audio/voices` | List TTS voices (pass-through to the tts backend) |
 | `POST /v1/registry/reload` | Re-read `backend/*.yaml` (admin) |
-| `GET /health` | Proxy, current chat llama-server, embedding, and TTS/ASR status |
+| `GET /health` | Proxy, current chat llama-server, embedding, and TTS/ASR status (audio/chat report `idle_seconds` while loaded) |
 
 ### Examples
 
@@ -502,7 +511,7 @@ curl -s localhost:11434/v1/embeddings -d '{
   "input": "hello world"
 }'
 
-# TTS — served by the persistent tts server (audio.cpp / outetts)
+# TTS — boots on first use, then idle-unloads like the chat LLM (audio.cpp / outetts)
 curl -s localhost:11434/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model": "outetts", "input": "Hello from llamaswap!", "voice": "af_sky"}' \
@@ -554,11 +563,14 @@ with open("speech.wav", "rb") as fh:
 
 - The persistent embedding server starts with the proxy. If it fails to
   start, the proxy still starts and reports the embedding state in
-  `/health`. TTS/ASR servers behave the same way (per role).
-- TTS/ASR models are small: the persistent audio servers run alongside the
-  chat LLM and are never stopped to free VRAM. Switching between audio
-  backends of the same role (e.g. `whisper-asr` ↔ `qwen3-asr`) stops the
-  previous audio server and starts the requested one — a few seconds.
+  `/health`. The chat LLM and TTS/ASR servers start on first use instead
+  of booting with the proxy.
+- The chat LLM and TTS/ASR servers are stopped after
+  `LLAMASWAP_IDLE_UNLOAD_SECONDS` with no requests (`/health` shows
+  `idle_seconds`); only the embedding server stays up. Switching between
+  audio backends of the same role (e.g. `whisper-asr` ↔ `qwen3-asr`)
+  stops the previous audio server and starts the requested one — a few
+  seconds.
 - `/v1/audio/speech` returns whatever the backend returns (audio.cpp
   returns WAV; Kokoro-FastAPI would return mp3 — the proxy passes the
   `Content-Type` through).
