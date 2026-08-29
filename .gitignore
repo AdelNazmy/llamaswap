@@ -2,3 +2,4 @@ __pycache__
 app/__pycache__/*
 data
 linkedin-post.md
+test_output
