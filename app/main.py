@@ -140,8 +140,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="llamaswap", version="0.1.0", lifespan=lifespan)
 
 
-@app.get("/health")
-async def health(request: Request):
+def _health_snapshot(request: Request) -> dict:
+    """Full proxy status: chat LLM, embedding, and TTS/ASR managers."""
     embedding_manager: Optional[EmbeddingManager] = (
         request.app.state.embedding_manager
     )
@@ -158,6 +158,11 @@ async def health(request: Request):
             for role, manager in request.app.state.audio_managers.items()
         },
     }
+
+
+@app.get("/health")
+async def health(request: Request):
+    return _health_snapshot(request)
 
 
 @app.get("/v1/models")
@@ -197,24 +202,20 @@ async def reset(request: Request):
     """Unload every loaded backend: chat LLM, TTS/ASR audio servers, and
     the persistent embedding server. Everything boots again on its next
     request (the embedding server also best-effort relaunches after a
-    chat request, per its persistent role)."""
+    chat request, per its persistent role). Returns the full post-reset
+    /health snapshot."""
     chat_manager = request.app.state.manager
     audio_managers = request.app.state.audio_managers
     embedding_manager = request.app.state.embedding_manager
 
-    chat = await chat_manager.unload()
-    audio = {
-        role: await mgr.unload() for role, mgr in audio_managers.items()
-    }
-    emb = False
+    await chat_manager.unload()
+    for mgr in audio_managers.values():
+        await mgr.unload()
     if embedding_manager is not None:
-        emb = embedding_manager.is_running or embedding_manager.is_loading
         await embedding_manager.stop()
 
-    return {
-        "reset": True,
-        "unloaded": {"chat": chat, "audio": audio, "embedding": emb},
-    }
+    # Respond with the full post-reset /health snapshot.
+    return _health_snapshot(request)
 
 
 async def _ensure_and_route(

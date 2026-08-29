@@ -505,7 +505,7 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 | `POST /v1/audio/translations` | ASR translate-to-English (whisper.cpp supports via a `translate` form field; others pass through). Same `response_format` normalisation as transcriptions |
 | `GET /v1/audio/voices` | List TTS voices (pass-through to the tts backend) |
 | `POST /v1/registry/reload` | Re-read `backend/*.yaml` (admin) |
-| `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, and the persistent embedding server (admin). Each boots again on its next request |
+| `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
 | `GET /health` | Proxy, current chat llama-server, embedding, and TTS/ASR status (audio/chat report `idle_seconds` while loaded) |
 
 ### Examples
