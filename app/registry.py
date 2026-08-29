@@ -182,7 +182,19 @@ class Registry:
     def __init__(self, backend_dir: str | Path):
         self.backend_dir = Path(backend_dir)
         self.models: dict[str, ModelConfig] = {}
+        self._llm_sizes: dict[str, int] = {}
         self.reload()
+
+    @staticmethod
+    def _model_path(cfg: ModelConfig) -> Optional[str]:
+        """Weights file path from the config's --model arg, if present."""
+        args = cfg.command.args
+        for i, a in enumerate(args):
+            if a == "--model" and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith("--model="):
+                return a.split("=", 1)[1]
+        return None
 
     def reload(self) -> None:
         if not self.backend_dir.is_dir():
@@ -196,12 +208,36 @@ class Registry:
                 raise RegistryError(f"invalid model config {path.name}: {exc}") from exc
             models[cfg.name] = cfg
         self.models = models
+        # Size (bytes) of each chat LLM's weights file, used by
+        # smallest_llm() as the proxy for VRAM footprint.
+        llm_sizes: dict[str, int] = {}
+        for name, cfg in models.items():
+            if cfg.role != "llm":
+                continue
+            path = self._model_path(cfg)
+            if path:
+                try:
+                    llm_sizes[name] = Path(path).stat().st_size
+                except OSError:
+                    logger.warning(
+                        "cannot stat model file for '%s': %s", name, path
+                    )
+        self._llm_sizes = llm_sizes
         logger.info(
             "registry loaded %d model(s) from %s: %s",
             len(models),
             self.backend_dir,
             ", ".join(models) or "(none)",
         )
+
+    def smallest_llm(self) -> Optional[str]:
+        """Name of the chat (role: llm) model with the smallest weights
+        file on disk — the cheapest VRAM footprint — or None if there are
+        no size-ranked chat models. Ties resolve to the first in sorted
+        registry order."""
+        if not self._llm_sizes:
+            return None
+        return min(self._llm_sizes, key=lambda name: self._llm_sizes[name])
 
     def get(self, name: str) -> ModelConfig:
         cfg = self.models.get(name)

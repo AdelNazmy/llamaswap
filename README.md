@@ -50,6 +50,11 @@ llamaswap (FastAPI)
 - **Resource fallback.** If a chat model fails to load while the embedding
   server is running, llamaswap stops the embedding server, retries the chat
   load once, and then best-effort relaunches embeddings in the background.
+- **VRAM guard.** While tts AND asr servers are both loaded, only the
+  smallest chat LLM (smallest weights file on disk) is served — a
+  request for a bigger chat model transparently loads the smallest one
+  instead, and the audio servers keep running. Once either audio role
+  idle-unloads, normal model selection resumes
 - **Registry.** Every file in `backend/` is one model: the exact
   binary + arguments + env + port. Add a file, reload, done. Works for any
   OpenAI-compatible backend, not just llama-server.
@@ -78,7 +83,10 @@ llamaswap/
 │   ├── octen-embedding.yaml  # persistent embedding server
 │   ├── qwen3.8-27b.yaml      # chat LLMs
 │   ├── outetts-tts.yaml      # TTS: OuteTTS via audio.cpp (role: tts)
+│   ├── qwen3-tts.yaml        # TTS: Qwen3-TTS 12Hz 0.6B (voice clone) via audio.cpp
+│   ├── supertonic-3.yaml     # TTS: Supertonic 3 (preset voices) via audio.cpp
 │   ├── qwen3-asr.yaml        # ASR: Qwen3-ASR via audio.cpp (role: asr)
+│   ├── nemotron-asr.yaml     # ASR: Nemotron 3.5 ASR Streaming via audio.cpp
 │   └── whisper-asr.yaml      # ASR: Whisper via whisper.cpp (role: asr)
 ├── app/
 │   ├── config.py             # settings (env prefix LLAMASWAP_)
@@ -125,8 +133,8 @@ meta:
 |---|---|---|---|
 | `llm` | ProcessManager | yes | `qwen3.8-27b` |
 | `embedding` | EmbeddingManager | no (single) | `octen-embedding-0.6b` |
-| `tts` | AudioManager | yes (among tts models) | `outetts` |
-| `asr` | AudioManager | yes (among asr models) | `whisper-asr`, `qwen3-asr` |
+| `tts` | AudioManager | yes (among tts models) | `outetts`, `qwen3-tts`, `supertonic-3` |
+| `asr` | AudioManager | yes (among asr models) | `whisper-asr`, `qwen3-asr`, `nemotron-asr` |
 
 `role: llm` models are swapped on request by the normal path. A single
 `role: embedding` model runs persistently on its own port (usually `8102`)
@@ -238,17 +246,17 @@ mkdir -p /opt/audio.cpp
 cd /opt/audio.cpp
 git clone --depth 1 --branch v0.7.0 https://github.com/0xShug0/audio.cpp .
 git submodule update --init --recursive
-# Only the outetts (TTS) + qwen3_asr (ASR) models are compiled in, which
-# keeps the build time and binary small. Drop AUDIOCPP_MODEL_SET /
+# Only the compiled model loaders below ship in the binary, which keeps
+# the build time and binary small. Drop AUDIOCPP_MODEL_SET /
 # AUDIOCPP_MODELS to build the full model set instead.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENGINE_ENABLE_CUDA=ON \
-    -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS="outetts,qwen3_asr,supertonic,nemotron_asr"
+    -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS="outetts,qwen3_asr,qwen3_tts,supertonic,nemotron_asr"
 # Cap at 70% of available cores so nvcc does not saturate the host
 # (28 threads -> -j19; 20 cores -> -j14).
 cmake --build build --parallel $(($(nproc) * 7 / 10)) --target audiocpp_server
 ```
 
-> The custom model set above only compiles the `outetts` + `qwen3_asr` + `supertonic` + `nemotron_asr`
+> The custom model set above only compiles the `outetts` + `qwen3_tts` + `qwen3_asr` + `supertonic` + `nemotron_asr`
 > loaders (small binary, fast build). To use the higher-quality families
 > below (Higgs Audio, IndexTTS, VibeVoice, VoxCPM2, Nemotron/Parakeet ASR,
 > ...), build with the **full model set** instead — drop the
@@ -285,7 +293,7 @@ the same way through `request_format: json_path`.
 
 | Family | Model | Notes |
 |---|---|---|
-| `qwen3_tts` | Qwen3-TTS 1.7B Base/CustomVoice | Best size/quality ratio; Clone + Design variants (script: `tts-qwen3`) |
+| `qwen3_tts` | Qwen3-TTS 12Hz 0.6B/1.7B Base | Best size/quality ratio; the 12Hz 0.6B Base config here is a voice-clone model (reference audio required, no preset voice) (script: `tts-qwen3`) |
 | `omnivoice` | OmniVoice (Qwen3-0.6B) | 646+ languages, Clone/Design/Ctrl |
 | `magpie_tts` | NVIDIA MagpieTTS 357M | Tiny, crisp, multilingual (12 langs) |
 | `supertonic` | Supertonic 3 | Very fast (200x+ real-time on CUDA), en + 31 langs |
@@ -323,10 +331,16 @@ trade-off for zh/en.
 > `outetts-tts.yaml` with the matching `family:` + `path:`.
 
 ```bash
-# Models (downloads the missing weights into /opt/models):
-#   TTS: OuteTTS 1.0 1B Q8_0 GGUF (family `outetts`)
-#   ASR: Qwen3-ASR 0.6B Q8_0 GGUF (family `qwen3_asr`)
-./scripts/download-models.sh tts asr
+# Models (downloads the missing weights into /opt/models; re-run to fetch
+# anything missing, e.g. after adding a new backend yaml):
+#   tts             OuteTTS 1.0 1B Q8_0 (family `outetts`)
+#   tts-qwen3       Qwen3-TTS 12Hz 0.6B Base Q8_0 (family `qwen3_tts`)
+#   supertonic_3    Supertonic 3 Q8_0 (family `supertonic`)
+#   asr             Qwen3-ASR 0.6B Q8_0 (family `qwen3_asr`)
+#   nemotron_asr    Nemotron 3.5 ASR Streaming 0.6B Q8_0 (family `nemotron_asr`)
+#   whisper         ggml-base.en (whisper.cpp)
+#   whisper-multi   ggml-base (multilingual whisper.cpp)
+./scripts/download-models.sh tts tts-qwen3 supertonic_3 asr nemotron_asr whisper
 ```
 
 The binary ends up at `build/bin/audiocpp_server`. The Docker overlay
@@ -517,8 +531,25 @@ curl -s localhost:11434/v1/audio/speech \
   -d '{"model": "outetts", "input": "Hello from llamaswap!", "voice": "af_sky"}' \
   -o out.wav
 
+# TTS — switch to another audio.cpp backend per request (voice_id = preset voice)
+curl -s localhost:11434/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "supertonic-3", "input": "Hello!", "voice": "F1"}' \
+  -o supertonic.wav
+
+# TTS — Supertonic preset voices: F1..F5, M1..M5 (31 languages)
+curl -s localhost:11434/v1/audio/voices
+
+# qwen3-tts is the Qwen3-TTS 12Hz 0.6B *Base* variant: a voice-clone model,
+# so it requires reference audio (backend dialect) and has no preset voice.
+# Without it the backend returns "requires voice clone reference audio".
+curl -s localhost:11434/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3-tts", "input": "Hello!", "reference_text": "...", "reference_audio": "..."}' \
+  -o qwen3tts.wav
+
 # ASR — multipart upload; the `model` field picks the ASR backend and
-# llamaswap swaps it in transparently (whisper.cpp vs audio.cpp qwen3-asr)
+# llamaswap swaps it in transparently (whisper.cpp vs audio.cpp qwen3-asr / nemotron-asr)
 curl -s localhost:11434/v1/audio/transcriptions \
   -F 'model=whisper-asr' -F 'file=@speech.wav' -F 'response_format=json'
 
@@ -526,6 +557,11 @@ curl -s localhost:11434/v1/audio/transcriptions \
 # starts audio.cpp qwen3-asr, then forwards the file internally
 curl -s localhost:11434/v1/audio/transcriptions \
   -F 'model=qwen3-asr' -F 'file=@speech.wav'
+
+# Nemotron 3.5 ASR Streaming 0.6B — 40 language-locales, punctuation/
+# capitalization, automatic language detection (audio.cpp json_path dialect)
+curl -s localhost:11434/v1/audio/transcriptions \
+  -F 'model=nemotron-asr' -F 'file=@speech.wav' -F 'response_format=json'
 ```
 
 OpenAI SDK:

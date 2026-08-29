@@ -1,0 +1,41 @@
+# TTS model: Supertonic 3 (Q8_0) via audio.cpp audiocpp_server
+#
+# Supertone on-device TTS: fast local synthesis across 31 languages with
+# preset voices (see /v1/audio/voices once the tts role is running).
+# Another switchable TTS backend alongside outetts / qwen3-tts.
+#
+# Managed by the AudioManager (on-demand per-role server, role: tts).
+#
+# Install the model (scripts/download-models.sh):
+#   ./scripts/download-models.sh supertonic_3  # -> /opt/models/Supertonic-3-GGUF/...
+# (GGUF from hf.co/audio-cpp/audio.cpp-gguf)
+name: supertonic-3
+description: "Supertonic 3 Q8_0 (audio.cpp) — fast multilingual TTS with preset voices"
+role: tts
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+    - "--model-spec-override"
+    - "/opt/audio.cpp/model_specs"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: supertonic
+        path: /opt/models/Supertonic-3-GGUF/supertonic-3-q8_0.gguf
+        task: tts
+        mode: offline
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8108
+meta:
+  family: supertonic
+  capabilities: [tts]
+  request_format: json

@@ -1,21 +1,19 @@
-# Vision chat model: Qwen3.6 35B MoE (IQ3_XXS) + mmproj projector
-name: qwen3.6-35b-vision
-description: "Qwen3.6 35B-A3B MoE, IQ3_XXS quant, multimodal chat (image + text)"
+# Text chat model: Qwen3.8 27B (Q3_K_XL)
+name: qwen3.8-27b-ridge
+description: "Qwen3.8 27B dense, Ridge, text chat 130k"
 command:
   binary: /opt/llama.cpp/build/bin/llama-server
   args:
     - "--model"
-    - "/opt/models/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf"
-    - "--mmproj"
-    - "/opt/models/Qwen3.6-mmproj-BF16.gguf"
+    - "/opt/models/Qwen3.8-27B-Ridge-3.7bpw.gguf"
     - "--ctx-size"
-    - "32000"
+    - "131000"
     - "--n-gpu-layers"
     - "999"
     - "--cache-type-k"
-    - "q8_0"
+    - "q4_0"
     - "--cache-type-v"
-    - "q8_0"
+    - "q4_0"
     - "--flash-attn"
     - "on"
     - "--parallel"
@@ -26,22 +24,17 @@ command:
     - "ngram-mod"
     - "--log-colors"
     - "on"
-    - "--batch-size"
-    - "1024"
-    - "--ubatch-size"
-    - "256"
     - "--reasoning-budget"
     - "1024"
-    - "--kv-unified"
-    - "--cache-idle-slots"
     - "--mmap"
     - "--mlock"
     - "--jinja"
   env:
     CUDA_VISIBLE_DEVICES: "0"
+# internal llama-server binding (enforced by the proxy; one model at a time)
 host: 127.0.0.1
 port: 8101
 meta:
-  context_length: 32000
+  context_length: 131000
   family: qwen
-  capabilities: [chat, vision]
+  capabilities: [chat]

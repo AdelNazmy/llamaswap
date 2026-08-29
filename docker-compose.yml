@@ -23,6 +23,9 @@ services:
       # Unload the chat LLM AND audio (tts/asr) servers after this many
       # idle seconds; only the embedding server stays up.
       LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
+      # While tts AND asr are both loaded, serve only the smallest chat
+      # LLM (weights-file size) instead of the requested one.
+      LLAMASWAP_AUDIO_VRAM_GUARD: "${LLAMASWAP_AUDIO_VRAM_GUARD:-true}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
     volumes:

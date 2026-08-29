@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # Unload the loaded LLM / audio server after this many seconds with no
     # requests. 0 disables idle unload (default).
     idle_unload_seconds: float = 300
+    # When both audio roles (tts AND asr) are loaded, only the smallest
+    # chat LLM (smallest weights file) may be served — TTS + ASR + a big
+    # LLM may not fit on one GPU. The requested chat model is substituted
+    # with the smallest one and the swap happens as usual; set false to
+    # disable.
+    audio_vram_guard: bool = True
     # Where the proxy stages uploaded audio files for backends whose
     # transcription API takes a server-side path (audio.cpp). Must be
     # writable by llamaswap AND readable by the backend process.

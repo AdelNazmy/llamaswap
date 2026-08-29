@@ -1,0 +1,41 @@
+# TTS model: Qwen3-TTS 12Hz 0.6B Base (Q8_0) via audio.cpp audiocpp_server
+#
+# Alternative TTS backend to outetts (same role, swapped per request via
+# the `model` field of /v1/audio/speech). Qwen3-TTS is an instruction-
+# following TTS; the 12Hz codec produces 24 kHz audio.
+#
+# Managed by the AudioManager (on-demand per-role server, role: tts).
+#
+# Install the model (scripts/download-models.sh):
+#   ./scripts/download-models.sh tts-qwen3  # -> /opt/models/Qwen3-TTS-12Hz-0.6B-Base-GGUF/...
+# (GGUF from hf.co/audio-cpp/audio.cpp-gguf)
+name: qwen3-tts
+description: "Qwen3-TTS 12Hz 0.6B Base Q8_0 (audio.cpp) — text-to-speech"
+role: tts
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+    - "--model-spec-override"
+    - "/opt/audio.cpp/model_specs"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: qwen3_tts
+        path: /opt/models/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf
+        task: tts
+        mode: offline
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8107
+meta:
+  family: qwen3_tts
+  capabilities: [tts]
+  request_format: json

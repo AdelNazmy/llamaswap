@@ -14,6 +14,9 @@ LLM:
     whisper-server) and idle-unload like the chat LLM; proxied through
     the OpenAI audio endpoints (/v1/audio/speech,
     /v1/audio/transcriptions, ...).
+
+While tts AND asr are both loaded, a VRAM guard substitutes the smallest
+chat LLM for any requested chat model (see Settings.audio_vram_guard).
 """
 
 import asyncio
@@ -208,6 +211,24 @@ async def _ensure_and_route(
             "/v1/audio/transcriptions instead",
         )
         return JSONResponse(status_code=status, content=payload)
+    # VRAM guard: while BOTH audio roles are loaded, only the smallest
+    # chat LLM may be served (TTS + ASR + a big LLM may not fit on one
+    # GPU). The requested model is transparently substituted and the swap
+    # happens as usual; disable via LLAMASWAP_AUDIO_VRAM_GUARD=false.
+    settings: Settings = request.app.state.settings
+    if settings.audio_vram_guard:
+        tts_mgr = request.app.state.audio_managers["tts"]
+        asr_mgr = request.app.state.audio_managers["asr"]
+        if tts_mgr.is_running and asr_mgr.is_running:
+            smallest = registry.smallest_llm()
+            if smallest is not None and smallest != model:
+                logger.warning(
+                    "audio_vram_guard: tts+asr loaded; serving smallest "
+                    "chat LLM '%s' instead of requested '%s'",
+                    smallest, model,
+                )
+                model = smallest
+                cfg = registry.get(smallest)
     embedding_manager: Optional[EmbeddingManager] = (
         request.app.state.embedding_manager
     )

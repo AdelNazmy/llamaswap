@@ -35,6 +35,6 @@ command:
 host: 127.0.0.1
 port: 8101
 meta:
-  context_length: 65000
+  context_length: 32000
   family: qwen
   capabilities: [chat]

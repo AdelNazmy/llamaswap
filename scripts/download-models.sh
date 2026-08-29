@@ -38,7 +38,7 @@ tts-qwen3|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-TTS
 asr|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf|Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
 whisper|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin|ggml-base.en.bin
 whisper-multi|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin|ggml-base.bin
-nemotron_asr|https://huggingface.co/audio-cpp/audio.cpp-gguf/blob/main/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf|Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf
+nemotron_asr|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf|Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf
 supertonic_3|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Supertonic-3-GGUF/supertonic-3-q8_0.gguf|Supertonic-3-GGUF/supertonic-3-q8_0.gguf
 '
 
@@ -71,7 +71,7 @@ main() {
     for name in "$@"; do
         spec=$(resolve "$name")
         if [ -z "$spec" ]; then
-            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi)" >&2
+            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi nemotron_asr supertonic_3)" >&2
             rc=1
             continue
         fi
