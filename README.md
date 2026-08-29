@@ -168,6 +168,10 @@ llamaswap/
 │   ├── audio_manager.py      # on-demand per-role TTS/ASR lifecycle + swap + idle unload
 │   ├── proxy.py              # async reverse proxy (stream / raw / multipart)
 │   └── main.py               # FastAPI routes (OpenAI API)
+├── scripts/
+│   ├── download-models.sh    # fetch TTS/ASR model weights
+│   └── sample-qwen3-tts.sh   # sample the Qwen3-TTS voice clone
+├── data/                     # local audio (gitignored): recordings, reference clips, samples
 ├── requirements.txt
 ├── docs/images/              # screenshots referenced by this README
 └── README.md
@@ -549,6 +553,102 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_IDLE_UNLOAD_SECONDS`, `LLAMASWAP_AUDIO_VRAM_GUARD`,
 `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`, `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`.
 
+## Voice cloning with Qwen3-TTS
+
+The `qwen3-tts` backend (Qwen3-TTS 12Hz 0.6B *Base*) is a **voice-clone**
+model: it has no preset voices and synthesizes from a short reference clip
+(`voice_ref`) plus its **exact** transcript (`reference_text`). llamaswap
+keeps both off the OpenAI API surface and injects them from the model
+config, so `/v1/audio/speech` only needs `input` (see
+`_apply_clone_reference` in `app/main.py`).
+
+### 1. Prepare a reference clip
+
+Qwen3-TTS clones best from a **3–10 second** clip of clean speech — a single
+natural phrase cut at a pause. This repo ships with the reference used by
+`backend/qwen3-tts.yaml` (`data/script_scarlette_ref.wav`, a ≈4.7 s clip cut
+from the first clean phrase of the 8-minute `data/script_scarlette.wav`).
+Both files are gitignored (local only — your voice is not committed).
+
+```bash
+# The shipped reference is the opening 4.68 s of the 8-minute recording — the
+# first clean phrase, cut at its natural pause. It starts at 0:00, so -ss may
+# be omitted (or written as -ss 0 -to 4.68).
+ffmpeg -y -i data/script_scarlette.wav \
+  -t 4.68 \
+  -ar 24000 -ac 1 -c:a pcm_s16le \
+  data/script_scarlette_ref.wav
+
+# For a new voice, point -i at your recording and trim your own 3-10 s window:
+#   ffmpeg -y -i data/my_recording.wav \
+#     -ss 00:00:10 -to 00:00:15 \
+#     -ar 24000 -ac 1 -c:a pcm_s16le \
+#     data/my_voice_ref.wav
+```
+
+Transcribe the clip **exactly** (punctuation included). The transcript is
+required — Qwen3-TTS's in-context-learning (ICL) clone mode throws
+`"Qwen3 voice clone ICL mode requires reference text"` without it:
+
+```text
+Today I'm excited to introduce a significant advancement in our software testing capabilities.
+```
+
+> Keep the reference ≤ ~10 s; longer input is accepted but can dilute the
+> timbre. 24 kHz mono 16-bit is the format of the shipped reference.
+
+### 2. Wire the reference into the model
+
+`backend/qwen3-tts.yaml` already points at the clip above under `meta`:
+
+```yaml
+meta:
+  family: qwen3_tts
+  capabilities: [tts, clone]
+  reference_voice: data/script_scarlette_ref.wav   # relative to the repo root
+  reference_text: "Today I'm excited to introduce a significant advancement in our software testing capabilities."
+```
+
+To clone a different voice, replace `reference_voice` (your clip) and
+`reference_text` (its exact transcript), then reload the registry:
+
+```bash
+curl -s -X POST localhost:11434/v1/registry/reload
+```
+
+### 3. Sample the clone
+
+`scripts/sample-qwen3-tts.sh` synthesizes through the configured voice, or
+an ad-hoc reference you pass in:
+
+```bash
+# sample the voice configured in backend/qwen3-tts.yaml
+./scripts/sample-qwen3-tts.sh "Hello from the cloned voice"
+# -> data/qwen3-tts-sample.wav
+
+# override the reference with a local clip (base64-inlined to the server)
+./scripts/sample-qwen3-tts.sh \
+  --reference-audio data/my_voice_ref.wav \
+  --reference-text "The exact words spoken in that clip." \
+  --out /tmp/my_clone.wav \
+  "Say this in the new voice."
+```
+
+The script is a thin wrapper over the OpenAI audio endpoint; the equivalent
+`curl` is:
+
+```bash
+curl -s localhost:11434/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3-tts", "input": "Hello from a cloned voice!"}' \
+  -o qwen3tts.wav
+```
+
+The default mode relies on the server-injected reference; `-t`/`--text`
+sets the text, `-a`/`--reference-audio` + `-T`/`--reference-text` override
+the reference, and `-o`/`--out` sets the output. Run
+`./scripts/sample-qwen3-tts.sh --help` for every flag.
+
 ## API
 
 | Endpoint | Description |
@@ -624,12 +724,13 @@ curl -s localhost:11434/v1/audio/speech \
 # TTS — Supertonic preset voices: F1..F5, M1..M5 (31 languages)
 curl -s localhost:11434/v1/audio/voices
 
-# qwen3-tts is the Qwen3-TTS 12Hz 0.6B *Base* variant: a voice-clone model,
-# so it requires reference audio (backend dialect) and has no preset voice.
-# Without it the backend returns "requires voice clone reference audio".
+# qwen3-tts is the Qwen3-TTS 12Hz 0.6B *Base* variant: a voice-clone model
+# with no preset voices. llamaswap injects the reference clip + transcript
+# configured in backend/qwen3-tts.yaml (data/script_scarlette_ref.wav), so a
+# plain OpenAI `input` is all you send — see "Voice cloning with Qwen3-TTS".
 curl -s localhost:11434/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"model": "qwen3-tts", "input": "Hello!", "reference_text": "...", "reference_audio": "..."}' \
+  -d '{"model": "qwen3-tts", "input": "Hello from a cloned voice!"}' \
   -o qwen3tts.wav
 
 # ASR — multipart upload; the `model` field picks the ASR backend and
