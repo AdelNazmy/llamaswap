@@ -1,0 +1,78 @@
+# Image-generation model: FLUX.1-schnell (Q8_0 GGUF) via stable-diffusion.cpp
+#
+# schnell is the Apache-2.0 licensed, guidance-distilled FLUX variant —
+# 4 steps, cfg-scale 1.0. The diffusion weights are the preconverted GGUF
+# from hf.co/leejet/FLUX.1-schnell-gguf; the VAE and text encoders are the
+# shared BFL/Comfy files (one copy under FLUX.1-common serves every
+# diffusion backend of role "image").
+#
+# Managed by the RoleServerManager (on-demand per-role server, role: image),
+# routed through the OpenAI /v1/images/generations + /v1/images/edits
+# endpoints. stable-diffusion.cpp's sd-server speaks the OpenAI image API
+# natively, so llamaswap is a near pass-through here.
+#
+# VRAM: Q8_0 needs ~12 GB for the diffusion model + a ~0.4 GB VAE. The
+# diffusion model and VAE run on the GPU (--backend diffusion=cuda0,vae=cuda0)
+# while the text encoders stay on CPU (te=cpu, so ~10 GB of T5-XXL lives in
+# RAM), plus flash attention (--diffusion-fa) — this fits a 16 GB card once
+# the image VRAM guard unloads the chat LLM + audio + embedding servers
+# (LLAMASWAP_UNLOAD_ON_IMAGE).
+# For smaller cards, switch the --diffusion-model to flux1-schnell-q4_0.gguf
+# or flux1-schnell-q4_k.gguf (~6.4 GB) — same repo, and the quality cost is
+# modest.
+#
+# Build the backend (see README "Building stable-diffusion.cpp (image)"):
+#   git clone https://github.com/leejet/stable-diffusion.cpp /opt/stable-diffusion.cpp
+#   # -> binary at /opt/stable-diffusion.cpp/build/bin/sd-server
+#
+# Install the model files (scripts/download-models.sh):
+#   ./scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl
+name: flux-schnell
+description: "FLUX.1-schnell Q8_0 GGUF (stable-diffusion.cpp) — fast text-to-image"
+role: image
+command:
+  binary: /opt/stable-diffusion.cpp/build/bin/sd-server
+  # sd-server spells its listen flags differently from --host/--port.
+  host_arg: "--listen-ip"
+  port_arg: "--listen-port"
+  args:
+    - "--diffusion-model"
+    - "/opt/models/FLUX.1-schnell-gguf/flux1-schnell-q8_0.gguf"
+    - "--vae"
+    - "/opt/models/FLUX.1-common/ae.safetensors"
+    - "--clip_l"
+    - "/opt/models/FLUX.1-common/clip_l.safetensors"
+    - "--t5xxl"
+    - "/opt/models/FLUX.1-common/t5xxl_fp16.safetensors"
+    # schnell is guidance-distilled: 4 steps, cfg 1.0 (see flux.md).
+    - "--cfg-scale"
+    - "1.0"
+    - "--steps"
+    - "4"
+    - "--sampling-method"
+    - "euler"
+    # Random seed per generation (OpenAI images API has no seed field).
+    - "--seed"
+    - "-1"
+    # FLUX's native resolution; clients can override via `size`.
+    - "--width"
+    - "1024"
+    - "--height"
+    - "1024"
+    # Diffusion model + VAE on the GPU; text encoders on CPU (T5-XXL is
+    # ~10 GB) so everything fits in 16 GB VRAM with flash attention.
+    - "--diffusion-fa"
+    - "--backend"
+    - "diffusion=cuda0,vae=cuda0,te=cpu"
+    - "-v"
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8109
+meta:
+  family: flux
+  capabilities: [image, text-to-image]
+  request_format: json
+  # sd-server exposes no dedicated /health route; /v1/models is a stable
+  # readiness probe (the port only opens after model load completes).
+  health_path: /v1/models

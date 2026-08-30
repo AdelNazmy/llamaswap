@@ -3,8 +3,8 @@
 Started at app boot and kept running for the lifetime of the proxy so
 that embedding requests never have to wait on the LLM swap path. The
 one sanctioned shutdown is stop_for_resources(), used to free VRAM
-when a chat LLM cannot be launched; the caller is expected to
-best-effort relaunch afterwards via ensure_running().
+when a chat LLM or the image server needs the GPU; the caller is
+expected to best-effort relaunch afterwards via ensure_running().
 """
 
 import asyncio
@@ -180,19 +180,23 @@ class EmbeddingManager:
                 self._state = EmbedState.STOPPED
                 self._detail = ""
 
-    async def stop_for_resources(self) -> None:
-        """Stop the embedding server to free VRAM for a chat LLM launch."""
+    async def stop_for_resources(self, reason: str = "an LLM") -> None:
+        """Stop the embedding server to free VRAM for another backend.
+
+        ``reason`` is surfaced in the /health ``detail`` field (e.g.
+        "an LLM" or "the image model").
+        """
         async with self._lock:
             was_running = self._state in (EmbedState.READY, EmbedState.LOADING)
             await self._stop_locked()
             if was_running:
                 self._state = EmbedState.STOPPED
-                self._detail = "stopped to make room for an LLM"
+                self._detail = f"stopped to make room for {reason}"
             self._stopped_for_resources = True
             if was_running:
                 logger.info(
-                    "embedding server '%s' stopped to free resources for an LLM",
-                    self.name,
+                    "embedding server '%s' stopped to free resources for %s",
+                    self.name, reason,
                 )
 
     async def _wait_loading_settled(self) -> bool:

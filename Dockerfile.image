@@ -1,0 +1,26 @@
+# Opt-in overlay that stamps the stable-diffusion.cpp image backend into
+# the image.
+#
+# The sd-server binary is NOT compiled in the image build. Build it on the
+# host first (see README: "Building stable-diffusion.cpp (image)"), then
+# docker-compose.image.yml passes the result dir as a build context — the
+# same pattern the base Dockerfile uses for llama.cpp's `llamacpp-bin`
+# (llama-server) and Dockerfile.audio uses for the audio backends.
+#
+# Expected host layout (overridable in docker-compose.image.yml):
+#   /opt/stable-diffusion.cpp/build/bin/sd-server
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.image.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.image.yml up -d
+
+FROM llamaswap:local
+
+RUN mkdir -p /opt/stable-diffusion.cpp/build/bin
+
+# `sdcpp-bin` is a named build context whose root is the build/bin dir;
+# sources are relative to the context root (same syntax as
+# COPY --from=llamacpp-bin ./llama-server ... in the base Dockerfile).
+COPY --from=sdcpp-bin ./sd-server /opt/stable-diffusion.cpp/build/bin/sd-server
+
+RUN chmod 0755 /opt/stable-diffusion.cpp/build/bin/sd-server

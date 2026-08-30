@@ -24,6 +24,10 @@ class CommandSpec(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     config_json: dict[str, Any] | None = None
+    # Flag spellings for the listen address. Most backends use --host/--port;
+    # stable-diffusion.cpp's sd-server uses --listen-ip/--listen-port.
+    host_arg: str = "--host"
+    port_arg: str = "--port"
 
 
 class ModelMeta(BaseModel):
@@ -44,13 +48,13 @@ class ModelMeta(BaseModel):
     model_config = {"extra": "allow"}
 
 
-ROLES = {"llm", "embedding", "tts", "asr"}
+ROLES = {"llm", "embedding", "tts", "asr", "image"}
 # Roles served by the ProcessManager (one process, swapped on request).
 SWAP_ROLES = {"llm"}
 # Roles served by dedicated managers. Only "embedding" is persistent
-# (boots with the proxy); "tts"/"asr" are on-demand and idle-unloaded
-# like the chat LLM, so nothing else runs without a request.
-PERSISTENT_ROLES = {"embedding", "tts", "asr"}
+# (boots with the proxy); "tts"/"asr"/"image" are on-demand and
+# idle-unloaded like the chat LLM, so nothing else runs without a request.
+PERSISTENT_ROLES = {"embedding", "tts", "asr", "image"}
 
 
 class ModelConfig(BaseModel):
@@ -59,8 +63,9 @@ class ModelConfig(BaseModel):
     role:
       "llm"       — swapped in/out by the ProcessManager
       "embedding" — persistent embedding server (EmbeddingManager)
-      "tts"       — persistent TTS server (AudioManager)
-      "asr"       — persistent ASR server (AudioManager)
+      "tts"       — on-demand TTS server (RoleServerManager)
+      "asr"       — on-demand ASR server (RoleServerManager)
+      "image"     — on-demand image-generation server (RoleServerManager)
     """
 
     name: str
@@ -98,24 +103,30 @@ class ModelConfig(BaseModel):
         """argv for the backend subprocess, with host/port enforced.
 
         ``config_path`` (a rendered config JSON file, if any) is substituted
-        for a ``{config_path}`` placeholder in args.
+        for a ``{config_path}`` placeholder in args. The host/port flag
+        spellings are configurable per command via ``command.host_arg`` /
+        ``command.port_arg`` (default ``--host``/``--port``); some backends
+        spell them differently (e.g. sd-server's ``--listen-ip`` /
+        ``--listen-port``).
         """
+        host_arg = self.command.host_arg
+        port_arg = self.command.port_arg
         argv = [self.command.binary]
         args = list(self.command.args)
-        # Strip any user-provided --host/--port (value or = form) so the
+        # Strip any user-provided host/port flag (value or = form) so the
         # manager's host/port always win.
         i = 0
         while i < len(args):
             a = args[i]
-            if a in ("--host", "--port") and i + 1 < len(args):
+            if a in (host_arg, port_arg) and i + 1 < len(args):
                 i += 2
                 continue
-            if a.startswith("--host=") or a.startswith("--port="):
+            if a.startswith(f"{host_arg}=") or a.startswith(f"{port_arg}="):
                 i += 1
                 continue
             argv.append(a.replace("{config_path}", config_path or ""))
             i += 1
-        argv += ["--host", self.host, "--port", str(self.port)]
+        argv += [host_arg, self.host, port_arg, str(self.port)]
         return argv
 
     def render_config_json(self, config_path: str) -> dict[str, Any]:
