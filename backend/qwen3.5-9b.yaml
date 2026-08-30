@@ -17,9 +17,9 @@ command:
     - "-c"
     - "65000"
     - "--reasoning-budget"
-    - "0"
+    - "1024"
     - "--reasoning"
-    - "off"
+    - "on"
     - "--image-min-tokens"
     - "1024"
 
