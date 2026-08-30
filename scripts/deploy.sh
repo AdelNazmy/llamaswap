@@ -53,6 +53,7 @@ usage() {
 Usage: ./scripts/deploy.sh [options]
 
 Deploy the full llamaswap stack. All backends are enabled by default.
+./deploy.sh                       # build all + start (up -d)
 
 Options:
   --no-audio      skip the audio overlay (base + image only)
