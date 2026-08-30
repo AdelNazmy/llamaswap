@@ -1,0 +1,53 @@
+# Opt-in compose overlay that enables image generation in the llamaswap
+# container.
+#
+# The sd-server binary is built on the HOST (see README: "Building
+# stable-diffusion.cpp (image)") — nothing is compiled inside the image.
+# The overlay stamps the host-built binary into the image via a build
+# context (same pattern as llama.cpp's `llamacpp-bin` in the base
+# Dockerfile):
+#
+#   sdcpp-bin:  /opt/stable-diffusion.cpp/build/bin  (sd-server)
+#
+# On `up`, the image-models-init one-shot service downloads the FLUX
+# weights into the shared /opt/models directory (host dir) before llamaswap
+# starts. You can also run it manually:
+#   docker compose -f docker-compose.yml -f docker-compose.image.yml run --rm image-models-init
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.image.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.image.yml up -d
+#
+# Combine with the audio overlay (distinct init-service names, so both can
+# run in the same deployment):
+#   docker compose -f docker-compose.yml -f docker-compose.audio.yml \
+#                  -f docker-compose.image.yml up -d
+services:
+  image-models-init:
+    image: alpine:3.20
+    container_name: llamaswap-image-models-init
+    init: true
+    restart: "no"
+    environment:
+      MODEL_ROOT: /opt/models
+    volumes:
+      - ./scripts:/scripts:ro
+      - /opt/models:/opt/models # rw: download into the shared model root
+    command:
+      - /bin/sh
+      - -c
+      - "apk add --no-cache curl aria2 >/dev/null 2>&1 && exec sh /scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl"
+
+  llamaswap:
+    build:
+      # Stamps the host-built sd-server binary into llamaswap:local (no
+      # compile). The base image must exist first (docker compose build on
+      # docker-compose.yml alone) and the binary must exist at the context
+      # path below (build it first — see README).
+      context: .
+      dockerfile: Dockerfile.image
+      additional_contexts:
+        sdcpp-bin: /opt/stable-diffusion.cpp/build/bin
+    depends_on:
+      image-models-init:
+        condition: service_completed_successfully

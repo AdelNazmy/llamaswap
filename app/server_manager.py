@@ -1,18 +1,21 @@
-"""Per-role on-demand audio servers (TTS / ASR).
+"""Per-role on-demand backend servers (TTS / ASR / image generation).
 
-One AudioManager exists per audio role (``tts``, ``asr``). Like the
-chat-LLM swap path — and unlike the persistent embedding server — the
-audio servers are **on-demand**: nothing boots with the proxy. The
-first request for a role launches the first configured model; a request
-naming a *different* audio model of the same role transparently stops
-the running server and launches the requested one. After
-``idle_unload_seconds`` with no requests the running server is stopped
-to free VRAM (same idle-unload policy as the chat LLM; 0 disables it).
+One RoleServerManager exists per on-demand role (``tts``, ``asr``,
+``image``). Like the chat-LLM swap path — and unlike the persistent
+embedding server — these servers are **on-demand**: nothing boots with
+the proxy. The first request for a role launches the first configured
+model; a request naming a *different* model of the same role
+transparently stops the running server and launches the requested one.
+After ``idle_unload_seconds`` with no requests the running server is
+stopped to free VRAM (same idle-unload policy as the chat LLM; 0
+disables it).
 
 Health checking is generic — every supported backend (llama-server,
-audio.cpp audiocpp_server, whisper.cpp whisper-server) exposes
-``GET /health``; the path is configurable per model via
-``meta.health_path``.
+audio.cpp audiocpp_server, whisper.cpp whisper-server,
+stable-diffusion.cpp sd-server) exposes a readiness endpoint; it is
+configurable per model via ``meta.health_path`` (default ``/health``;
+sd-server uses ``/v1/models`` since it has no dedicated ``/health``
+route).
 """
 
 import asyncio
@@ -29,31 +32,31 @@ import httpx
 
 from .registry import ModelConfig, UnknownModelError
 
-logger = logging.getLogger("llamaswap.audio_manager")
+logger = logging.getLogger("llamaswap.server_manager")
 
 
-class AudioState(str, Enum):
+class ServerState(str, Enum):
     LOADING = "loading"
     READY = "ready"
     STOPPED = "stopped"
     FAILED = "failed"
 
 
-class AudioLoadError(Exception):
-    """Raised when an audio backend could not be brought up."""
+class RoleServerLoadError(Exception):
+    """Raised when a role's backend server could not be brought up."""
 
 
 @dataclass
-class _RunningAudio:
+class _RunningServer:
     config: ModelConfig
     process: asyncio.subprocess.Process
-    state: AudioState
+    state: ServerState
     detail: str = ""
     config_file: Optional[str] = None
 
 
-class AudioManager:
-    """Starts, monitors and swaps the persistent server for one audio role."""
+class RoleServerManager:
+    """Starts, monitors and swaps the on-demand server for one role."""
 
     def __init__(self, role: str, startup_timeout: float,
                  stop_timeout: float, health_interval: float,
@@ -65,7 +68,7 @@ class AudioManager:
         self._idle_unload_seconds = idle_unload_seconds
         self._lock = asyncio.Lock()
         self._config_dir = Path(config_dir)
-        self._current: Optional[_RunningAudio] = None
+        self._current: Optional[_RunningServer] = None
         self._configs: dict[str, ModelConfig] = {}
         self._last_activity: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
@@ -77,12 +80,12 @@ class AudioManager:
     @property
     def name(self) -> Optional[str]:
         cur = self._current
-        return cur.config.name if cur and cur.state is AudioState.READY else None
+        return cur.config.name if cur and cur.state is ServerState.READY else None
 
     @property
     def is_running(self) -> bool:
         cur = self._current
-        return cur is not None and cur.state is AudioState.READY
+        return cur is not None and cur.state is ServerState.READY
 
     @property
     def current_config(self) -> Optional[ModelConfig]:
@@ -118,12 +121,12 @@ class AudioManager:
             "role": self.role,
             "state": cur.state.value,
             "model": cur.config.name if cur.state in (
-                AudioState.READY, AudioState.LOADING, AudioState.FAILED
+                ServerState.READY, ServerState.LOADING, ServerState.FAILED
             ) else None,
             "port": cur.config.port,
             "detail": cur.detail,
         }
-        if cur.state is AudioState.READY and self._idle_unload_seconds > 0:
+        if cur.state is ServerState.READY and self._idle_unload_seconds > 0:
             elapsed = asyncio.get_running_loop().time() - self._last_activity
             info["idle_seconds"] = max(0.0, round(elapsed, 1))
             info["idle_unload_seconds"] = self._idle_unload_seconds
@@ -144,7 +147,7 @@ class AudioManager:
         async with httpx.AsyncClient(timeout=5.0) as client:
             while True:
                 if proc.returncode is not None:
-                    raise AudioLoadError(
+                    raise RoleServerLoadError(
                         f"{self.role} server for '{cfg.name}' exited (code "
                         f"{proc.returncode}) during startup; see logs above"
                     )
@@ -155,7 +158,7 @@ class AudioManager:
                 except httpx.HTTPError:
                     pass
                 if asyncio.get_running_loop().time() > deadline:
-                    raise AudioLoadError(
+                    raise RoleServerLoadError(
                         f"{self.role} server for '{cfg.name}' did not become "
                         f"healthy within {self._startup_timeout:.0f}s"
                     )
@@ -196,10 +199,10 @@ class AudioManager:
 
     async def ensure_model(self, name: str,
                            registry: "Registry") -> ModelConfig:
-        """Make sure `name` (an audio model of this role) is the loaded one.
+        """Make sure `name` (a model of this role) is the loaded one.
 
         Returns the model's config; raises UnknownModelError if the model is
-        not a member of this role, or AudioLoadError if it fails to load.
+        not a member of this role, or RoleServerLoadError if it fails to load.
         """
         cfg = registry.get(name)  # raises UnknownModelError
         if cfg.role != self.role:
@@ -212,14 +215,14 @@ class AudioManager:
             cur = self._current
             if cur is not None and cur.config.name == name:
                 # Already this model: wait out an in-flight load if needed.
-                if cur.state is AudioState.READY:
+                if cur.state is ServerState.READY:
                     return cfg
-                if cur.state is AudioState.LOADING:
+                if cur.state is ServerState.LOADING:
                     await self._wait_loading_settled(cur)
                     if self.is_running:
                         return cfg
                     # The in-flight load failed; fall through to relaunch.
-            elif cur is not None and cur.state is AudioState.LOADING:
+            elif cur is not None and cur.state is ServerState.LOADING:
                 # A swap for another model is in flight; wait for it to
                 # settle, then swap again (bounded, mirrors ProcessManager).
                 await self._wait_loading_settled(cur)
@@ -241,9 +244,9 @@ class AudioManager:
             await self._stop_current()
             return had
 
-    async def _wait_loading_settled(self, prev: _RunningAudio) -> None:
+    async def _wait_loading_settled(self, prev: _RunningServer) -> None:
         deadline = asyncio.get_running_loop().time() + self._startup_timeout + 30.0
-        while self._current is prev and prev.state is AudioState.LOADING:
+        while self._current is prev and prev.state is ServerState.LOADING:
             if asyncio.get_running_loop().time() > deadline:
                 break
             await asyncio.sleep(0.25)
@@ -275,8 +278,8 @@ class AudioManager:
             )
         except OSError as exc:
             _cleanup_config(config_file)
-            raise AudioLoadError(f"failed to spawn {self.role} server: {exc}") from exc
-        entry = _RunningAudio(config=cfg, process=proc, state=AudioState.LOADING,
+            raise RoleServerLoadError(f"failed to spawn {self.role} server: {exc}") from exc
+        entry = _RunningServer(config=cfg, process=proc, state=ServerState.LOADING,
                               config_file=config_file)
         self._current = entry
         asyncio.get_running_loop().create_task(self._tail_stderr(entry))
@@ -285,12 +288,12 @@ class AudioManager:
         except BaseException:
             await self._stop_current()
             raise
-        entry.state = AudioState.READY
+        entry.state = ServerState.READY
         entry.detail = ""
         logger.info("%s model '%s' ready on port %d",
                     self.role, cfg.name, cfg.port)
 
-    async def _tail_stderr(self, entry: _RunningAudio) -> None:
+    async def _tail_stderr(self, entry: _RunningServer) -> None:
         assert entry.process.stderr is not None
         try:
             async for chunk in entry.process.stderr:
@@ -299,8 +302,8 @@ class AudioManager:
         except asyncio.CancelledError:
             raise
         rc = await entry.process.wait()
-        if entry.state is AudioState.READY and rc not in (0, -signal.SIGTERM):
-            entry.state = AudioState.FAILED
+        if entry.state is ServerState.READY and rc not in (0, -signal.SIGTERM):
+            entry.state = ServerState.FAILED
             entry.detail = f"{self.role} server exited with code {rc}"
             logger.error(
                 "%s server for '%s' exited unexpectedly (code %s)",
@@ -308,7 +311,7 @@ class AudioManager:
             )
 
     async def _idle_watcher(self) -> None:
-        """Stop the loaded audio server once it has been idle past the timeout."""
+        """Stop the loaded server once it has been idle past the timeout."""
         try:
             while True:
                 await asyncio.sleep(self._health_interval)
@@ -319,7 +322,7 @@ class AudioManager:
                     continue
                 async with self._lock:
                     cur = self._current
-                    if cur is None or cur.state is not AudioState.READY:
+                    if cur is None or cur.state is not ServerState.READY:
                         continue
                     elapsed = asyncio.get_running_loop().time() - \
                         self._last_activity
@@ -351,3 +354,8 @@ def _cleanup_config(path: Optional[str]) -> None:
         Path(path).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# Back-compat aliases — TTS/ASR predate the generic manager + image role.
+AudioManager = RoleServerManager
+AudioLoadError = RoleServerLoadError

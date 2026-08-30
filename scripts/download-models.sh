@@ -20,6 +20,11 @@
 #   whisper-multi  ggml-base (multilingual whisper.cpp; enables real
 #            translation for /v1/audio/translations — point whisper-asr.yaml's
 #            -m at ggml-base.bin to use it)
+#   flux-schnell FLUX.1-schnell q8_0 GGUF  (stable-diffusion.cpp,
+#            used by backend/flux-schnell.yaml)
+#   flux-vae  FLUX VAE ae.safetensors     (shared FLUX auxiliary)
+#   flux-clip_l FLUX clip_l text encoder  (shared FLUX auxiliary)
+#   flux-t5xxl FLUX t5xxl text encoder    (shared FLUX auxiliary, ~10 GB)
 #
 # Env:
 #   MODEL_ROOT  model directory (default: /opt/models)
@@ -40,6 +45,10 @@ whisper|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.b
 whisper-multi|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin|ggml-base.bin
 nemotron_asr|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf|Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf
 supertonic_3|https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/Supertonic-3-GGUF/supertonic-3-q8_0.gguf|Supertonic-3-GGUF/supertonic-3-q8_0.gguf
+flux-schnell|https://huggingface.co/leejet/FLUX.1-schnell-gguf/resolve/main/flux1-schnell-q8_0.gguf|FLUX.1-schnell-gguf/flux1-schnell-q8_0.gguf
+flux-vae|https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors|FLUX.1-common/ae.safetensors
+flux-clip_l|https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors|FLUX.1-common/clip_l.safetensors
+flux-t5xxl|https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors|FLUX.1-common/t5xxl_fp16.safetensors
 '
 
 resolve() { # name -> url|relpath
@@ -71,7 +80,7 @@ main() {
     for name in "$@"; do
         spec=$(resolve "$name")
         if [ -z "$spec" ]; then
-            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi nemotron_asr supertonic_3)" >&2
+            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi nemotron_asr supertonic_3 flux-schnell flux-vae flux-clip_l flux-t5xxl)" >&2
             rc=1
             continue
         fi

@@ -9,11 +9,15 @@ LLM:
     started at boot and kept running (only stopped to free VRAM for an LLM)
   * ``chat`` — one LLM at a time (ProcessManager), swapped on request and
     unloaded after ``idle_unload_seconds`` with no requests
-  * ``tts`` / ``asr`` — audio servers (AudioManager) that boot on first
-    use, swap between backends per request (e.g. qwen3-asr vs
+  * ``tts`` / ``asr`` — audio servers (RoleServerManager) that boot on
+    first use, swap between backends per request (e.g. qwen3-asr vs
     whisper-server) and idle-unload like the chat LLM; proxied through
     the OpenAI audio endpoints (/v1/audio/speech,
     /v1/audio/transcriptions, ...).
+  * ``image`` — an image-generation server (RoleServerManager) that boots
+    on first use, swaps between image models per request, and idle-unloads
+    like the chat LLM; proxied through the OpenAI image endpoints
+    (/v1/images/generations, /v1/images/edits).
 
 While tts AND asr are both loaded, a VRAM guard substitutes the smallest
 chat LLM for any requested chat model (see Settings.audio_vram_guard).
@@ -22,6 +26,13 @@ weights-file size) unloads the running TTS/ASR servers first to free VRAM,
 leaving the embedding server up (see Settings.unload_audio_on_big_llm);
 conversely, while a big chat LLM is loaded, TTS/ASR requests are rejected
 with 409 (see Settings.block_audio_on_big_llm).
+
+Image generation is the heaviest workload, so it is guarded the same way:
+before it loads, the chat LLM, TTS/ASR servers, and the embedding server
+are stopped to free the whole GPU (see Settings.unload_on_image); before
+any chat request the image server is stopped
+(Settings.unload_image_on_llm); and any TTS/ASR request stops the image
+server too (Settings.unload_image_on_audio).
 """
 
 import asyncio
@@ -35,7 +46,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .audio_manager import AudioLoadError, AudioManager
+from .server_manager import RoleServerLoadError, RoleServerManager
 from .config import Settings, get_settings
 from .embedding_manager import EmbeddingLoadError, EmbeddingManager
 from .process_manager import ModelLoadError, ProcessManager
@@ -93,10 +104,10 @@ async def lifespan(app: FastAPI):
     )
     # Audio (tts/asr) managers: one per role, on-demand like the chat
     # LLM — nothing boots here, the first request launches a server
-    # (see _route_audio and AudioManager.ensure_model).
-    app.state.audio_managers: dict[str, AudioManager] = {}
+    # (see _route_audio and RoleServerManager.ensure_model).
+    app.state.audio_managers: dict[str, RoleServerManager] = {}
     for role in ("tts", "asr"):
-        manager = AudioManager(
+        manager = RoleServerManager(
             role,
             startup_timeout=settings.startup_timeout,
             stop_timeout=settings.stop_timeout,
@@ -106,6 +117,20 @@ async def lifespan(app: FastAPI):
         )
         manager.configure(app.state.registry.role_configs(role))
         app.state.audio_managers[role] = manager
+
+    # Image-generation manager: one on-demand server (swapped among the
+    # model configs of role "image"), routed through the OpenAI image
+    # endpoints. Nothing boots here; the first /v1/images/* request
+    # launches it (see _route_image).
+    app.state.image_manager = RoleServerManager(
+        "image",
+        startup_timeout=settings.startup_timeout,
+        stop_timeout=settings.stop_timeout,
+        health_interval=settings.health_interval,
+        idle_unload_seconds=settings.idle_unload_seconds,
+        config_dir=settings.audio_tmp_dir,
+    )
+    app.state.image_manager.configure(app.state.registry.role_configs("image"))
 
     # Persistent embedding server: launched at boot, kept running for the
     # lifetime of the proxy (only stopped to free VRAM for an LLM).
@@ -134,6 +159,7 @@ async def lifespan(app: FastAPI):
     finally:
         for manager in app.state.audio_managers.values():
             await manager.shutdown()
+        await app.state.image_manager.shutdown()
         if app.state.embedding_manager is not None:
             await app.state.embedding_manager.shutdown()
         await app.state.manager.shutdown()
@@ -143,7 +169,7 @@ app = FastAPI(title="llamaswap", version="0.1.0", lifespan=lifespan)
 
 
 def _health_snapshot(request: Request) -> dict:
-    """Full proxy status: chat LLM, embedding, and TTS/ASR managers."""
+    """Full proxy status: chat LLM, embedding, TTS/ASR, and image managers."""
     embedding_manager: Optional[EmbeddingManager] = (
         request.app.state.embedding_manager
     )
@@ -159,6 +185,7 @@ def _health_snapshot(request: Request) -> dict:
             role: manager.status()
             for role, manager in request.app.state.audio_managers.items()
         },
+        "image": request.app.state.image_manager.status(),
     }
 
 
@@ -192,27 +219,30 @@ async def reload_registry(request: Request):
     except RegistryError as exc:
         status, body = _error(500, str(exc), "server_error")
         return JSONResponse(status_code=status, content=body)
-    # Refresh per-role audio configs only — servers boot on first use and
+    # Refresh per-role configs only — servers boot on first use and
     # are idle-unloaded, so never pre-start them here.
     for role, manager in request.app.state.audio_managers.items():
         manager.configure(registry.role_configs(role))
+    request.app.state.image_manager.configure(registry.role_configs("image"))
     return {"reloaded": True, "models": request.app.state.registry.names()}
 
 
 @app.post("/v1/reset")
 async def reset(request: Request):
-    """Unload every loaded backend: chat LLM, TTS/ASR audio servers, and
-    the persistent embedding server. Everything boots again on its next
-    request (the embedding server also best-effort relaunches after a
-    chat request, per its persistent role). Returns the full post-reset
-    /health snapshot."""
+    """Unload every loaded backend: chat LLM, TTS/ASR audio servers, the
+    image server, and the persistent embedding server. Everything boots
+    again on its next request (the embedding server also best-effort
+    relaunches after a chat request, per its persistent role). Returns
+    the full post-reset /health snapshot."""
     chat_manager = request.app.state.manager
     audio_managers = request.app.state.audio_managers
+    image_manager = request.app.state.image_manager
     embedding_manager = request.app.state.embedding_manager
 
     await chat_manager.unload()
     for mgr in audio_managers.values():
         await mgr.unload()
+    await image_manager.unload()
     if embedding_manager is not None:
         await embedding_manager.stop()
 
@@ -261,6 +291,11 @@ async def _ensure_and_route(
         await asyncio.gather(*(
             mgr.unload() for mgr in request.app.state.audio_managers.values()
         ))
+    # Image generation is the heaviest workload: stop the image server
+    # before any chat request so the LLM fits (disable via
+    # LLAMASWAP_UNLOAD_IMAGE_ON_LLM=false).
+    if settings.unload_image_on_llm:
+        await request.app.state.image_manager.unload()
     # VRAM guard: while BOTH audio roles are loaded, only the smallest
     # chat LLM may be served (TTS + ASR + a big LLM may not fit on one
     # GPU). The requested model is transparently substituted and the swap
@@ -437,7 +472,7 @@ async def _route_audio(
     and idle-unloads it after ``idle_unload_seconds`` with no requests.
     """
     registry: Registry = request.app.state.registry
-    manager: AudioManager = request.app.state.audio_managers[role]
+    manager: RoleServerManager = request.app.state.audio_managers[role]
     body = await request.body()
     content_type = request.headers.get("content-type", "")
     try:
@@ -491,9 +526,14 @@ async def _route_audio(
                 "server_error",
             )
             return JSONResponse(status_code=status, content=payload)
+    # VRAM guard for image: a TTS/ASR request stops the image server
+    # first so audio never stacks on top of a diffusion model (FLUX etc.
+    # use most of the GPU). Disable via LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO=false.
+    if request.app.state.settings.unload_image_on_audio:
+        await request.app.state.image_manager.unload()
     try:
         cfg = await manager.ensure_model(model, registry)
-    except AudioLoadError as exc:
+    except RoleServerLoadError as exc:
         status, payload = _error(
             503, f"failed to load {role} model '{model}': {exc}",
             "server_error",
@@ -645,7 +685,7 @@ async def audio_translations(request: Request):
 @app.get("/v1/audio/voices")
 async def audio_voices(request: Request):
     """List voices from the TTS backend, if it exposes such an endpoint."""
-    manager: AudioManager = request.app.state.audio_managers["tts"]
+    manager: RoleServerManager = request.app.state.audio_managers["tts"]
     if not manager.is_running:
         status, payload = _error(
             503, "tts server is not running", "server_error"
@@ -671,6 +711,98 @@ async def audio_voices(request: Request):
         "content-type", "application/json"), status_code=resp.status_code)
 
 
+# ---------------------------------------------------------------------------
+# OpenAI image API (text-to-image / image edit)
+# ---------------------------------------------------------------------------
+
+async def _route_image(request: Request, path: str):
+    """Route an OpenAI image request to the on-demand image server.
+
+    The ``model`` field (JSON body, or multipart form for /v1/images/edits)
+    selects which image backend to load; llamaswap starts the server on
+    first use (or swaps the running one when the model differs) and
+    idle-unloads it like the other on-demand roles. sd-server speaks the
+    OpenAI image dialect natively, so this is a near pass-through.
+    """
+    registry: Registry = request.app.state.registry
+    manager: RoleServerManager = request.app.state.image_manager
+    settings: Settings = request.app.state.settings
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    try:
+        model = extract_model(body, content_type)
+    except Exception:  # noqa: BLE001
+        model = None
+    if model is None:
+        configs = registry.role_configs("image")
+        if not configs:
+            status, payload = _error(
+                404, "no image model configured", "server_error"
+            )
+            return JSONResponse(status_code=status, content=payload)
+        model = configs[0].name
+    try:
+        cfg = registry.get(model)
+    except UnknownModelError as exc:
+        status, payload = _error(
+            404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=payload)
+    if cfg.role != "image":
+        status, payload = _error(
+            400, f"model '{model}' is not an image model (role: {cfg.role})"
+        )
+        return JSONResponse(status_code=status, content=payload)
+
+    # VRAM guard: a diffusion model wants the whole GPU, so stop the chat
+    # LLM, TTS/ASR, and the embedding server first — FLUX gets the full
+    # card. Disable via LLAMASWAP_UNLOAD_ON_IMAGE=false.
+    if settings.unload_on_image:
+        await asyncio.gather(
+            request.app.state.manager.unload(),
+            *(mgr.unload() for mgr in request.app.state.audio_managers.values()),
+        )
+        embedding_manager = request.app.state.embedding_manager
+        if embedding_manager is not None and embedding_manager.is_running:
+            await embedding_manager.stop_for_resources(reason="the image model")
+    try:
+        cfg = await manager.ensure_model(model, registry)
+    except RoleServerLoadError as exc:
+        status, payload = _error(
+            503, f"failed to load image model '{model}': {exc}",
+            "server_error",
+        )
+        return JSONResponse(status_code=status, content=payload)
+    except UnknownModelError as exc:
+        status, payload = _error(
+            404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=payload)
+
+    headers = _fwd_headers(request)
+    # The backend's schema doesn't carry the OpenAI `model` selector
+    # (llamaswap uses it only to pick the backend), so drop it first.
+    out_body = body
+    if "application/json" in content_type.lower():
+        out_body = json_remove_key(body, "model")
+    status, data, ctype = await proxy_raw(
+        cfg.port, cfg.host, path, out_body, headers
+    )
+    if status != 200:
+        return JSONResponse(status_code=status, content=_maybe_json(data))
+    return Response(content=data, media_type=ctype)
+
+
+@app.post("/v1/images/generations")
+async def images_generations(request: Request):
+    return await _route_image(request, "/v1/images/generations")
+
+
+@app.post("/v1/images/edits")
+async def images_edits(request: Request):
+    return await _route_image(request, "/v1/images/edits")
+
+
 @app.exception_handler(UnknownModelError)
 async def unknown_model_handler(request: Request, exc: UnknownModelError):
     status, payload = _error(
@@ -685,7 +817,7 @@ async def model_load_handler(request: Request, exc: ModelLoadError):
     return JSONResponse(status_code=status, content=payload)
 
 
-@app.exception_handler(AudioLoadError)
-async def audio_load_handler(request: Request, exc: AudioLoadError):
+@app.exception_handler(RoleServerLoadError)
+async def role_server_load_handler(request: Request, exc: RoleServerLoadError):
     status, payload = _error(503, str(exc), "server_error")
     return JSONResponse(status_code=status, content=payload)

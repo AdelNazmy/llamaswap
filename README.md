@@ -31,19 +31,22 @@ rejected with `409` (see `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`,
 ```
 OpenAI client (port 11434)
         │  /v1/chat/completions, /v1/embeddings,
-        │  /v1/audio/speech, /v1/audio/transcriptions, /v1/models
+        │  /v1/audio/speech, /v1/audio/transcriptions,
+        │  /v1/images/generations, /v1/images/edits, /v1/models
         ▼
 llamaswap (FastAPI)
   • model registry        ← backend/*.yaml
   • LLM process manager   ← start / stop / swap chat llama-server (on-demand)
   • embedding manager     ← persistent embedding llama-server
   • audio managers        ← on-demand per-role TTS/ASR servers (t+r)
+  • image manager         ← on-demand per-role image server
         │  HTTP (streaming pass-through / binary pass-through)
         ├── llama-server chat   (127.0.0.1:8101, on-demand + idle unload)
         ├── llama-server embed (127.0.0.1:8102, persistent)
         ├── audiocpp_server TTS (127.0.0.1:8103, on-demand, swappable)
         ├── audiocpp_server ASR (127.0.0.1:8104, on-demand, swappable)
-        └── whisper-server ASR  (127.0.0.1:8105, on-demand, swappable)
+        ├── whisper-server ASR  (127.0.0.1:8105, on-demand, swappable)
+        └── sd-server image     (127.0.0.1:8109, on-demand, swappable)
 ```
 ## The flow, simplified
 
@@ -56,30 +59,35 @@ flowchart LR
         CH["CHAT<br/>one model at a time"]
         EM["EMBED<br/>persistent"]
         AU["AUDIO<br/>TTS + ASR"]
-        V["VRAM guard<br/>(3 deterministic rules)"]
+        IMG["IMAGE<br/>one diffusion model"]
+        V["VRAM guard<br/>(deterministic rules)"]
     end
 
     L --> CH
     L --> EM
     L --> AU
+    L --> IMG
 
     CH -->|"swap per request:<br/>stop → boot → serve"| B1["llama-server"]
     EM -->|"own port, never evicted"| B2["llama-server (embed)"]
     AU -->|"swap backend per request"| B3["audiocpp · whisper.cpp"]
+    IMG -->|"swap model per request"| B4["sd-server · stable-diffusion.cpp"]
 
     V -. "① big LLM ⇒ unload TTS / ASR first" .-> CH
     V -. "② TTS + ASR loaded ⇒ serve smallest LLM" .-> CH
     V -. "③ big LLM loaded ⇒ reject audio (409)" .-> AU
+    V -. "④ image gen ⇄ unload chat / audio" .-> IMG
 
     CH -. "idle 300s" .-> OFF["unload → VRAM freed"]
     AU -. "idle 300s" .-> OFF
+    IMG -. "idle 300s" .-> OFF
     EM -. "survives LLM swaps" .-> ON["embeddings stay up"]
 ```
 
 Read it left to right:
 
 1. **One door, one dialect.** Any OpenAI client talks to `:11434/v1` — chat,
-   embeddings, audio, models — nothing else changes.
+   embeddings, audio, images, models — nothing else changes.
 2. **CHAT** = single `llama-server`. A request for a *different* model stops
    the running one, boots the new one from its YAML, waits for `/health`,
    then serves. A 13 GB model never needs to fit twice.
@@ -88,25 +96,113 @@ Read it left to right:
 4. **AUDIO** = per-role TTS and ASR servers that boot on first use and swap
    backends per request (Qwen3-ASR ↔ whisper.cpp; OuteTTS ↔ Supertonic ↔
    Qwen3-TTS voice clone). Ollama has none of this natively.
-5. **VRAM guard** — three deterministic rules (below) instead of hoping the
-   GPU evicts the right thing.
+5. **IMAGE** = one on-demand diffusion server (stable-diffusion.cpp's
+   `sd-server`) behind `/v1/images/generations` and `/v1/images/edits`. It
+   swaps image models per request and idle-unloads like everything else.
+6. **VRAM guard** — a set of deterministic rules (below) instead of hoping
+   the GPU evicts the right thing.
 
-### The VRAM guard — three deterministic rules
+### The VRAM guard — complete behavior
+**One invariant drives everything, Heaviness decides who loses.**
+>The image
+server (FLUX ≈ 12 GB) is the heaviest tenant — it evicts whoever is
+resident when *it* loads, and it is evicted by every *other* request. A
+"big" chat LLM (anything larger than the smallest weights file, ≈ 7–13 GB)
+evicts audio but is never evicted *by* audio — audio is simply refused
+(`409`) while a big LLM holds the GPU. The embedding server (≈ 0.7 GB) is
+the most persistent: it survives chat/audio swaps and only yields to the
+image server (or a failed big-LLM load).
 
-No `OOM` roulette. Three rules keep a 16 GB card from ever being
-over-subscribed (each a toggle, all on by default):
+#### The four residents
 
-1. **Unload on big model.** A request for a "big" chat LLM — anything bigger
-   than the smallest weights file — stops the running TTS/ASR servers first
-   (the embedding server stays up), so the model always fits.
-2. **Downgrade while audio is loaded.** When TTS *and* ASR are both
-   resident, chat is transparently served by the smallest LLM, whatever
-   model was asked for.
-3. **Block audio while a big LLM is resident.** While a big model holds the
-   GPU, `/v1/audio/*` returns `409` until it idle-unloads.
+| Tenant | Manager | Lifetime |
+|---|---|---|
+| Embedding | `EmbeddingManager` | persistent — boots at startup, survives all but image load / LLM retry |
+| Chat LLM | `ProcessManager` | on-demand, one at a time, idle-unloaded |
+| TTS / ASR | `RoleServerManager` ×2 | on-demand per role, idle-unloaded |
+| Image | `RoleServerManager` ×1 | on-demand, idle-unloaded |
 
-> `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM` · `LLAMASWAP_AUDIO_VRAM_GUARD` ·
-> `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM` — all default to `true`.
+`LLAMASWAP_IDLE_UNLOAD_SECONDS` (default **300**) is the baseline: except
+embedding, every loaded server is shut down after that many seconds with no
+requests (`0` disables idle unload).
+
+#### Rules by request type
+
+**Chat** (`/v1/chat/completions`, `/v1/completions`) — in order:
+
+1. Big LLM requested → stop TTS/ASR first (embedding stays up).
+   `unload_audio_on_big_llm` (true)
+2. Always unload the image server first (no-op if not loaded).
+   `unload_image_on_llm` (true)
+3. If TTS *and* ASR are both still resident → serve the smallest LLM
+   instead of the requested one. `audio_vram_guard` (true)
+4. Load the requested (or substituted) LLM. On load failure while embedding
+   is running: stop embedding, retry once, then best-effort relaunch
+   embedding in the background.
+
+> The `audio_vram_guard` downgrade only fires when audio was *not* evicted —
+> i.e. `unload_audio_on_big_llm=false` keeps audio resident, or the smallest
+> LLM was requested while both audio roles hold VRAM. With the defaults, a
+> big LLM evicts audio at step 1 and is never downgraded.
+
+**Audio** (`/v1/audio/speech`, `/v1/audio/transcriptions`,
+`/v1/audio/translations`) — in order:
+
+1. Reject `409` if a big LLM is loaded or mid-load.
+   `block_audio_on_big_llm` (true)
+2. Unload the image server first (no-op if not loaded).
+   `unload_image_on_audio` (true)
+3. Load/swap the requested audio role.
+
+This is the only path that returns `409` — and only against a big chat LLM,
+never against the image server.
+
+**Image** (`/v1/images/generations`, `/v1/images/edits`):
+
+1. Stop chat LLM + TTS/ASR + embedding — free the whole GPU.
+   `unload_on_image` (true)
+2. Load/swap the image server.
+
+**Embedding** (`/v1/embeddings`): served directly by the dedicated server,
+never disturbs anything; if it was evicted it self-heals via
+`ensure_running()`.
+
+#### The six toggles
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `unload_audio_on_big_llm` | `true` | big LLM request → evict TTS/ASR first |
+| `audio_vram_guard` | `true` | TTS + ASR both loaded → serve smallest LLM only |
+| `block_audio_on_big_llm` | `true` | big LLM loaded → audio gets `409` |
+| `unload_on_image` | `true` | image load → evict chat + audio + embedding |
+| `unload_image_on_llm` | `true` | chat request → evict image |
+| `unload_image_on_audio` | `true` | audio request → evict image |
+
+#### Embedding server — the special case
+
+The embedding server boots with the proxy and is **never** idle-unloaded. It
+is evicted in exactly two cases — an image request frees the whole GPU, and
+a big-LLM load fails and needs the VRAM for a retry — and it self-heals on
+the next `/v1/embeddings` request (directly) or the next chat request
+(background relaunch).
+
+#### Worked examples
+
+- **FLUX after chat:** a resident ~13 GB chat LLM is stopped, plus embedding;
+  FLUX q8 (~12 GB) loads with its text encoders on CPU.
+- **Chat right after FLUX:** the FLUX server is unloaded, the LLM loads, and
+  embedding restarts in the background.
+- **TTS right after FLUX:** the FLUX server is unloaded, then TTS boots — no
+  `409`.
+- **Both audio roles loaded, then a big LLM:** default = audio evicted, the
+  big LLM loads. With `unload_audio_on_big_llm=false`, the request is instead
+  downgraded to the smallest LLM.
+- **Big LLM loaded, then audio:** audio is refused with `409`. With
+  `block_audio_on_big_llm=false`, audio is allowed to stack and risks OOM.
+
+No OOM roulette, no hidden GPU-driver eviction: every resident backend is
+either supported by an explicit rule, evicted by an explicit rule, or
+refused with `409`.
 
 ## The flow detailed
 - **One chat LLM at a time.** A 13 GB model does not fit twice on a 16 GB
@@ -139,6 +235,12 @@ over-subscribed (each a toggle, all on by default):
   on top of a large model. Audio works again once the big LLM idle-unloads
   or the smallest model is served. Controlled by
   `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM` (default true).
+- **VRAM guard (image direction).** Image generation is the heaviest
+  tenant: a `/v1/images/*` request stops the chat LLM, TTS/ASR, and
+  embedding servers first to free the whole GPU; and any chat or TTS/ASR
+  request stops the image server instead of stacking on it. Controlled by
+  `LLAMASWAP_UNLOAD_ON_IMAGE`, `LLAMASWAP_UNLOAD_IMAGE_ON_LLM`, and
+  `LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO` (all default true).
 - **Registry.** Every file in `backend/` is one model: the exact
   binary + arguments + env + port. Add a file, reload, done. Works for any
   OpenAI-compatible backend, not just llama-server.
@@ -168,6 +270,7 @@ flowchart TD
     R -->|"/v1/chat/completions /v1/completions"| CH
     R -->|"/v1/embeddings"| EM
     R -->|"/v1/audio/speech /transcriptions ..."| AU
+    R -->|"/v1/images/generations /v1/images/edits"| IM
     R -->|"/v1/reset"| RS
     R -->|"/v1/models /health"| OUT
 
@@ -176,8 +279,9 @@ flowchart TD
         CH2 -->|"no"| CH2x["400 / 404"]
         CH2 -->|"yes"| CH3{"big model requested?<br/>model != smallest"}
         CH3 -->|"yes — unload_audio_on_big_llm"| CH4["unload TTS + ASR<br/>embedding stays up"]
-        CH3 -->|"no"| CH5{"both TTS and ASR loaded?"}
-        CH4 --> CH5
+        CH3 -->|"no"| CH4b["unload image server<br/>(unload_image_on_llm)"]
+        CH4 --> CH4b
+        CH4b --> CH5{"both TTS and ASR loaded?"}
         CH5 -->|"yes — audio_vram_guard"| CH6["serve smallest LLM instead"]
         CH5 -->|"no"| CH7
         CH6 --> CH7
@@ -189,9 +293,17 @@ flowchart TD
     subgraph AU["Audio path (TTS / ASR)"]
         AU1["extract model<br/>default: first of role"] --> AU2{"loaded chat model is big?"}
         AU2 -->|"yes — block_audio_on_big_llm"| AU3["409 audio blocked"]
-        AU2 -->|"no"| AU4["AudioManager: boot / swap<br/>TTS or ASR server, await /health"]
-        AU4 --> AU5["translate dialect<br/>ffmpeg transcode response_format"]
-        AU5 --> OUT
+        AU2 -->|"no"| AU4["unload image server<br/>(unload_image_on_audio)"]
+        AU4 --> AU5["AudioManager: boot / swap<br/>TTS or ASR server, await /health"]
+        AU5 --> AU6["translate dialect<br/>ffmpeg transcode response_format"]
+        AU6 --> OUT
+    end
+
+    subgraph IM["Image path (text-to-image / edit)"]
+        IM1["extract model<br/>default: first of role"] --> IM2["unload chat + TTS + ASR + embedding<br/>(unload_on_image)"]
+        IM2 --> IM3["image manager: boot / swap<br/>sd-server, await /v1/models"]
+        IM3 --> IM4["proxy image response"]
+        IM4 --> OUT
     end
 
     subgraph EM["Embedding path"]
@@ -203,7 +315,7 @@ flowchart TD
     end
 
     subgraph RS["Reset"]
-        RS1["unload chat + TTS + ASR + embedding"] --> RS2["return post-reset /health"]
+        RS1["unload chat + TTS + ASR + image + embedding"] --> RS2["return post-reset /health"]
         RS2 --> OUT
     end
 
@@ -222,17 +334,18 @@ llamaswap/
 │   ├── supertonic-3.yaml     # TTS: Supertonic 3 (preset voices) via audio.cpp
 │   ├── qwen3-asr.yaml        # ASR: Qwen3-ASR via audio.cpp (role: asr)
 │   ├── nemotron-asr.yaml     # ASR: Nemotron 3.5 ASR Streaming via audio.cpp
-│   └── whisper-asr.yaml      # ASR: Whisper via whisper.cpp (role: asr)
+│   ├── whisper-asr.yaml      # ASR: Whisper via whisper.cpp (role: asr)
+│   └── flux-schnell.yaml     # image: FLUX.1-schnell via sd-server (role: image)
 ├── app/
 │   ├── config.py             # settings (env prefix LLAMASWAP_)
 │   ├── registry.py           # YAML → validated ModelConfig objects
 │   ├── process_manager.py    # chat llama-server lifecycle + health checks
 │   ├── embedding_manager.py  # persistent embedding llama-server lifecycle
-│   ├── audio_manager.py      # on-demand per-role TTS/ASR lifecycle + swap + idle unload
+│   ├── server_manager.py     # on-demand per-role TTS/ASR/image lifecycle + swap + idle unload
 │   ├── proxy.py              # async reverse proxy (stream / raw / multipart)
 │   └── main.py               # FastAPI routes (OpenAI API)
 ├── scripts/
-│   ├── download-models.sh    # fetch TTS/ASR model weights
+│   ├── download-models.sh    # fetch TTS/ASR/image model weights
 │   └── sample-qwen3-tts.sh   # sample the Qwen3-TTS voice clone
 ├── data/                     # local audio (gitignored): recordings, reference clips, samples
 ├── requirements.txt
@@ -272,8 +385,9 @@ meta:
 |---|---|---|---|
 | `llm` | ProcessManager | yes | `qwen3.8-27b` |
 | `embedding` | EmbeddingManager | no (single) | `octen-embedding-0.6b` |
-| `tts` | AudioManager | yes (among tts models) | `outetts`, `qwen3-tts`, `supertonic-3` |
-| `asr` | AudioManager | yes (among asr models) | `whisper-asr`, `qwen3-asr`, `nemotron-asr` |
+| `tts` | RoleServerManager | yes (among tts models) | `outetts`, `qwen3-tts`, `supertonic-3` |
+| `asr` | RoleServerManager | yes (among asr models) | `whisper-asr`, `qwen3-asr`, `nemotron-asr` |
+| `image` | RoleServerManager | yes (among image models) | `flux-schnell` |
 
 `role: llm` models are swapped on request by the normal path. A single
 `role: embedding` model runs persistently on its own port (usually `8102`)
@@ -286,6 +400,11 @@ role swaps the server (`/v1/audio/speech` → the `tts` role;
 `/v1/audio/transcriptions` → the `asr` role), and the server is stopped
 after `LLAMASWAP_IDLE_UNLOAD_SECONDS` with no requests (same policy as
 the chat LLM). Each audio model needs its own port (`8103`+ recommended).
+
+`role: image` works the same way through `/v1/images/generations` and
+`/v1/images/edits` (see `flux-schnell.yaml`; port `8109`), with the image
+VRAM guard unloading chat/audio before it — and vice-versa — so a
+diffusion model never shares the GPU.
 
 `meta.request_format` tells the proxy which request dialect the backend
 speaks (default `json`):
@@ -479,7 +598,14 @@ trade-off for zh/en.
 #   nemotron_asr    Nemotron 3.5 ASR Streaming 0.6B Q8_0 (family `nemotron_asr`)
 #   whisper         ggml-base.en (whisper.cpp)
 #   whisper-multi   ggml-base (multilingual whisper.cpp)
+#   flux-schnell    FLUX.1-schnell q8_0 GGUF (stable-diffusion.cpp)
+#   flux-vae        FLUX VAE (ae.safetensors)
+#   flux-clip_l     FLUX clip_l text encoder
+#   flux-t5xxl      FLUX t5xxl text encoder (~10 GB)
 ./scripts/download-models.sh tts tts-qwen3 supertonic_3 asr nemotron_asr whisper
+
+# image generation (FLUX.1-schnell + shared encoders)
+./scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl
 ```
 
 The binary ends up at `build/bin/audiocpp_server`. The Docker overlay
@@ -524,6 +650,84 @@ The binary ends up at `build/bin/whisper-server`. The Docker overlay
 inside the build. `--convert` needs `ffmpeg` (only for local conversion;
 llamaswap's proxy pre-converts uploads to wav itself).
 
+### Building stable-diffusion.cpp (image)
+
+The `flux-schnell.yaml` config points at stable-diffusion.cpp's `sd-server`
+binary, which natively speaks the OpenAI image API (`/v1/images/generations`,
+`/v1/images/edits`), so llamaswap is a near pass-through.
+
+**Prerequisites**
+
+* NVIDIA GPU + driver and the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+  (`nvcc`) — the same toolkit used for llama.cpp / audio.cpp / whisper.cpp.
+* CMake ≥ 3.16 and a C++17 compiler — same toolchain as the other backends.
+* `git` — to clone stable-diffusion.cpp and pull its submodules
+  (`ggml`, `thirdparty/libwebp`, `thirdparty/libwebm`, the server webui).
+* ~25 GB free disk space for the FLUX weights plus build artifacts.
+
+```bash
+mkdir -p /opt/stable-diffusion.cpp
+cd /opt/stable-diffusion.cpp
+git clone https://github.com/leejet/stable-diffusion.cpp .
+# ggml (plus libwebp/libwebm and the optional webui) is a git submodule;
+# skip this and the ggml/ tree is empty, so CMake fails with
+# "does not contain a CMakeLists.txt".
+git submodule update --init --recursive
+
+# CUDA build. The server example builds as `sd-server`; the web frontend is
+# optional (off below, which skips the pnpm toolchain).
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DSD_SERVER_BUILD_FRONTEND=OFF
+# Cap at 70% of available cores so nvcc does not saturate the host.
+cmake --build build --config Release --target sd-server \
+    --parallel $(($(nproc) * 9 / 10))
+
+# FLUX.1-schnell q8_0 GGUF + VAE + text encoders
+./scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl
+```
+>Note: if any model download failed it may reuire your login
+The 401 Unauthorized error occurs because the FLUX.1-dev model is a gated repository on Hugging Face, requiring you to accept their terms and authenticate your download request.
+* Step 1: Accept the Terms on Hugging Face
+
+   1. Log into your Hugging Face account.
+   2. Visit the [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) repository page.
+   3. Agree to the user conditions and submit the access request form.
+
+* Step 2: Create a Read Token
+
+   1. Go to your Hugging Face Account Settings.
+   2. Click on Access Tokens in the left sidebar.
+   3. Generate a new token with Read permissions.
+   4. Copy the generated token string.
+
+* Step 3: Pass the Token via wget
+Modify your wget command to include an authorization header containing your token:
+
+  wget --header="Authorization: Bearer YOUR_HF_TOKEN_HERE" https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors
+
+> Alternative: Use the huggingface-cli (Recommended)
+Since you are already working inside a virtual environment (.venv), using the official Hugging Face CLI tool handles authentication and large downloads much more reliably than wget.
+
+   1. Install the CLI tool:
+
+    pip install huggingface_hub
+
+   2. Log into your account:
+
+    huggingface-cli login
+
+    (Paste your Read token when prompted)
+
+
+   3. Download the specific file directly to your current directory:
+
+    huggingface-cli download black-forest-labs/FLUX.1-dev ae.safetensors --local-dir .
+
+
+The binary ends up at `build/bin/sd-server`. The Docker overlay (below)
+stamps this host-built binary into the image — nothing is compiled inside
+the build. A single `flux-schnell` model of `role: image` is included; add
+more (e.g. SDXL) as extra `backend/*.yaml` files on port `8110`+.
+
 ### Enabling TTS/ASR in Docker (optional overlay)
 
 The base image stays buildable without any audio backends. The
@@ -560,6 +764,30 @@ Without the overlay the audio YAMLs in `backend/` simply fail to spawn
 their (missing) binaries — the proxy keeps running and reports the roles
 as stopped in `/health`. Delete the audio YAMLs to hide them from
 `/v1/models` entirely.
+
+### Enabling image generation in Docker (optional overlay)
+
+Like the audio stack, the image backend is an opt-in overlay: it does not
+compile anything, stamps the host-built `sd-server` binary into the image
+via the `sdcpp-bin` build context, and an `image-models-init` one-shot
+downloads the FLUX weights before llamaswap starts. The init-service name
+is distinct from the audio overlay's `models-init`, so the two overlays
+can be stacked:
+
+```bash
+# 1. build the base image first
+ docker compose up --build
+# 2. build + start with image generation (FLUX weights downloaded +
+#    binary stamped in, then llamaswap starts)
+docker compose -f docker-compose.yml -f docker-compose.image.yml up -d --build
+# 3. or everything at once (audio + image)
+docker compose -f docker-compose.yml -f docker-compose.audio.yml \
+               -f docker-compose.image.yml up -d --build
+```
+
+Without the overlay the `flux-schnell.yaml` model simply fails to spawn
+its (missing) binary — the proxy keeps running and reports the image role
+as stopped in `/health`. Delete the image YAML to hide it from `/v1/models`.
 
 ### LlamaSwap Docker Installation
 ```bash
@@ -810,6 +1038,12 @@ curl -s localhost:11434/v1/audio/transcriptions \
 # capitalization, automatic language detection (audio.cpp json_path dialect)
 curl -s localhost:11434/v1/audio/transcriptions \
   -F 'model=nemotron-asr' -F 'file=@speech.wav' -F 'response_format=json'
+
+# image generation — boots sd-server on first use, then idle-unloads;
+# returns {created, data:[{b64_json}]} (decode b64 to save the PNG)
+curl -s localhost:11434/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "flux-schnell", "prompt": "a cat piloting a tiny spaceship", "size": "1024x1024", "n": 1}'
 ```
 
 OpenAI SDK:
@@ -841,14 +1075,23 @@ with open("speech.wav", "rb") as fh:
         model="whisper-asr", file=fh, response_format="json",
     )
     print(tr.text)
+
+# image generation
+import base64
+img = client.images.generate(
+    model="flux-schnell",
+    prompt="a cat piloting a tiny spaceship",
+    size="1024x1024",
+)
+open("cat.png", "wb").write(base64.b64decode(img.data[0].b64_json))
 ```
 
 ## Notes
 
 - The persistent embedding server starts with the proxy. If it fails to
   start, the proxy still starts and reports the embedding state in
-  `/health`. The chat LLM and TTS/ASR servers start on first use instead
-  of booting with the proxy.
+  `/health`. The chat LLM, TTS/ASR, and image servers start on first use
+  instead of booting with the proxy.
 - Requesting a "big" chat LLM (anything other than the smallest by
   weights-file size) unloads any running TTS/ASR servers first to free
   VRAM — the embedding server is left running. Disable with
@@ -862,12 +1105,16 @@ with open("speech.wav", "rb") as fh:
   `LLAMASWAP_AUDIO_VRAM_GUARD`, and it only blocks *new* requests — an
   audio server that was already resident keeps running until its idle
   timeout. Disable with `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM=false`.
-- The chat LLM and TTS/ASR servers are stopped after
+- The chat LLM, TTS/ASR, and image servers are stopped after
   `LLAMASWAP_IDLE_UNLOAD_SECONDS` with no requests (`/health` shows
   `idle_seconds`); only the embedding server stays up. Switching between
-  audio backends of the same role (e.g. `whisper-asr` ↔ `qwen3-asr`)
-  stops the previous audio server and starts the requested one — a few
-  seconds.
+  backends of the same role (e.g. `whisper-asr` ↔ `qwen3-asr`) stops the
+  previous server and starts the requested one — a few seconds.
+- Image generation is guarded the same way: a `/v1/images/*` request stops
+  the chat LLM, TTS/ASR, and embedding servers first — freeing the whole
+  GPU — so FLUX fits; and any chat or TTS/ASR request stops the image
+  server. Toggles: `LLAMASWAP_UNLOAD_ON_IMAGE`,
+  `LLAMASWAP_UNLOAD_IMAGE_ON_LLM`, `LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO`.
 - `/v1/audio/speech` returns whatever the backend returns (audio.cpp
   returns WAV; Kokoro-FastAPI would return mp3 — the proxy passes the
   `Content-Type` through) **unless** the request asks for a different
