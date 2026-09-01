@@ -49,41 +49,7 @@ llamaswap (FastAPI)
         └── sd-server image     (127.0.0.1:8109, on-demand, swappable)
 ```
 ## The flow, simplified
-
-```mermaid
-flowchart LR
-    C["Any OpenAI client<br/>(SDK · curl · Open WebUI)"] --> L[("llamaswap<br/>:11434/v1")]
-
-    subgraph G["one GPU"]
-        direction TB
-        CH["CHAT<br/>one model at a time"]
-        EM["EMBED<br/>persistent"]
-        AU["AUDIO<br/>TTS + ASR"]
-        IMG["IMAGE<br/>one diffusion model"]
-        V["VRAM guard<br/>(deterministic rules)"]
-    end
-
-    L --> CH
-    L --> EM
-    L --> AU
-    L --> IMG
-
-    CH -->|"swap per request:<br/>stop → boot → serve"| B1["llama-server"]
-    EM -->|"own port, never evicted"| B2["llama-server (embed)"]
-    AU -->|"swap backend per request"| B3["audiocpp · whisper.cpp"]
-    IMG -->|"swap model per request"| B4["sd-server · stable-diffusion.cpp"]
-
-    V -. "① big LLM ⇒ unload TTS / ASR first" .-> CH
-    V -. "② TTS + ASR loaded ⇒ serve smallest LLM" .-> CH
-    V -. "③ big LLM loaded ⇒ reject audio (409)" .-> AU
-    V -. "④ image gen ⇄ unload chat / audio" .-> IMG
-
-    CH -. "idle 300s" .-> OFF["unload → VRAM freed"]
-    AU -. "idle 300s" .-> OFF
-    IMG -. "idle 300s" .-> OFF
-    EM -. "survives LLM swaps" .-> ON["embeddings stay up"]
-```
-
+![llamaswapv2.1](docs/images/llamaswapv2.1.png)
 Read it left to right:
 
 1. **One door, one dialect.** Any OpenAI client talks to `:11434/v1` — chat,
