@@ -929,6 +929,7 @@ the reference, and `-o`/`--out` sets the output. Run
 | `POST /v1/models/{model}/unload` | Unload the model resident for this model's role (admin) |
 | `POST /v1/chat/completions` | Chat; `stream: true` for SSE. `X-Pin-Seconds` suppresses idle unload |
 | `POST /v1/completions` | Text completions |
+| `POST /v1/responses` | OpenAI Responses API; proxies to llama-server's `/v1/responses` (streaming via `stream: true`). Requires a llama-server build that exposes the responses route |
 | `POST /v1/embeddings` | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path |
 | `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out. `response_format` (mp3/opus/aac/flac/pcm/wav) is transcoded from WAV internally via ffmpeg |
 | `POST /v1/audio/speech/stream` | Streaming TTS: chunked audio passthrough (backend codec) |
@@ -941,12 +942,24 @@ the reference, and `-o`/`--out` sets the output. Run
 | `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image status, plus registry warnings/degraded |
 | `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests) |
 | `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
+| `GET /api/tags` | Ollama-compatible model list (one entry per registry model, with `size`, `digest`, `details`) |
+| `GET /api/ps` | Ollama-compatible running-models list (chat LLM, embedding, TTS/ASR, image that are resident now, with `expires_at` from the idle unloader) |
 
 ### Examples
 
 ```bash
 # list models
 curl -s localhost:11434/v1/models | jq
+
+# Ollama-compatible: list models (tags) and running models (ps)
+curl -s localhost:11434/api/tags | jq
+curl -s localhost:11434/api/ps | jq
+
+# OpenAI Responses API (non-streaming)
+curl -s localhost:11434/v1/responses -d '{
+  "model": "qwen3.8-27b",
+  "input": "Say hello in one word."
+}'
 
 # chat (non-streaming) — first call loads the model (can take minutes)
 curl -s localhost:11434/v1/chat/completions -d '{

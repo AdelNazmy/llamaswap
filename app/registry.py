@@ -344,6 +344,13 @@ class Registry:
     def names(self) -> list[str]:
         return list(self.models)
 
+    def model_path(self, name: str) -> Optional[str]:
+        """On-disk weights file path for ``name``, if its command names one."""
+        cfg = self.models.get(name)
+        if cfg is None:
+            return None
+        return self._model_path(cfg)
+
     def embedding_config(self) -> Optional[ModelConfig]:
         """The dedicated embedding model config, or None if not defined."""
         return self._first_role("embedding")

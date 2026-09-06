@@ -19,6 +19,12 @@ LLM:
     like the chat LLM; proxied through the OpenAI image endpoints
     (/v1/images/generations, /v1/images/edits).
 
+The OpenAI Responses API (``/v1/responses``) is proxied straight through to
+llama-server's responses route, alongside ``/v1/chat/completions`` and
+``/v1/completions``. Two Ollama-compatible read-only endpoints are also
+served: ``/api/tags`` (registry model list) and ``/api/ps`` (currently
+resident backends).
+
 While tts AND asr are both loaded, a VRAM guard substitutes the smallest
 chat LLM for any requested chat model (see Settings.audio_vram_guard).
 Requesting a "big" chat LLM (any LLM other than the smallest by
@@ -36,10 +42,13 @@ server too (Settings.unload_image_on_audio).
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -493,6 +502,11 @@ async def completions(request: Request):
     return await _ensure_and_route(request, "/v1/completions")
 
 
+@app.post("/v1/responses")
+async def responses(request: Request):
+    return await _ensure_and_route(request, "/v1/responses")
+
+
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
     embedding_manager: Optional[EmbeddingManager] = (
@@ -941,6 +955,158 @@ async def images_generations(request: Request):
 @app.post("/v1/images/edits")
 async def images_edits(request: Request):
     return await _route_image(request, "/v1/images/edits")
+
+
+# ---------------------------------------------------------------------------
+# Ollama compatibility surface (/api/tags, /api/ps)
+# ---------------------------------------------------------------------------
+# llamaswap listens on Ollama's default port, so it also serves the two most
+# commonly probed Ollama endpoints. /api/tags lists the registry (one entry
+# per backend/*.yaml model, Ollama-shaped); /api/ps lists the backends that
+# are actually resident right now (chat LLM, embedding, TTS/ASR, image).
+
+# Go's zero time: what Ollama emits for a model that never expires.
+_NEVER_EXPIRES = "0001-01-01T00:00:00Z"
+
+_PARAM_RE = re.compile(r"(?i)(\d+(?:\.\d+)?)\s*[bB]\b")
+_QUANT_RE = re.compile(r"(?i)\b(Q[2-8](?:_[A-Z0-9]+)*|F16|F32|BF16)\b")
+
+
+def _parameter_size(name: str) -> str:
+    """Best-effort parameter-size label from a model name (e.g. "27B")."""
+    m = _PARAM_RE.search(name)
+    return f"{m.group(1)}B" if m else ""
+
+
+def _quantization_level(name: str) -> str:
+    """Quantization token from a model name (Q4_K_M, Q8_0, F16, ...), if any."""
+    m = _QUANT_RE.search(name)
+    return m.group(1).upper() if m else ""
+
+
+def _model_digest(name: str) -> str:
+    # Stable synthetic digest. Ollama digests are a real hash over the blob;
+    # hashing multi-GB GGUF weights on every list call would be far too slow,
+    # so llamaswap derives a deterministic digest from the model name instead.
+    return "sha256:" + hashlib.sha256(name.encode()).hexdigest()
+
+
+def _model_file_info(registry: Registry, cfg: ModelConfig) -> tuple[int, str]:
+    """(size_bytes, modified_at_rfc3339) for a model's weights file."""
+    size = 0
+    modified_at = "1970-01-01T00:00:00Z"
+    path = registry.model_path(cfg.name)
+    if path:
+        try:
+            st = Path(path).stat()
+            size = st.st_size
+            modified_at = datetime.fromtimestamp(
+                st.st_mtime, tz=timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+        except OSError:
+            pass
+    return size, modified_at
+
+
+def _ollama_details(cfg: ModelConfig) -> dict:
+    family = cfg.meta.family or cfg.name
+    return {
+        "parent_model": "",
+        "format": "gguf",
+        "family": family,
+        "families": [family],
+        "parameter_size": _parameter_size(cfg.name),
+        "quantization_level": _quantization_level(cfg.name),
+    }
+
+
+def _ollama_tag_entry(registry: Registry, cfg: ModelConfig) -> dict:
+    """One Ollama /api/tags entry (a registry model)."""
+    size, modified_at = _model_file_info(registry, cfg)
+    return {
+        "name": cfg.name,
+        "model": cfg.name,
+        "modified_at": modified_at,
+        "size": size,
+        "digest": _model_digest(cfg.name),
+        "details": _ollama_details(cfg),
+    }
+
+
+def _ollama_process_entry(registry: Registry, cfg: ModelConfig,
+                          expires_at: str) -> dict:
+    """One Ollama /api/ps entry (a currently resident model)."""
+    size, _ = _model_file_info(registry, cfg)
+    return {
+        "name": cfg.name,
+        "model": cfg.name,
+        "size": size,
+        "size_vram": size,
+        "digest": _model_digest(cfg.name),
+        "details": _ollama_details(cfg),
+        "expires_at": expires_at,
+    }
+
+
+def _expires_at(status: dict) -> str:
+    """Idle-unload deadline from a manager status dict, Ollama-expiry style.
+
+    Returns Go-zero-time (never expires) when the manager has no idle unload
+    configured or is already past its deadline.
+    """
+    idle_unload = status.get("idle_unload_seconds")
+    if idle_unload:
+        idle = status.get("idle_seconds", 0.0)
+        remaining = float(idle_unload) - float(idle)
+        if remaining > 0:
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+            return expiry.isoformat().replace("+00:00", "Z")
+    return _NEVER_EXPIRES
+
+
+@app.get("/api/tags")
+async def api_tags(request: Request):
+    """Ollama-style model list: one entry per registry model."""
+    registry: Registry = request.app.state.registry
+    models = [
+        _ollama_tag_entry(registry, cfg)
+        for cfg in sorted(registry.models.values(), key=lambda c: c.name)
+    ]
+    return {"models": models}
+
+
+@app.get("/api/ps")
+async def api_ps(request: Request):
+    """Ollama-style running-processes list: every backend resident now."""
+    registry: Registry = request.app.state.registry
+    models: list[dict] = []
+
+    def add(name: Optional[str], status: dict) -> None:
+        if not name:
+            return
+        cfg = registry.models.get(name)
+        if cfg is None:
+            return
+        models.append(_ollama_process_entry(registry, cfg, _expires_at(status)))
+
+    st = request.app.state.manager.status()
+    if st.get("state") == "ready":
+        add(st.get("model"), st)
+
+    emb: Optional[EmbeddingManager] = request.app.state.embedding_manager
+    if emb is not None and emb.is_running:
+        add(emb.name, {})
+
+    for mgr in request.app.state.audio_managers.values():
+        st = mgr.status()
+        if st.get("state") == "ready":
+            add(st.get("model"), st)
+
+    st = request.app.state.image_manager.status()
+    if st.get("state") == "ready":
+        add(st.get("model"), st)
+
+    return {"models": models}
 
 
 # ---------------------------------------------------------------------------
