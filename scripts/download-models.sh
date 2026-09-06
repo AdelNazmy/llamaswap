@@ -30,7 +30,7 @@
 #   MODEL_ROOT  model directory (default: /opt/models)
 #   NO_RESUME   set to 1 to restart a partial download instead of resuming
 #
-# Requires: curl. (No huggingface_hub / hf CLI needed.)
+# Requires: aria2 (the aria2c binary). (No huggingface_hub / hf CLI needed.)
 
 set -u
 
@@ -55,6 +55,28 @@ resolve() { # name -> url|relpath
     printf '%s\n' "$BUNDLES" | awk -F'|' -v n="$1" '$1 == n { print $2 "|" $3; exit; }'
 }
 
+# is_present <relpath> -> 0 if the file exists and is non-empty
+is_present() {
+    [ -f "$MODEL_ROOT/$1" ] && [ -s "$MODEL_ROOT/$1" ]
+}
+
+# list_missing <bundle...> -> print each bundle whose file is missing.
+# Exits 0 so callers can capture the list via command substitution.
+list_missing() {
+    for name in "$@"; do
+        spec=$(resolve "$name")
+        if [ -z "$spec" ]; then
+            echo "  [error] unknown bundle '$name'" >&2
+            continue
+        fi
+        rel="${spec#*|}"
+        if ! is_present "$rel"; then
+            printf '%s\n' "$name"
+        fi
+    done
+    return 0
+}
+
 download_one() {
     url="$1"; rel="$2"
     dest="$MODEL_ROOT/$rel"
@@ -72,9 +94,25 @@ download_one() {
 }
 
 main() {
+    missing_only=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --missing) missing_only=1; shift ;;
+            --) shift; break ;;
+            -*) echo "download-models: unknown option '$1'" >&2; exit 2 ;;
+            *) break ;;
+        esac
+    done
+
     if [ $# -eq 0 ]; then
         set -- tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3
     fi
+
+    if [ "$missing_only" = 1 ]; then
+        list_missing "$@"
+        return 0
+    fi
+
     echo "Model root: $MODEL_ROOT"
     rc=0
     for name in "$@"; do

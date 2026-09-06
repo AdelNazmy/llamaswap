@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -63,6 +64,17 @@ class Settings(BaseSettings):
     # wants a much shorter residency than a chat LLM.
     idle_unload_audio_seconds: Optional[float] = None
     idle_unload_image_seconds: Optional[float] = None
+
+    @field_validator(
+        "idle_unload_audio_seconds", "idle_unload_image_seconds", mode="before"
+    )
+    @classmethod
+    def _empty_string_to_none(cls, value):
+        # docker-compose passes ``${VAR:-}`` as an empty string when the
+        # variable is unset; treat that the same as "not set" (None).
+        if value is None or value == "":
+            return None
+        return value
 
     # Optional authentication. When api_key is set, every /v1/* request (and
     # the admin dashboard at /) must present it as

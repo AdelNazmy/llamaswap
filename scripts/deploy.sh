@@ -18,10 +18,13 @@
 # first and stamped in via compose `additional_contexts` (see the README
 # "Building ..." sections). A missing binary aborts the matching build.
 #
-# Model weights are NOT downloaded here: on `up -d` the one-shot init
-# services (models-init for audio, image-models-init for image) download any
-# missing weights into /opt/models before llamaswap starts. To fetch them
-# manually instead, run ./scripts/download-models.sh [bundle ...].
+# Model weights: before starting (skipped by --build-only), deploy.sh checks
+# the shared model root (MODEL_ROOT, default /opt/models) and downloads any
+# missing TTS/ASR/FLUX weights by running ./scripts/download-models.sh. The
+# one-shot init services (models-init / image-models-init) still run on
+# `up -d` as a safety net for direct `docker compose up` users, but they'll
+# find everything already present. The base chat LLM + embedding weights are
+# still installed separately via `hf` (see README) and are not managed here.
 #
 # Usage:
 #   ./scripts/deploy.sh                       # build all + start (up -d)
@@ -35,6 +38,8 @@
 #   LLAMASWAP_PORT        proxy port to health-check (default: 11434)
 #   LLAMASWAP_DEPLOY_WAIT max seconds to wait for /health during --verify
 #                         (default: 180)
+#   MODEL_ROOT            shared model dir to check/download into
+#                         (default: /opt/models)
 
 set -eu
 
@@ -147,6 +152,105 @@ if [ "$INCLUDE_IMAGE" = 1 ]; then
     docker compose -f docker-compose.yml -f docker-compose.image.yml build
 else
     echo "==> [3/3] image overlay skipped (--no-image)"
+fi
+
+# --- privilege / dependency helpers -----------------------------------------
+# Called only when a model download is actually needed, so `sudo` is only
+# requested when model weights are missing (never for a no-op deploy).
+
+need_escalation() { # -> 0 if we can run commands as root (root, or sudo)
+    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
+}
+
+run_root() { # run "$@" as root (sudo when not already root)
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+ensure_model_root() { # dir -> 0 once it exists and is writable by this user
+    root="$1"
+    if [ -d "$root" ] && [ -w "$root" ]; then
+        return 0
+    fi
+    echo "deploy: model root '$root' is missing or not writable; requesting sudo" >&2
+    if ! need_escalation; then
+        echo "deploy: cannot sudo; run as root, or create a writable '$root' manually" >&2
+        return 1
+    fi
+    run_root mkdir -p "$root" || return 1
+    run_root chown "$(id -u):$(id -g)" "$root" 2>/dev/null || true
+    if [ -d "$root" ] && [ -w "$root" ]; then
+        return 0
+    fi
+    echo "deploy: still unable to write '$root'; check its permissions" >&2
+    return 1
+}
+
+ensure_aria2c() { # -> 0 once aria2c is on PATH
+    if command -v aria2c >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "deploy: aria2c is required to download model weights" >&2
+    if ! need_escalation; then
+        echo "deploy: cannot sudo; install 'aria2' manually and re-run" >&2
+        return 1
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "deploy: installing aria2 via apt-get ..."
+        run_root apt-get update && run_root apt-get install -y aria2
+    elif command -v dnf >/dev/null 2>&1; then
+        run_root dnf install -y aria2
+    elif command -v yum >/dev/null 2>&1; then
+        run_root yum install -y aria2
+    elif command -v apk >/dev/null 2>&1; then
+        run_root apk add --no-cache aria2
+    elif command -v pacman >/dev/null 2>&1; then
+        run_root pacman -S --noconfirm aria2
+    else
+        echo "deploy: no supported package manager found; install 'aria2' manually and re-run" >&2
+        return 1
+    fi
+    command -v aria2c >/dev/null 2>&1
+}
+
+# --- model weights ---------------------------------------------------------
+# Runtime concern only; --build-only skips this. download-models.sh is
+# idempotent (skips files that already exist), but we ask it which of our
+# required bundles are missing and only invoke the download when there is
+# work to do.
+if [ "$DO_UP" = 1 ]; then
+    MODEL_ROOT="${MODEL_ROOT:-/opt/models}"
+    export MODEL_ROOT
+
+    NEEDED=
+    if [ "$INCLUDE_AUDIO" = 1 ]; then
+        NEEDED="$NEEDED tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3"
+    fi
+    if [ "$INCLUDE_IMAGE" = 1 ]; then
+        NEEDED="$NEEDED flux-schnell flux-vae flux-clip_l flux-t5xxl"
+    fi
+
+    if [ -z "$NEEDED" ]; then
+        echo "==> no downloadable model bundles for this configuration"
+    else
+        # shellcheck disable=SC2086  # intentional word split into bundle names
+        missing="$(sh "$ROOT/scripts/download-models.sh" --missing $NEEDED)"
+        if [ -n "$missing" ]; then
+            echo
+            echo "==> missing model weights detected; downloading into $MODEL_ROOT"
+            # shellcheck disable=SC2086  # newline/space-separated bundle names
+            for b in $missing; do echo "      - $b"; done
+            ensure_model_root "$MODEL_ROOT" || exit 1
+            ensure_aria2c || exit 1
+            # shellcheck disable=SC2086
+            sh "$ROOT/scripts/download-models.sh" $NEEDED
+        else
+            echo "==> all required model weights present under $MODEL_ROOT"
+        fi
+    fi
 fi
 
 # --- start ------------------------------------------------------------------
