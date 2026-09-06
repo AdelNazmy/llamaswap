@@ -28,6 +28,8 @@ services:
       # Unload the chat LLM AND audio (tts/asr) servers after this many
       # idle seconds; only the embedding server stays up.
       LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
+      LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS:-}"
+      LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS:-}"
       # While tts AND asr are both loaded, serve only the smallest chat
       # LLM (weights-file size) instead of the requested one.
       LLAMASWAP_AUDIO_VRAM_GUARD: "${LLAMASWAP_AUDIO_VRAM_GUARD:-true}"
@@ -40,7 +42,11 @@ services:
       LLAMASWAP_UNLOAD_IMAGE_ON_LLM: "${LLAMASWAP_UNLOAD_IMAGE_ON_LLM:-true}"
       LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO: "${LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO:-true}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
+      LLAMASWAP_LOG_JSON: "${LLAMASWAP_LOG_JSON:-false}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
+      LLAMASWAP_API_KEY: "${LLAMASWAP_API_KEY:-}"
+      LLAMASWAP_ADMIN_KEY: "${LLAMASWAP_ADMIN_KEY:-}"
+      LLAMASWAP_MAX_CONCURRENCY: "${LLAMASWAP_MAX_CONCURRENCY:-0}"
     volumes:
       - /opt/models:/opt/models:ro
       - ./backend:/app/backend

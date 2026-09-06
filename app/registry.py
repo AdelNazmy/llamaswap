@@ -45,16 +45,19 @@ class ModelMeta(BaseModel):
     request_format: str = "json"
     # Health endpoint checked by the process manager (default: /health).
     health_path: str = "/health"
+    # Declared VRAM footprint (GiB) used by the VRAM scheduler/guards. When
+    # unset, the registry falls back to the on-disk weights-file size.
+    vram_gb: Optional[float] = None
+    # Pin this backend to a specific GPU: overrides CUDA_VISIBLE_DEVICES at
+    # launch, so chat/embed/audio/image can run concurrently on different
+    # cards of a multi-GPU box.
+    gpu: Optional[int] = None
     model_config = {"extra": "allow"}
 
 
 ROLES = {"llm", "embedding", "tts", "asr", "image"}
-# Roles served by the ProcessManager (one process, swapped on request).
-SWAP_ROLES = {"llm"}
-# Roles served by dedicated managers. Only "embedding" is persistent
-# (boots with the proxy); "tts"/"asr"/"image" are on-demand and
-# idle-unloaded like the chat LLM, so nothing else runs without a request.
-PERSISTENT_ROLES = {"embedding", "tts", "asr", "image"}
+# Request dialects the proxy knows how to translate to/from.
+REQUEST_FORMATS = {"json", "multipart", "json_path"}
 
 
 class ModelConfig(BaseModel):
@@ -96,6 +99,20 @@ class ModelConfig(BaseModel):
 
     def health_url(self) -> str:
         return f"http://{self.host}:{self.port}{self.meta.health_path}"
+
+    def launch_env(self, base: dict[str, str]) -> dict[str, str]:
+        """Environment for the backend subprocess.
+
+        Merges the per-model ``command.env`` over ``base`` (usually
+        ``os.environ``), then applies the ``meta.gpu`` pin (if any) as a
+        ``CUDA_VISIBLE_DEVICES`` override — the one universal per-backend
+        device pin across llama-server / audiocpp_server / whisper-server /
+        sd-server.
+        """
+        env = {**base, **self.command.env}
+        if self.meta.gpu is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(self.meta.gpu)
+        return env
 
     def build_argv(
         self, config_path: str | None = None,
@@ -193,7 +210,9 @@ class Registry:
     def __init__(self, backend_dir: str | Path):
         self.backend_dir = Path(backend_dir)
         self.models: dict[str, ModelConfig] = {}
-        self._llm_sizes: dict[str, int] = {}
+        self._llm_vram: dict[str, float] = {}
+        self.warnings: list[str] = []
+        self.degraded: list[str] = []
         self.reload()
 
     @staticmethod
@@ -211,29 +230,79 @@ class Registry:
         if not self.backend_dir.is_dir():
             raise RegistryError(f"backend directory not found: {self.backend_dir}")
         models: dict[str, ModelConfig] = {}
+        warnings: list[str] = []
+        seen_names: dict[str, str] = {}
+        # (host, port) -> (name, role): the same listen address is only
+        # allowed within ONE role (chat LLMs all reuse 8101 legitimately
+        # because they are swapped by a single manager; two *different*
+        # roles on one port is always a collision).
+        seen_ports: dict[tuple[str, int], tuple[str, str]] = {}
         for path in sorted(self.backend_dir.glob("*.y*ml")):
             try:
                 raw: Any = yaml.safe_load(path.read_text()) or {}
                 cfg = ModelConfig.model_validate(raw)
             except Exception as exc:  # noqa: BLE001
                 raise RegistryError(f"invalid model config {path.name}: {exc}") from exc
+            if cfg.name in seen_names:
+                raise RegistryError(
+                    f"duplicate model name '{cfg.name}' in {path.name} "
+                    f"(already defined in {seen_names[cfg.name]})"
+                )
+            if cfg.meta.request_format not in REQUEST_FORMATS:
+                raise RegistryError(
+                    f"{path.name}: unknown request_format "
+                    f"'{cfg.meta.request_format}'; expected one of "
+                    f"{sorted(REQUEST_FORMATS)}"
+                )
+            key = (cfg.host, cfg.port)
+            if key in seen_ports and seen_ports[key][1] != cfg.role:
+                other_name, other_role = seen_ports[key]
+                raise RegistryError(
+                    f"{path.name}: listen address {cfg.host}:{cfg.port} of "
+                    f"role '{cfg.role}' collides with '{other_name}' "
+                    f"(role '{other_role}') on the same port"
+                )
+            if not Path(cfg.command.binary).exists():
+                warnings.append(
+                    f"{path.name}: binary not found: {cfg.command.binary}"
+                )
+            seen_names[cfg.name] = path.name
+            seen_ports[key] = (cfg.name, cfg.role)
             models[cfg.name] = cfg
         self.models = models
-        # Size (bytes) of each chat LLM's weights file, used by
-        # smallest_llm() as the proxy for VRAM footprint.
-        llm_sizes: dict[str, int] = {}
+        self.warnings = warnings
+        self.degraded = []
+        # VRAM ranking for the guards: declared meta.vram_gb when present,
+        # otherwise the on-disk weights-file size (MiB) as an estimate.
+        llm_vram: dict[str, float] = {}
         for name, cfg in models.items():
             if cfg.role != "llm":
+                continue
+            if cfg.meta.vram_gb is not None:
+                llm_vram[name] = cfg.meta.vram_gb * 1024.0  # GiB -> MiB
                 continue
             path = self._model_path(cfg)
             if path:
                 try:
-                    llm_sizes[name] = Path(path).stat().st_size
+                    llm_vram[name] = Path(path).stat().st_size / (1024 * 1024)
                 except OSError:
                     logger.warning(
                         "cannot stat model file for '%s': %s", name, path
                     )
-        self._llm_sizes = llm_sizes
+        self._llm_vram = llm_vram
+        llms = [c.name for c in models.values() if c.role == "llm"]
+        if llms and not llm_vram:
+            msg = (
+                "no chat LLM has a known VRAM estimate (weights missing, "
+                "unstat-able, or no meta.vram_gb); the audio/image VRAM "
+                "guards are disabled"
+            )
+            self.degraded.append(msg)
+            logger.warning(msg)
+        if warnings:
+            logger.warning(
+                "registry %d warning(s): %s", len(warnings), "; ".join(warnings)
+            )
         logger.info(
             "registry loaded %d model(s) from %s: %s",
             len(models),
@@ -242,13 +311,29 @@ class Registry:
         )
 
     def smallest_llm(self) -> Optional[str]:
-        """Name of the chat (role: llm) model with the smallest weights
-        file on disk — the cheapest VRAM footprint — or None if there are
-        no size-ranked chat models. Ties resolve to the first in sorted
-        registry order."""
-        if not self._llm_sizes:
+        """Name of the chat (role: llm) model with the smallest VRAM
+        footprint (declared ``meta.vram_gb``, falling back to weights-file
+        size), or None when no chat LLM has a known size — in which case
+        the audio/image VRAM guards are deliberately disabled and the
+        degraded state is surfaced in ``registry.degraded``."""
+        if not self._llm_vram:
             return None
-        return min(self._llm_sizes, key=lambda name: self._llm_sizes[name])
+        return min(self._llm_vram, key=lambda name: self._llm_vram[name])
+
+    def llm_vram_mb(self) -> dict[str, float]:
+        """VRAM ranking (MiB) for every size-known chat LLM."""
+        return dict(self._llm_vram)
+
+    def vram_mb(self, name: str) -> Optional[float]:
+        """VRAM estimate (MiB) for any registry model, when known."""
+        if name in self._llm_vram:
+            return self._llm_vram[name]
+        cfg = self.models.get(name)
+        if cfg is None:
+            return None
+        if cfg.meta.vram_gb is not None:
+            return cfg.meta.vram_gb * 1024.0
+        return None
 
     def get(self, name: str) -> ModelConfig:
         cfg = self.models.get(name)
@@ -299,4 +384,6 @@ class Registry:
             "context_length": meta.context_length,
             "family": meta.family,
             "capabilities": meta.capabilities,
+            "vram_gb": meta.vram_gb,
+            "gpu": meta.gpu,
         }

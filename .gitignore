@@ -1,6 +1,15 @@
 __pycache__/
-linkedin-post.md
-script_scarlette.wav
-qwen3-tts-sample.wav
 *.pyc
+.pytest_cache/
+
+# machine-specific config and secrets — never commit
+.env
+
+# generated test artifacts / images
+test_output/
+
+# draft / local notes
+linkedin-post.md
 README_local.md
+qwen3-tts-sample.wav
+script_scarlette.wav

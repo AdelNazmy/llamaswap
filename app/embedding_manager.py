@@ -16,6 +16,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .events import bus
+from .metrics import metrics
 from .registry import ModelConfig
 
 logger = logging.getLogger("llamaswap.embedding_manager")
@@ -67,7 +69,7 @@ class EmbeddingManager:
         }
 
     def _health_url(self) -> str:
-        return f"http://{self.config.host}:{self.config.port}/health"
+        return self.config.health_url()
 
     def _stderr_line(self, chunk: bytes) -> None:
         for line in chunk.decode(errors="replace").splitlines():
@@ -100,6 +102,7 @@ class EmbeddingManager:
     async def _stop_locked(self) -> None:
         """Stop the subprocess; caller must hold self._lock."""
         proc = self._process
+        was_ready = self._state is EmbedState.READY
         self._process = None
         if self._stderr_task is not None:
             self._stderr_task.cancel()
@@ -123,6 +126,9 @@ class EmbeddingManager:
                 pass
             await proc.wait()
         logger.info("embedding server '%s' stopped", self.name)
+        if was_ready:
+            metrics.inc_unload("embedding", self.name)
+            bus.emit("model_unloaded", role="embedding", model=self.name)
 
     async def start(self) -> None:
         """Launch the embedding server and wait until it is healthy."""
@@ -137,7 +143,8 @@ class EmbeddingManager:
             logger.info(
                 "launching embedding server '%s': %s", self.name, " ".join(argv)
             )
-            env = {**os.environ, **self.config.command.env}
+            env = self.config.launch_env(os.environ)
+            start = asyncio.get_running_loop().time()
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *argv,
@@ -148,6 +155,9 @@ class EmbeddingManager:
             except OSError as exc:
                 self._state = EmbedState.FAILED
                 self._detail = f"failed to spawn llama-server: {exc}"
+                metrics.inc_load_failure("embedding", self.name)
+                bus.emit("load_failed", role="embedding", model=self.name,
+                            error=str(exc))
                 raise EmbeddingLoadError(self._detail) from exc
             self._process = proc
             self._state = EmbedState.LOADING
@@ -163,10 +173,18 @@ class EmbeddingManager:
                 await self._stop_locked()
                 if self._state is not EmbedState.FAILED:
                     self._state = EmbedState.FAILED
+                metrics.inc_load_failure("embedding", self.name)
+                bus.emit("load_failed", role="embedding", model=self.name,
+                            error="did not become healthy")
                 raise
             self._state = EmbedState.READY
             self._detail = ""
             self._stopped_for_resources = False
+            metrics.observe_load(
+                "embedding", self.name,
+                asyncio.get_running_loop().time() - start,
+            )
+            bus.emit("model_loaded", role="embedding", model=self.name)
             logger.info(
                 "embedding server '%s' ready on port %d", self.name, self.config.port
             )

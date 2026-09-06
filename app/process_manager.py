@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .events import bus
+from .metrics import metrics
 from .registry import ModelConfig, UnknownModelError
 
 logger = logging.getLogger("llamaswap.process_manager")
@@ -52,6 +54,8 @@ class ProcessManager:
         self._current: Optional[RunningModel] = None
         self._last_activity: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
+        # Timestamp until which idle unload is suppressed (X-Pin-Seconds).
+        self._pinned_until: float = 0.0
         if idle_unload_seconds > 0:
             self._idle_task = asyncio.get_running_loop().create_task(
                 self._idle_watcher()
@@ -76,7 +80,7 @@ class ProcessManager:
         return info
 
     def _health_url(self, cfg: ModelConfig) -> str:
-        return f"http://{cfg.host}:{cfg.port}/health"
+        return cfg.health_url()
 
     def _stderr_line(self, entry: "RunningModel", chunk: bytes) -> None:
         for line in chunk.decode(errors="replace").splitlines():
@@ -110,7 +114,10 @@ class ProcessManager:
     async def _stop_current(self) -> None:
         cur = self._current
         self._current = None
-        if cur is None or cur.process.returncode is not None:
+        if cur is None:
+            return
+        was_ready = cur.state is ModelState.READY
+        if cur.process.returncode is not None:
             return
         proc = cur.process
         logger.info("stopping llama-server for '%s' (pid %s)", cur.name, proc.pid)
@@ -128,6 +135,9 @@ class ProcessManager:
                 pass
             await proc.wait()
         logger.info("llama-server for '%s' stopped", cur.name)
+        if was_ready:
+            metrics.inc_unload("llm", cur.name)
+            bus.emit("model_unloaded", role="llm", model=cur.name)
 
     async def ensure_model(self, name: str,
                            registry: "Registry") -> tuple[str, int]:
@@ -138,9 +148,13 @@ class ProcessManager:
             cur = self._current
             if cur is not None and cur.name == name and cur.state is ModelState.READY:
                 return name, cfg.port
+            prev = cur.name if cur is not None and cur.state is ModelState.READY else None
             if cur is not None:
                 await self._stop_current()
             await self._launch(cfg)
+            if prev is not None and prev != name:
+                metrics.inc_swap("llm", prev, name)
+                bus.emit("swap", role="llm", from_model=prev, to_model=name)
             return name, cfg.port
 
     async def unload(self) -> bool:
@@ -155,12 +169,18 @@ class ProcessManager:
             await self._stop_current()
             return had
 
+    def pin(self, seconds: float) -> None:
+        """Suppress idle unload for the next ``seconds`` (X-Pin-Seconds)."""
+        if seconds > 0:
+            self._pinned_until = asyncio.get_running_loop().time() + seconds
+
     async def _launch(self, cfg: ModelConfig) -> None:
         argv = cfg.build_argv()
         logger.info(
             "launching llama-server for '%s': %s", cfg.name, " ".join(argv)
         )
-        env = {**os.environ, **cfg.command.env}
+        env = cfg.launch_env(os.environ)
+        start = asyncio.get_running_loop().time()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -169,6 +189,8 @@ class ProcessManager:
                 stderr=asyncio.subprocess.PIPE,
             )
         except OSError as exc:
+            metrics.inc_load_failure("llm", cfg.name)
+            bus.emit("load_failed", role="llm", model=cfg.name, error=str(exc))
             raise ModelLoadError(f"failed to spawn llama-server: {exc}") from exc
         entry = RunningModel(name=cfg.name, config=cfg, process=proc,
                              state=ModelState.LOADING)
@@ -180,9 +202,20 @@ class ProcessManager:
             await self._wait_healthy(cfg, proc)
         except BaseException:
             await self._stop_current()
+            metrics.inc_load_failure("llm", cfg.name)
+            bus.emit(
+                "load_failed", role="llm", model=cfg.name,
+                error="did not become healthy",
+            )
             raise
         entry.state = ModelState.READY
         entry.detail = ""
+        elapsed = asyncio.get_running_loop().time() - start
+        metrics.observe_load("llm", cfg.name, elapsed)
+        bus.emit(
+            "model_loaded", role="llm", model=cfg.name,
+            seconds=round(elapsed, 2),
+        )
         logger.info("model '%s' ready on port %d", cfg.name, cfg.port)
 
     async def _tail_stderr(self, entry: RunningModel) -> None:
@@ -209,7 +242,10 @@ class ProcessManager:
                 await asyncio.sleep(self._health_interval)
                 if self._current is None:
                     continue
-                elapsed = asyncio.get_running_loop().time() - self._last_activity
+                now = asyncio.get_running_loop().time()
+                if now < self._pinned_until:
+                    continue
+                elapsed = now - self._last_activity
                 if elapsed < self._idle_unload_seconds:
                     continue
                 async with self._lock:

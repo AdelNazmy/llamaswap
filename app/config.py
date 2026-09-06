@@ -1,6 +1,7 @@
 """Application settings, overridable via env vars prefixed LLAMASWAP_."""
 
 from functools import lru_cache
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -55,6 +56,31 @@ class Settings(BaseSettings):
     # writable by llamaswap AND readable by the backend process.
     audio_tmp_dir: str = "/tmp/llamaswap-audio"
     log_level: str = "INFO"
+
+    # Per-role idle-unload overrides. None inherits idle_unload_seconds;
+    # 0 disables idle unload for that role (chat always uses
+    # idle_unload_seconds). Useful because a diffusion server or TTS server
+    # wants a much shorter residency than a chat LLM.
+    idle_unload_audio_seconds: Optional[float] = None
+    idle_unload_image_seconds: Optional[float] = None
+
+    # Optional authentication. When api_key is set, every /v1/* request (and
+    # the admin dashboard at /) must present it as
+    # ``Authorization: Bearer <key>`` or ``X-Api-Key: <key>``. /health and
+    # /metrics stay open for health-checking and scraping.
+    api_key: str = ""
+    # Admin key gating the destructive/admin endpoints (/v1/reset,
+    # /v1/registry/reload, /v1/models/{model}/load|unload). When unset it
+    # falls back to api_key; if both are unset those endpoints are open.
+    admin_key: str = ""
+
+    # Global request backpressure: maximum concurrently in-flight requests
+    # before the proxy answers 429 + Retry-After. 0 disables the limit.
+    max_concurrency: int = 0
+
+    # Emit structured JSON logs (one JSON object per line) instead of the
+    # default human-readable format.
+    log_json: bool = False
 
 
 @lru_cache

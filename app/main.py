@@ -36,6 +36,7 @@ server too (Settings.unload_image_on_audio).
 """
 
 import asyncio
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -46,6 +47,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from .events import bus
+from .metrics import metrics
 from .server_manager import RoleServerLoadError, RoleServerManager
 from .config import Settings, get_settings
 from .embedding_manager import EmbeddingLoadError, EmbeddingManager
@@ -62,6 +65,7 @@ from .proxy import (
     multipart_inject_field,
     proxy_json,
     proxy_raw,
+    proxy_raw_stream,
     proxy_stream,
     remove_audio_upload,
     save_audio_upload,
@@ -71,6 +75,21 @@ from .registry import ModelConfig, Registry, RegistryError, UnknownModelError
 
 ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("llamaswap")
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per log line (LLAMASWAP_LOG_JSON=true)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
 
 
 def _error(status: int, message: str, etype: str = "invalid_request_error"):
@@ -84,13 +103,61 @@ def _fwd_headers(request: Request) -> dict[str, str]:
     }
 
 
+def _apply_pin(request: Request, *managers) -> None:
+    """Honour ``X-Pin-Seconds`` by suppressing idle unload on the given
+    managers for the requested number of seconds."""
+    raw = request.headers.get("x-pin-seconds")
+    if not raw:
+        return
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return
+    for mgr in managers:
+        mgr.pin(seconds)
+
+
+def _runtime_state(request: Request, entry: dict) -> dict:
+    """Attach ``state``/``loaded`` to a ``/v1/models`` entry from live
+    manager status."""
+    name = entry["id"]
+    role = entry["role"]
+    state = "stopped"
+    if role == "llm":
+        st = request.app.state.manager.status()
+        if st.get("model") == name:
+            state = st.get("state", "stopped")
+    elif role == "embedding":
+        emb: Optional[EmbeddingManager] = request.app.state.embedding_manager
+        if emb is not None and emb.name == name:
+            state = emb.status().get("state", "stopped")
+    elif role in ("tts", "asr"):
+        st = request.app.state.audio_managers[role].status()
+        if st.get("model") == name:
+            state = st.get("state", "stopped")
+    elif role == "image":
+        st = request.app.state.image_manager.status()
+        if st.get("model") == name:
+            state = st.get("state", "stopped")
+    entry["state"] = state
+    entry["loaded"] = state == "ready"
+    return entry
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=settings.log_level.upper())
+    if settings.log_json:
+        formatter: logging.Formatter = _JsonFormatter()
+        for handler in logging.root.handlers:
+            handler.setFormatter(formatter)
+    else:
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
+        for handler in logging.root.handlers:
+            handler.setFormatter(formatter)
     backend_dir = Path(settings.backend_dir)
     if not backend_dir.is_absolute():
         backend_dir = ROOT / backend_dir
@@ -105,6 +172,11 @@ async def lifespan(app: FastAPI):
     # Audio (tts/asr) managers: one per role, on-demand like the chat
     # LLM — nothing boots here, the first request launches a server
     # (see _route_audio and RoleServerManager.ensure_model).
+    audio_idle = (
+        settings.idle_unload_audio_seconds
+        if settings.idle_unload_audio_seconds is not None
+        else settings.idle_unload_seconds
+    )
     app.state.audio_managers: dict[str, RoleServerManager] = {}
     for role in ("tts", "asr"):
         manager = RoleServerManager(
@@ -112,7 +184,7 @@ async def lifespan(app: FastAPI):
             startup_timeout=settings.startup_timeout,
             stop_timeout=settings.stop_timeout,
             health_interval=settings.health_interval,
-            idle_unload_seconds=settings.idle_unload_seconds,
+            idle_unload_seconds=audio_idle,
             config_dir=settings.audio_tmp_dir,
         )
         manager.configure(app.state.registry.role_configs(role))
@@ -122,12 +194,17 @@ async def lifespan(app: FastAPI):
     # model configs of role "image"), routed through the OpenAI image
     # endpoints. Nothing boots here; the first /v1/images/* request
     # launches it (see _route_image).
+    image_idle = (
+        settings.idle_unload_image_seconds
+        if settings.idle_unload_image_seconds is not None
+        else settings.idle_unload_seconds
+    )
     app.state.image_manager = RoleServerManager(
         "image",
         startup_timeout=settings.startup_timeout,
         stop_timeout=settings.stop_timeout,
         health_interval=settings.health_interval,
-        idle_unload_seconds=settings.idle_unload_seconds,
+        idle_unload_seconds=image_idle,
         config_dir=settings.audio_tmp_dir,
     )
     app.state.image_manager.configure(app.state.registry.role_configs("image"))
@@ -169,12 +246,19 @@ app = FastAPI(title="llamaswap", version="0.1.0", lifespan=lifespan)
 
 
 def _health_snapshot(request: Request) -> dict:
-    """Full proxy status: chat LLM, embedding, TTS/ASR, and image managers."""
+    """Full proxy status: chat LLM, embedding, TTS/ASR, and image managers,
+    plus registry-level warnings and degraded conditions."""
     embedding_manager: Optional[EmbeddingManager] = (
         request.app.state.embedding_manager
     )
+    registry: Registry = request.app.state.registry
+    degraded = any(
+        mgr.status().get("state") == "failed"
+        for mgr in list(request.app.state.audio_managers.values())
+        + [request.app.state.image_manager, request.app.state.manager]
+    ) or bool(registry.degraded)
     return {
-        "status": "ok",
+        "status": "degraded" if degraded else "ok",
         "current_model": request.app.state.manager.status(),
         "embedding": (
             embedding_manager.status()
@@ -186,6 +270,10 @@ def _health_snapshot(request: Request) -> dict:
             for role, manager in request.app.state.audio_managers.items()
         },
         "image": request.app.state.image_manager.status(),
+        "registry": {
+            "degraded": registry.degraded,
+            "warnings": registry.warnings,
+        },
     }
 
 
@@ -197,7 +285,11 @@ async def health(request: Request):
 @app.get("/v1/models")
 async def list_models(request: Request):
     registry: Registry = request.app.state.registry
-    return {"object": "list", "data": registry.list_openai()}
+    data = [
+        _runtime_state(request, entry)
+        for entry in registry.list_openai()
+    ]
+    return {"object": "list", "data": data}
 
 
 @app.get("/v1/models/{model}")
@@ -208,7 +300,7 @@ async def get_model(model: str, request: Request):
     except UnknownModelError:
         status, body = _error(404, f"model '{model}' not found")
         return JSONResponse(status_code=status, content=body)
-    return data
+    return _runtime_state(request, data)
 
 
 @app.post("/v1/registry/reload")
@@ -224,7 +316,31 @@ async def reload_registry(request: Request):
     for role, manager in request.app.state.audio_managers.items():
         manager.configure(registry.role_configs(role))
     request.app.state.image_manager.configure(registry.role_configs("image"))
-    return {"reloaded": True, "models": request.app.state.registry.names()}
+    return {
+        "reloaded": True,
+        "models": request.app.state.registry.names(),
+        "warnings": registry.warnings,
+        "degraded": registry.degraded,
+    }
+
+
+@app.get("/v1/registry/info")
+async def registry_info(request: Request):
+    """Registry summary: models by role, load warnings, degraded conditions,
+    and the VRAM ranking used by the guards."""
+    registry: Registry = request.app.state.registry
+    return {
+        "models": registry.names(),
+        "roles": {
+            role: [c.name for c in registry.role_configs(role)]
+            for role in ("llm", "embedding", "tts", "asr", "image")
+            if registry.role_configs(role)
+        },
+        "smallest_llm": registry.smallest_llm(),
+        "llm_vram_mb": registry.llm_vram_mb(),
+        "warnings": registry.warnings,
+        "degraded": registry.degraded,
+    }
 
 
 @app.post("/v1/reset")
@@ -348,6 +464,7 @@ async def _ensure_and_route(
         asyncio.get_running_loop().create_task(
             embedding_manager.ensure_running()
         )
+    _apply_pin(request, manager)
     headers = _fwd_headers(request)
     if extract_stream_flag(body):
         gen = proxy_stream(
@@ -545,6 +662,7 @@ async def _route_audio(
         )
         return JSONResponse(status_code=status, content=payload)
 
+    _apply_pin(request, manager)
     headers = _fwd_headers(request)
 
     # Backends whose transcription API expects a server-side file path
@@ -613,7 +731,19 @@ async def _route_audio(
         out_body = _apply_clone_reference(cfg, out_body)
 
     try:
-        if backend_path in ("/v1/audio/speech", "/v1/audio/speech/stream"):
+        if backend_path == "/v1/audio/speech/stream":
+            # Live chunked audio: stream bytes through without buffering.
+            # ``response_format`` transcoding is a buffered operation, so a
+            # non-wav format is ignored on the streaming path and the
+            # backend's native codec is relayed as-is.
+            out_body = json_remove_key(out_body, "response_format")
+            gen = proxy_raw_stream(
+                cfg.port, cfg.host, backend_path, out_body, headers
+            )
+            return StreamingResponse(
+                gen, media_type="application/octet-stream"
+            )
+        if backend_path == "/v1/audio/speech":
             # ``response_format`` is an OpenAI-only construct: audio.cpp emits
             # WAV and does not understand it, so honour it locally via ffmpeg
             # instead of forwarding it upstream.
@@ -684,17 +814,26 @@ async def audio_translations(request: Request):
 
 @app.get("/v1/audio/voices")
 async def audio_voices(request: Request):
-    """List voices from the TTS backend, if it exposes such an endpoint."""
+    """List voices from the TTS backend, booting the first configured TTS
+    model on demand so the endpoint is immediately useful."""
     manager: RoleServerManager = request.app.state.audio_managers["tts"]
-    if not manager.is_running:
-        status, payload = _error(
-            503, "tts server is not running", "server_error"
-        )
-        return JSONResponse(status_code=status, content=payload)
     cfg = manager.current_config
-    if cfg is None:
-        status, payload = _error(503, "tts server is not ready", "server_error")
-        return JSONResponse(status_code=status, content=payload)
+    if not manager.is_running or cfg is None:
+        configs = request.app.state.registry.role_configs("tts")
+        if not configs:
+            status, payload = _error(
+                404, "no tts model configured", "server_error"
+            )
+            return JSONResponse(status_code=status, content=payload)
+        try:
+            cfg = await manager.ensure_model(
+                configs[0].name, request.app.state.registry
+            )
+        except (RoleServerLoadError, UnknownModelError) as exc:
+            status, payload = _error(
+                503, f"failed to load tts server: {exc}", "server_error"
+            )
+            return JSONResponse(status_code=status, content=payload)
     headers = _fwd_headers(request)
     try:
         async with httpx.AsyncClient(
@@ -779,6 +918,7 @@ async def _route_image(request: Request, path: str):
         )
         return JSONResponse(status_code=status, content=payload)
 
+    _apply_pin(request, manager)
     headers = _fwd_headers(request)
     # The backend's schema doesn't carry the OpenAI `model` selector
     # (llamaswap uses it only to pick the backend), so drop it first.
@@ -803,6 +943,220 @@ async def images_edits(request: Request):
     return await _route_image(request, "/v1/images/edits")
 
 
+# ---------------------------------------------------------------------------
+# Ops surface: metrics, events, model preload/unload, admin dashboard
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+async def get_metrics(request: Request):
+    """Prometheus text exposition (unauthenticated, scrape-friendly)."""
+    registry: Registry = request.app.state.registry
+    metrics.set_gauge("llamaswap_registered_models", float(len(registry.models)))
+    degraded = bool(registry.degraded) or any(
+        m.status().get("state") == "failed"
+        for m in list(request.app.state.audio_managers.values())
+        + [request.app.state.image_manager, request.app.state.manager]
+    )
+    metrics.set_gauge("llamaswap_status", 1.0 if degraded else 0.0)
+    return Response(
+        metrics.render(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@app.get("/v1/events")
+async def events_stream(request: Request):
+    """Server-sent events: model_loaded / model_unloaded / swap / load_failed."""
+    async def gen():
+        q = bus.subscribe()
+        try:
+            yield "retry: 2000\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+        finally:
+            bus.unsubscribe(q)
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/v1/models/{model}/load")
+async def load_model(model: str, request: Request):
+    """Preload/warm a model in the background (admin)."""
+    registry: Registry = request.app.state.registry
+    try:
+        cfg = registry.get(model)
+    except UnknownModelError as exc:
+        status, body = _error(
+            404, f"model not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=body)
+    try:
+        if cfg.role == "llm":
+            await request.app.state.manager.ensure_model(model, registry)
+        elif cfg.role == "embedding":
+            emb: Optional[EmbeddingManager] = request.app.state.embedding_manager
+            if emb is None or emb.name != model:
+                status, body = _error(
+                    400, f"model '{model}' is not the configured embedding server"
+                )
+                return JSONResponse(status_code=status, content=body)
+            if not await emb.ensure_running():
+                status, body = _error(
+                    503, f"embedding server '{model}' failed to start",
+                    "server_error",
+                )
+                return JSONResponse(status_code=status, content=body)
+        elif cfg.role in ("tts", "asr"):
+            await request.app.state.audio_managers[cfg.role].ensure_model(
+                model, registry
+            )
+        elif cfg.role == "image":
+            await request.app.state.image_manager.ensure_model(model, registry)
+    except (ModelLoadError, RoleServerLoadError) as exc:
+        status, body = _error(
+            503, f"failed to load model '{model}': {exc}", "server_error"
+        )
+        return JSONResponse(status_code=status, content=body)
+    return _health_snapshot(request)
+
+
+@app.post("/v1/models/{model}/unload")
+async def unload_model(model: str, request: Request):
+    """Unload the model currently resident for this model's role (admin)."""
+    registry: Registry = request.app.state.registry
+    try:
+        cfg = registry.get(model)
+    except UnknownModelError as exc:
+        status, body = _error(
+            404, f"model not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=body)
+    if cfg.role == "llm":
+        await request.app.state.manager.unload()
+    elif cfg.role == "embedding":
+        emb: Optional[EmbeddingManager] = request.app.state.embedding_manager
+        if emb is not None and emb.name == model:
+            await emb.stop()
+        else:
+            status, body = _error(
+                400, f"model '{model}' is not the configured embedding server"
+            )
+            return JSONResponse(status_code=status, content=body)
+    elif cfg.role in ("tts", "asr"):
+        await request.app.state.audio_managers[cfg.role].unload()
+    elif cfg.role == "image":
+        await request.app.state.image_manager.unload()
+    return _health_snapshot(request)
+
+
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llamaswap</title>
+<style>
+:root { color-scheme: dark; }
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+       background: #101418; color: #e6edf3; margin: 0; padding: 24px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: #8b949e; font-size: 13px; margin-bottom: 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px 16px; }
+.card h2 { font-size: 14px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .06em; color: #8b949e; }
+.row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+.badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.ready { background: #11351f; color: #3fb950; }
+.loading { background: #2e2a0f; color: #d29922; }
+.stopped { background: #21262d; color: #8b949e; }
+.failed { background: #4d1d24; color: #f85149; }
+input { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+        border-radius: 6px; padding: 6px 8px; font-size: 13px; margin-bottom: 12px; width: 260px; }
+button { background: #238636; border: 0; color: #fff; border-radius: 6px; padding: 6px 10px;
+         font-size: 12px; cursor: pointer; margin-right: 6px; }
+button.off { background: #21262d; color: #c9d1d9; }
+a { color: #79c0ff; }
+#log { font: 12px/1.5 ui-monospace, monospace; color: #8b949e; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>llamaswap</h1>
+<div class="sub">OpenAI-compatible model proxy · <a href="/health">/health</a> · <a href="/metrics">/metrics</a> · <a href="/docs">/docs</a> · <a href="/v1/events">/v1/events</a></div>
+<input id="key" type="password" placeholder="admin/api key (if enabled)" />
+<div class="grid" id="grid"></div>
+<pre id="log"></pre>
+<script>
+const $ = (id) => document.getElementById(id);
+function badge(state) { return '<span class="badge ' + (state||'stopped') + '">' + (state||'stopped') + '</span>'; }
+async function refresh() {
+  const key = $('key').value;
+  const hdr = key ? { 'X-Api-Key': key, 'X-Admin-Key': key } : {};
+  let health;
+  try { health = await (await fetch('/health')).json(); } catch (e) { $('grid').innerHTML = 'unreachable'; return; }
+  const snap = {
+    'chat LLM': health.current_model,
+    'embedding': health.embedding,
+    'TTS': health.audio && health.audio.tts,
+    'ASR': health.audio && health.audio.asr,
+    'image': health.image,
+  };
+  let html = '';
+  for (const [label, st] of Object.entries(snap)) {
+    if (!st) continue;
+    const state = st.state || 'stopped';
+    html += '<div class="card"><h2>' + label + '</h2>' +
+      '<div class="row"><span>state</span>' + badge(state) + '</div>' +
+      '<div class="row"><span>model</span><span>' + (st.model || '—') + '</span></div>' +
+      (st.port ? '<div class="row"><span>port</span><span>' + st.port + '</span></div>' : '') +
+      (st.idle_seconds != null ? '<div class="row"><span>idle</span><span>' + st.idle_seconds + 's</span></div>' : '') +
+      (st.detail ? '<div class="row"><span>detail</span><span>' + st.detail + '</span></div>' : '') +
+      '</div>';
+  }
+  $('grid').innerHTML = html;
+  try {
+    const models = await (await fetch('/v1/models', { headers: hdr })).json();
+    let rows = '<div class="card"><h2>models</h2>';
+    for (const m of (models.data || [])) {
+      rows += '<div class="row"><span>' + m.id + ' <i style="color:#6e7681">(' + m.role + ')</i></span>' +
+        '<span>' + badge(m.state) + ' ' +
+        '<button onclick="act(\'' + m.id + '\', \'load\')">load</button>' +
+        '<button class="off" onclick="act(\'' + m.id + '\', \'unload\')">unload</button></span></div>';
+    }
+    rows += '</div>';
+    $('grid').insertAdjacentHTML('beforeend', rows);
+  } catch (e) { $('log').textContent = 'set the API/admin key above to manage models.'; }
+}
+async function act(model, op) {
+  const key = $('key').value;
+  const hdr = key ? { 'X-Api-Key': key, 'X-Admin-Key': key } : {};
+  try {
+    await fetch('/v1/models/' + model + '/' + op, { method: 'POST', headers: hdr });
+  } catch (e) {}
+  refresh();
+}
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/")
+async def dashboard(request: Request):
+    """Tiny admin dashboard (HTML)."""
+    return Response(_DASHBOARD_HTML, media_type="text/html")
+
+
 @app.exception_handler(UnknownModelError)
 async def unknown_model_handler(request: Request, exc: UnknownModelError):
     status, payload = _error(
@@ -821,3 +1175,121 @@ async def model_load_handler(request: Request, exc: ModelLoadError):
 async def role_server_load_handler(request: Request, exc: RoleServerLoadError):
     status, payload = _error(503, str(exc), "server_error")
     return JSONResponse(status_code=status, content=payload)
+
+
+# ---------------------------------------------------------------------------
+# Gateway middleware (auth + backpressure + request metrics)
+# ---------------------------------------------------------------------------
+
+class _GatewayMiddleware:
+    """Pure-ASGI wrapper (not Starlette BaseHTTPMiddleware, so SSE and
+    streaming responses pass through untouched) that enforces optional API/
+    admin key auth, caps concurrent in-flight requests, and counts requests
+    for /metrics.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._inflight = 0
+
+    @staticmethod
+    def _headers(scope: dict) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, v in scope.get("headers") or []:
+            out.setdefault(k.decode("latin-1").lower(), v.decode("latin-1"))
+        return out
+
+    @staticmethod
+    def _is_admin(path: str) -> bool:
+        return (
+            path in ("/v1/reset", "/v1/registry/reload")
+            or (path.startswith("/v1/models/")
+                and (path.endswith("/load") or path.endswith("/unload")))
+        )
+
+    @staticmethod
+    def _provided_key(headers: dict[str, str]) -> str:
+        auth = headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return (
+            headers.get("x-api-key")
+            or headers.get("x-admin-key")
+            or ""
+        ).strip()
+
+    def _authorized(self, settings, path: str, headers: dict[str, str]) -> bool:
+        if self._is_admin(path):
+            required = settings.admin_key or settings.api_key
+        else:
+            required = settings.api_key
+        if not required:
+            return True
+        provided = self._provided_key(headers)
+        return bool(provided) and hmac.compare_digest(provided, required)
+
+    async def _json(self, send, status: int, payload: dict) -> None:
+        body = json.dumps(payload, default=str).encode()
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        settings = get_settings()
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+        headers = self._headers(scope)
+        status_holder = {"status": 200}
+
+        # Auth (health + metrics stay open for scrapers/probes).
+        if path not in ("/health", "/metrics") \
+                and not self._authorized(settings, path, headers):
+            status_holder["status"] = 401
+            _, body = _error(
+                401, "unauthorized: missing or invalid API key",
+                "authentication_error",
+            )
+            await self._json(send, 401, body)
+            metrics.inc_request(method, path, 401)
+            return
+
+        # Backpressure: reject fast when over the concurrency cap.
+        limited = False
+        if settings.max_concurrency > 0:
+            if self._inflight >= settings.max_concurrency:
+                limited = True
+            else:
+                self._inflight += 1
+        if limited:
+            status_holder["status"] = 429
+            _, body = _error(
+                429,
+                "too many concurrent requests; retry shortly",
+                "rate_limit_error",
+            )
+            await self._json(send, 429, body)
+            metrics.inc_request(method, path, 429)
+            return
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                status_holder["status"] = message.get("status", 200)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            if settings.max_concurrency > 0 and not limited:
+                self._inflight -= 1
+            metrics.inc_request(method, path, status_holder["status"])
+
+
+# Wrap the ASGI app with the gateway middleware. (Everything above was
+# registered on the inner FastAPI app; this wrapper sits in front of it.)
+app = _GatewayMiddleware(app)

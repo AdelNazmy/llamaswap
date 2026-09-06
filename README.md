@@ -343,7 +343,16 @@ meta:
   context_length: 8192
   family: qwen
   capabilities: [chat]
+  vram_gb: 13.0      # optional: declared VRAM footprint (scheduler uses this)
+  gpu: 0             # optional: pin CUDA_VISIBLE_DEVICES to this card
 ```
+
+`meta.vram_gb` (optional) declares the model's VRAM footprint in GiB and is
+used by the audio/image VRAM guards instead of the on-disk weights-file
+size — set it wherever the weights live on a remote/streamed mount or the
+file-size estimate is misleading. `meta.gpu` (optional) pins the backend to
+a specific GPU (`CUDA_VISIBLE_DEVICES`) so chat/embed/audio/image can run
+concurrently on different cards of a multi-GPU box.
 
 `role` can be:
 
@@ -806,9 +815,12 @@ Or with an explicit python:
 
 Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_BACKEND_DIR`, `LLAMASWAP_STARTUP_TIMEOUT`,
-`LLAMASWAP_STOP_TIMEOUT`, `LLAMASWAP_LOG_LEVEL`,
-`LLAMASWAP_IDLE_UNLOAD_SECONDS`, `LLAMASWAP_AUDIO_VRAM_GUARD`,
-`LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`, `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`.
+`LLAMASWAP_STOP_TIMEOUT`, `LLAMASWAP_LOG_LEVEL`, `LLAMASWAP_LOG_JSON`,
+`LLAMASWAP_IDLE_UNLOAD_SECONDS`,
+`LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS`, `LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS`,
+`LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`,
+`LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`, `LLAMASWAP_API_KEY`,
+`LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`.
 
 ## Voice cloning with Qwen3-TTS
 
@@ -910,19 +922,25 @@ the reference, and `-o`/`--out` sets the output. Run
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/models` | List models from the registry (OpenAI shape) |
-| `GET /v1/models/{model}` | One model entry |
-| `POST /v1/chat/completions` | Chat; `stream: true` for SSE |
+| `GET /` | Admin dashboard (live model states, one-click load/unload) |
+| `GET /v1/models` | List models from the registry (OpenAI shape) with live `state`/`loaded` |
+| `GET /v1/models/{model}` | One model entry (with live `state`/`loaded`) |
+| `POST /v1/models/{model}/load` | Preload/warm a model (admin) |
+| `POST /v1/models/{model}/unload` | Unload the model resident for this model's role (admin) |
+| `POST /v1/chat/completions` | Chat; `stream: true` for SSE. `X-Pin-Seconds` suppresses idle unload |
 | `POST /v1/completions` | Text completions |
 | `POST /v1/embeddings` | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path |
 | `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out. `response_format` (mp3/opus/aac/flac/pcm/wav) is transcoded from WAV internally via ffmpeg |
-| `POST /v1/audio/speech/stream` | TTS streaming variant (if the backend exposes one) |
+| `POST /v1/audio/speech/stream` | Streaming TTS: chunked audio passthrough (backend codec) |
 | `POST /v1/audio/transcriptions` | ASR (`role: asr`); OpenAI multipart upload → `{"text": ...}`. `response_format` = `json`/`text`/`srt`/`vtt`/`verbose_json` is honoured by the proxy regardless of backend |
 | `POST /v1/audio/translations` | ASR translate-to-English (whisper.cpp supports via a `translate` form field; others pass through). Same `response_format` normalisation as transcriptions |
-| `GET /v1/audio/voices` | List TTS voices (pass-through to the tts backend) |
+| `GET /v1/audio/voices` | List TTS voices (boots the first configured TTS model if not running) |
 | `POST /v1/registry/reload` | Re-read `backend/*.yaml` (admin) |
+| `GET /v1/registry/info` | Registry summary: roles, VRAM ranking, warnings, degraded conditions |
 | `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
-| `GET /health` | Proxy, current chat llama-server, embedding, and TTS/ASR status (audio/chat report `idle_seconds` while loaded) |
+| `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image status, plus registry warnings/degraded |
+| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests) |
+| `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
 
 ### Examples
 
@@ -1051,6 +1069,40 @@ img = client.images.generate(
 )
 open("cat.png", "wb").write(base64.b64decode(img.data[0].b64_json))
 ```
+
+## Authentication, metrics & operations
+
+**Auth (optional).** Set `LLAMASWAP_API_KEY` to require
+`Authorization: Bearer <key>` (or `X-Api-Key`) on every `/v1/*` request and
+the `/` dashboard; set `LLAMASWAP_ADMIN_KEY` to gate the admin endpoints
+(`/v1/reset`, `/v1/registry/reload`, `/v1/models/{model}/load|unload`) behind
+a separate key (falls back to `api_key`). `/health` and `/metrics` stay open
+for probes and Prometheus scraping — firewall them if exposed beyond
+localhost.
+
+**Observability.** `GET /metrics` exposes Prometheus text counters
+(model loads/unloads/swaps, load durations, load failures, HTTP requests by
+route/status). `GET /v1/events` streams `model_loaded` / `model_unloaded` /
+`swap` / `load_failed` as server-sent events. `LLAMASWAP_LOG_JSON=true` emits
+one JSON object per log line for log shippers.
+
+**Preload / unload.** `POST /v1/models/{model}/load` warms a model ahead of
+time (so the first real request is instant); `POST /v1/models/{model}/unload`
+frees its role. Any chat/audio/image request can also carry the
+`X-Pin-Seconds: <n>` header to keep the just-loaded model resident for `n`
+seconds, overriding the idle-unload timer.
+
+**Registry validation.** On load (and `/v1/registry/reload`), the registry
+rejects duplicate model names, cross-role listen-port collisions (two
+*different* roles on one port), and unknown `request_format` values; it
+emits warnings for missing binaries and a `degraded` notice when no chat
+LLM has a known VRAM estimate (weights missing / no `meta.vram_gb`), which
+is surfaced in `/health`, `/v1/registry/info`, and `GET /metrics`
+(`llamaswap_status`).
+
+**Backpressure.** Set `LLAMASWAP_MAX_CONCURRENCY` to cap in-flight requests;
+when exceeded the proxy answers `429` with a `Retry-After` rather than
+piling up on a slow model load.
 
 ## Notes
 

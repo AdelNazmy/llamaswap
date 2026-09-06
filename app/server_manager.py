@@ -30,6 +30,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .events import bus
+from .metrics import metrics
 from .registry import ModelConfig, UnknownModelError
 
 logger = logging.getLogger("llamaswap.server_manager")
@@ -72,6 +74,8 @@ class RoleServerManager:
         self._configs: dict[str, ModelConfig] = {}
         self._last_activity: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
+        # Timestamp until which idle unload is suppressed (X-Pin-Seconds).
+        self._pinned_until: float = 0.0
         if idle_unload_seconds > 0:
             self._idle_task = asyncio.get_running_loop().create_task(
                 self._idle_watcher()
@@ -169,7 +173,11 @@ class RoleServerManager:
         self._current = None
         # Tear down the rendered config file (if any) after the process ends.
         config_file = cur.config_file if cur else None
-        if cur is None or cur.process.returncode is not None:
+        if cur is None:
+            _cleanup_config(config_file)
+            return
+        was_ready = cur.state is ServerState.READY
+        if cur.process.returncode is not None:
             _cleanup_config(config_file)
             return
         proc = cur.process
@@ -195,6 +203,11 @@ class RoleServerManager:
                 pass
             await proc.wait()
         logger.info("%s server for '%s' stopped", self.role, cur.config.name)
+        if was_ready:
+            metrics.inc_unload(self.role, cur.config.name)
+            bus.emit(
+                "model_unloaded", role=self.role, model=cur.config.name
+            )
         _cleanup_config(config_file)
 
     async def ensure_model(self, name: str,
@@ -226,10 +239,16 @@ class RoleServerManager:
                 # A swap for another model is in flight; wait for it to
                 # settle, then swap again (bounded, mirrors ProcessManager).
                 await self._wait_loading_settled(cur)
+            prev = cur.config.name if cur is not None and cur.state is ServerState.READY else None
             cur = self._current
             if cur is not None:
                 await self._stop_current()
             await self._launch(cfg)
+            if prev is not None and prev != name:
+                metrics.inc_swap(self.role, prev, name)
+                bus.emit(
+                    "swap", role=self.role, from_model=prev, to_model=name
+                )
             return cfg
 
     async def unload(self) -> bool:
@@ -243,6 +262,11 @@ class RoleServerManager:
             had = self._current is not None
             await self._stop_current()
             return had
+
+    def pin(self, seconds: float) -> None:
+        """Suppress idle unload for the next ``seconds`` (X-Pin-Seconds)."""
+        if seconds > 0:
+            self._pinned_until = asyncio.get_running_loop().time() + seconds
 
     async def _wait_loading_settled(self, prev: _RunningServer) -> None:
         deadline = asyncio.get_running_loop().time() + self._startup_timeout + 30.0
@@ -268,7 +292,8 @@ class RoleServerManager:
             "launching %s server for '%s': %s",
             self.role, cfg.name, " ".join(argv),
         )
-        env = {**os.environ, **cfg.command.env}
+        env = cfg.launch_env(os.environ)
+        start = asyncio.get_running_loop().time()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -278,6 +303,9 @@ class RoleServerManager:
             )
         except OSError as exc:
             _cleanup_config(config_file)
+            metrics.inc_load_failure(self.role, cfg.name)
+            bus.emit("load_failed", role=self.role, model=cfg.name,
+                        error=str(exc))
             raise RoleServerLoadError(f"failed to spawn {self.role} server: {exc}") from exc
         entry = _RunningServer(config=cfg, process=proc, state=ServerState.LOADING,
                               config_file=config_file)
@@ -287,9 +315,20 @@ class RoleServerManager:
             await self._wait_healthy(cfg, proc)
         except BaseException:
             await self._stop_current()
+            metrics.inc_load_failure(self.role, cfg.name)
+            bus.emit(
+                "load_failed", role=self.role, model=cfg.name,
+                error="did not become healthy",
+            )
             raise
         entry.state = ServerState.READY
         entry.detail = ""
+        elapsed = asyncio.get_running_loop().time() - start
+        metrics.observe_load(self.role, cfg.name, elapsed)
+        bus.emit(
+            "model_loaded", role=self.role, model=cfg.name,
+            seconds=round(elapsed, 2),
+        )
         logger.info("%s model '%s' ready on port %d",
                     self.role, cfg.name, cfg.port)
 
@@ -317,7 +356,10 @@ class RoleServerManager:
                 await asyncio.sleep(self._health_interval)
                 if self._current is None:
                     continue
-                elapsed = asyncio.get_running_loop().time() - self._last_activity
+                now = asyncio.get_running_loop().time()
+                if now < self._pinned_until:
+                    continue
+                elapsed = now - self._last_activity
                 if elapsed < self._idle_unload_seconds:
                     continue
                 async with self._lock:

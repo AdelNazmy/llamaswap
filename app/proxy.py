@@ -162,6 +162,46 @@ async def proxy_raw(
     )
 
 
+async def proxy_raw_stream(
+    port: int, host: str, path: str, body: Any,
+    headers: dict[str, str],
+) -> AsyncIterator[bytes]:
+    """Streaming binary pass-through (e.g. chunked TTS audio output).
+
+    Unlike ``proxy_raw`` (which buffers the whole body), this yields raw
+    bytes as they arrive so a backend exposing a chunked speech endpoint
+    can be relayed live. No SSE rewriting — the payload is opaque audio.
+    """
+    url = f"http://{host}:{port}{path}"
+    fwd_headers = {k: v for k, v in headers.items()
+                   if k.lower() not in ("host", "content-length", "accept-encoding")}
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=10.0)
+        ) as client:
+            async with client.stream(
+                "POST", url, content=body, headers=fwd_headers
+            ) as resp:
+                if resp.status_code != 200:
+                    raw = await resp.aread()
+                    yield json.dumps({
+                        "error": {
+                            "message": raw.decode(errors="replace")[:500]
+                            if not _is_json(raw) else json.loads(raw),
+                        }
+                    }).encode()
+                    return
+                async for chunk in resp.aiter_raw():
+                    if chunk:
+                        yield chunk
+    except httpx.ConnectError:
+        yield json.dumps({
+            "error": {"message": "backend audio server is not reachable"}
+        }).encode()
+    except httpx.HTTPError as exc:
+        yield json.dumps({"error": {"message": str(exc)}}).encode()
+
+
 def _is_json(content: bytes) -> bool:
     head = content.lstrip()[:1]
     return head in (b"{", b"[")
