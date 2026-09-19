@@ -107,6 +107,7 @@ require_x() {
 }
 
 require_x /opt/llama.cpp/build/bin/llama-server
+require_x /opt/llama_prism.cpp/build/bin/llama-server
 
 if [ "$INCLUDE_AUDIO" = 1 ]; then
     require_x /opt/audio.cpp/build/bin/audiocpp_server

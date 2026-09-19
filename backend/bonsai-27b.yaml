@@ -24,18 +24,8 @@ command:
     - "1"
     - "-lv"
     - "4"
-    - "--spec-type"
-    - "ngram-mod"
     - "--log-colors"
     - "on"
-    - "--jinja"
-    - "--reasoning-budget"
-    - "1024"
-    - "--kv-unified"
-    - "--cache-idle-slots"
-    - "--mmap"
-    - "--mlock"
-
   env:
     CUDA_VISIBLE_DEVICES: "0"
 # internal llama-server binding (enforced by the proxy; one model at a time)
