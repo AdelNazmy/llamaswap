@@ -1,0 +1,47 @@
+# Text chat model: bonsai-27b)
+name: bonsai-27b
+description: "bonsai-27b, text chat 130k"
+command:
+  binary: /opt/llama.cpp/build/bin/llama-prism-server
+  args:
+    - "--model"
+    - "/opt/models/Ternary-Bonsai-2-27B-PQ2_0.gguf"
+    - "--ctx-size"
+    - "131000"
+    - "--n-gpu-layers"
+    - "999"
+    - "--flash-attn"
+    - "on"
+    - "-c"
+    - "131000"
+    - "--temp"
+    - "1.0"
+    - "--top-p"
+    - "0.95"
+    - "--top-k"
+    - "20"
+    - "--parallel"
+    - "1"
+    - "-lv"
+    - "4"
+    - "--spec-type"
+    - "ngram-mod"
+    - "--log-colors"
+    - "on"
+    - "--jinja"
+    - "--reasoning-budget"
+    - "1024"
+    - "--kv-unified"
+    - "--cache-idle-slots"
+    - "--mmap"
+    - "--mlock"
+
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+# internal llama-server binding (enforced by the proxy; one model at a time)
+host: 127.0.0.1
+port: 8111
+meta:
+  context_length: 131000
+  family: qwen
+  capabilities: [chat]

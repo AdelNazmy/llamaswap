@@ -423,24 +423,44 @@ Prerequisites for both backends: git, cmake (≥ 3.13) and a C++17 compiler
 Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
 (`nvcc`) and your GPU driver, then:
 
+For Bonsai low weights Models
 ```bash
-mkdir -p /opt/llamacpp
-cd /opt/llamacpp
+mkdir
+git clone https://github.com/PrismML-Eng/llama.cpp.git
+mv llama.cpp llama_prism.cpp
+cd llama_prism.cpp
+cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build --config Release -j 16
+```
+
+For Normal GGUF Models
+```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
-cmake --build build --config Release -j
+cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build --config Release -j 16
 ```
 
 ### ROCm (AMD)
 
 Install [ROCm](https://rocm.docs.amd.com/) (`hipcc`) and your GPU driver,
 then:
+
+For Bonsai low weights Models
+```bash
+git clone https://github.com/PrismML-Eng/llama.cpp.git
+mv llama.cpp llama_prism.cpp
+cd llama_prism.cpp
+cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_HIPBLAS=ON
+cmake --build build --config Release -j 16
+```
+
+For Normal GGUF Models
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIPBLAS=ON
-cmake --build build --config Release -j
+cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_HIPBLAS=ON
+cmake --build build --config Release -j 16
 ```
 
 ### Embedding model tensores download amd GGUF convert

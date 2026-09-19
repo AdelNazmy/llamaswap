@@ -29,7 +29,10 @@ COPY --from=cuda-libs /usr/local/cuda/lib64/libcublasLt.so* /usr/local/cuda/lib6
 RUN printf '/usr/local/cuda/lib64\n' > /etc/ld.so.conf.d/cuda.conf && ldconfig
 
 COPY --from=llamacpp-bin ./llama-server /opt/llama.cpp/build/bin/llama-server
+COPY --from=llamacpp_prism-bin ./llama-server /opt/llama.cpp/build/bin/llama-prism-server
+
 RUN chmod 0755 /opt/llama.cpp/build/bin/llama-server
+RUN chmod 0755 /opt/llama.cpp/build/bin/llama-prism-server
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

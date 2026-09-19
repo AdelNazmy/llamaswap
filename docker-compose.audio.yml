@@ -43,6 +43,7 @@ services:
       dockerfile: Dockerfile.audio
       additional_contexts:
         llamacpp-bin: /opt/llama.cpp/build/bin
+        llamacpp_prism-bin: /opt/llama_prism.cpp/build/bin
         audiocpp-bin: /opt/audio.cpp/build/bin
         audiocpp-src: /opt/audio.cpp
         whispercpp-bin: /opt/whisper.cpp/build/bin
