@@ -13,10 +13,12 @@ The OpenAI **audio API** is served by per-role TTS/ASR servers
 between backends per request — e.g. audio.cpp's Qwen3-ASR vs
 whisper.cpp's whisper-server — without touching the loaded chat LLM.
 
-**Only the embedding server is persistent.** The chat LLM and every
-TTS/ASR server are on-demand: nothing boots until a request names them,
-and each is stopped again after `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default
-300 s) with no requests — the same idle-unload policy everywhere.
+**The embedding server is persistent by default** (set
+`LLAMASWAP_EMBEDDING_AUTO_START=false` to make it on-demand like the
+others). The chat LLM and every TTS/ASR server are on-demand: nothing
+boots until a request names them, and each is stopped again after
+`LLAMASWAP_IDLE_UNLOAD_SECONDS` (default 300 s) with no requests — the
+same idle-unload policy everywhere.
 
 A three-part VRAM policy keeps the GPU from being oversubscribed:
 requesting a "big" chat LLM (any model larger than the smallest) unloads
@@ -83,7 +85,7 @@ image server (or a failed big-LLM load).
 
 | Tenant | Manager | Lifetime |
 |---|---|---|
-| Embedding | `EmbeddingManager` | persistent — boots at startup, survives all but image load / LLM retry |
+| Embedding | `EmbeddingManager` | persistent by default (boots at startup); on-demand when `LLAMASWAP_EMBEDDING_AUTO_START=false` |
 | Chat LLM | `ProcessManager` | on-demand, one at a time, idle-unloaded |
 | TTS / ASR | `RoleServerManager` ×2 | on-demand per role, idle-unloaded |
 | Image | `RoleServerManager` ×1 | on-demand, idle-unloaded |
@@ -839,8 +841,8 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_IDLE_UNLOAD_SECONDS`,
 `LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS`, `LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS`,
 `LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`,
-`LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`, `LLAMASWAP_API_KEY`,
-`LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`.
+`LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`, `LLAMASWAP_EMBEDDING_AUTO_START`,
+`LLAMASWAP_API_KEY`, `LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`.
 
 ## Voice cloning with Qwen3-TTS
 
@@ -1139,10 +1141,11 @@ piling up on a slow model load.
 
 ## Notes
 
-- The persistent embedding server starts with the proxy. If it fails to
+- The embedding server starts with the proxy by default. If it fails to
   start, the proxy still starts and reports the embedding state in
-  `/health`. The chat LLM, TTS/ASR, and image servers start on first use
-  instead of booting with the proxy.
+  `/health`. Set `LLAMASWAP_EMBEDDING_AUTO_START=false` to make it boot
+  on first use like the chat LLM, TTS/ASR, and image servers, which
+  always start on first use instead of booting with the proxy.
 - Requesting a "big" chat LLM (anything other than the smallest by
   weights-file size) unloads any running TTS/ASR servers first to free
   VRAM — the embedding server is left running. Disable with

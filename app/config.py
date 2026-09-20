@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     unload_on_image: bool = True
     unload_image_on_llm: bool = True
     unload_image_on_audio: bool = True
+    # The embedding server (role: embedding, e.g. octen-embedding) is
+    # launched automatically at boot and kept running for the lifetime of
+    # the proxy (only stopped to free VRAM for an LLM or the image server).
+    # Set false to launch it on first use instead — like the chat / TTS /
+    # ASR / image endpoints — so nothing boots until a request names it.
+    embedding_auto_start: bool = True
     # Where the proxy stages uploaded audio files for backends whose
     # transcription API takes a server-side path (audio.cpp). Must be
     # writable by llamaswap AND readable by the backend process.

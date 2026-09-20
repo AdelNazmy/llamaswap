@@ -1,12 +1,14 @@
 """llamaswap — an OpenAI-compatible proxy in front of llama-server.
 
 Model registry lives in backend/*.yaml; the requested model is launched
-(or swapped in) transparently on demand. Only the embedding server is
-persistent; everything else is on-demand and idle-unloaded like the chat
-LLM:
+(or swapped in) transparently on demand. The embedding server is started
+at boot and kept running (only stopped to free VRAM for an LLM) unless
+``embedding_auto_start`` is false, in which case it boots on first use
+like the other on-demand servers:
 
   * ``embedding`` — dedicated embedding llama-server (EmbeddingManager),
-    started at boot and kept running (only stopped to free VRAM for an LLM)
+    started at boot by default (or on the first /v1/embeddings request
+    when ``LLAMASWAP_EMBEDDING_AUTO_START=false``)
   * ``chat`` — one LLM at a time (ProcessManager), swapped on request and
     unloaded after ``idle_unload_seconds`` with no requests
   * ``tts`` / ``asr`` — audio servers (RoleServerManager) that boot on
@@ -218,8 +220,10 @@ async def lifespan(app: FastAPI):
     )
     app.state.image_manager.configure(app.state.registry.role_configs("image"))
 
-    # Persistent embedding server: launched at boot, kept running for the
-    # lifetime of the proxy (only stopped to free VRAM for an LLM).
+    # Dedicated embedding server: launched at boot and kept running for
+    # the lifetime of the proxy (only stopped to free VRAM for an LLM),
+    # unless LLAMASWAP_EMBEDDING_AUTO_START=false — then it boots on first
+    # use like the other on-demand servers (chat, TTS/ASR, image).
     app.state.embedding_manager = None
     emb_cfg = app.state.registry.embedding_config()
     if emb_cfg is not None:
@@ -230,11 +234,18 @@ async def lifespan(app: FastAPI):
             health_interval=settings.health_interval,
         )
         app.state.embedding_manager = emb_manager
-        try:
-            await emb_manager.start()
-        except EmbeddingLoadError as exc:
-            logger.error(
-                "embedding server failed to start at boot: %s", exc
+        if settings.embedding_auto_start:
+            try:
+                await emb_manager.start()
+            except EmbeddingLoadError as exc:
+                logger.error(
+                    "embedding server failed to start at boot: %s", exc
+                )
+        else:
+            logger.info(
+                "embedding server '%s' is on-demand "
+                "(LLAMASWAP_EMBEDDING_AUTO_START=false); it will launch "
+                "on the first /v1/embeddings request", emb_cfg.name,
             )
     logger.info(
         "llamaswap ready on %s:%d (%d models)",
@@ -469,7 +480,10 @@ async def _ensure_and_route(
             return JSONResponse(status_code=status, content=payload)
     # The LLM is ready. Best-effort bring the embedding server back up if
     # it was stopped to make room for an LLM; never block the response.
-    if embedding_manager is not None and not embedding_manager.is_running:
+    # Skipped when auto-start is disabled — then the embedding server only
+    # boots on an explicit /v1/embeddings request, like other endpoints.
+    if (settings.embedding_auto_start and embedding_manager is not None
+            and not embedding_manager.is_running):
         asyncio.get_running_loop().create_task(
             embedding_manager.ensure_running()
         )

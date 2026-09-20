@@ -42,6 +42,9 @@ services:
       LLAMASWAP_UNLOAD_ON_IMAGE: "${LLAMASWAP_UNLOAD_ON_IMAGE:-true}"
       LLAMASWAP_UNLOAD_IMAGE_ON_LLM: "${LLAMASWAP_UNLOAD_IMAGE_ON_LLM:-true}"
       LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO: "${LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO:-true}"
+      # Boot the embedding server at startup (octen-embedding). Set false
+      # to launch it on first use like the chat/TTS/ASR/image endpoints.
+      LLAMASWAP_EMBEDDING_AUTO_START: "${LLAMASWAP_EMBEDDING_AUTO_START:-true}"
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
       LLAMASWAP_LOG_JSON: "${LLAMASWAP_LOG_JSON:-false}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"

@@ -21,7 +21,7 @@ command:
     - "-lv"
     - "4"
     - "--spec-type"
-    - "ngram-mod"
+    - "ngram-simple"
     - "--log-colors"
     - "on"
     - "--reasoning-budget"
