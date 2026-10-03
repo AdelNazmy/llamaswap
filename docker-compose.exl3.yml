@@ -1,0 +1,26 @@
+# Opt-in compose overlay that enables EXL3 inference (exllamav3) in the
+# llamaswap container — see Dockerfile.exl3 for the installed stack and
+# backend/qwen3.8-27b-exl3.yaml for the model entry.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.exl3.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.exl3.yml up -d
+#
+# Triton JIT (used by exllamav3's EXL3 kernels) needs an unversioned
+# libcuda.so; WSL only exposes libcuda.so.1 to containers, so the shim dir
+# from the tabbyapi setup is mounted read-only and pointed at via
+# TRITON_LIBCUDA_PATH (set per-backend in the model YAML's command.env).
+#
+# NOTE: tabbyapi and llamaswap both want the whole GPU. Stop the tabbyapi
+# container before loading the exl3 model through llamaswap:
+#   docker stop tabbyapi
+services:
+  llamaswap:
+    build:
+      # Same build context; Dockerfile.exl3 starts FROM llamaswap:local
+      # and adds the exllamav3 stack (build llamaswap:local first via
+      # docker-compose.yml alone).
+      dockerfile: Dockerfile.exl3
+    volumes:
+      # Unversioned libcuda.so for Triton JIT linking (WSL only)
+      - ~/tabbyapi-config/cuda-shim:/opt/cuda-shim:ro

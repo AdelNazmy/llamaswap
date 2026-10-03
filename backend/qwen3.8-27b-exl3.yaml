@@ -1,0 +1,58 @@
+# Text chat model: Qwen3.8 27B EXL3 3.5bpw, served by exllamav3 directly
+# (the engine underneath tabbyAPI) instead of the tabbyapi container.
+#
+# Runs backend/exl3_server.py — a minimal OpenAI-compatible wrapper around
+# exllamav3's AsyncGenerator, so llamaswap can launch/stop it like a
+# llama-server process: SIGTERM = model unload + VRAM freed, and the usual
+# chat-LLM VRAM guards apply.
+#
+# Settings mirror ~/tabbyapi-config/config.yml (61k ctx = practical 16 GB
+# ceiling with MTP; Q4 KV cache; chunk 512; sysmem tiers; no warmup — a
+# full-seq-len warmup dry-run causes an allocation spike on 16 GB).
+# NOTE: stop the tabbyapi container (docker stop tabbyapi) before loading
+# this model — both use the whole GPU.
+#
+# Requires the exl3 image overlay (torch + exllamav3 + Triton):
+#   docker compose -f docker-compose.yml -f docker-compose.exl3.yml up -d --build
+name: qwen3.8-27b-exl3
+description: "Qwen3.8 27B dense, EXL3 3.5bpw (exllamav3), text chat 61k, MTP"
+command:
+  binary: /usr/local/bin/python3
+  args:
+    - "-u"
+    - "/app/backend/exl3_server.py"
+    - "--model"
+    - "/opt/models/exl3/Qwen3.8-27B-EXL3-3.5bpw"
+    - "--display-name"
+    - "qwen3.8-27b-exl3"
+    - "-cs"
+    - "61440"
+    - "-cq"
+    - "4"
+    - "-chunk_size"
+    - "512"
+    - "-ambs"
+    - "2"
+    - "--mtp"
+    - "-nw"
+    - "--sysmem-recurrent-cache-mb"
+    - "8192"
+    - "--sysmem-kv-cache-mb"
+    - "2176"
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+    # Triton JIT: -lcuda lookup needs an unversioned libcuda.so; WSL only
+    # exposes libcuda.so.1 to containers. Same shim the tabbyapi container
+    # uses (mounted by docker-compose.exl3.yml). Refresh after Windows
+    # driver updates: cp /usr/lib/wsl/lib/libcuda.so ~/tabbyapi-config/cuda-shim/libcuda.so
+    TRITON_LIBCUDA_PATH: "/opt/cuda-shim"
+# internal binding, enforced by the proxy; one model at a time
+host: 127.0.0.1
+port: 8101
+meta:
+  context_length: 61440
+  family: qwen
+  capabilities: [chat]
+  # Weights ~14.3 GB + Q4 KV @61k + MTP head; declared because there is no
+  # single --model weights file for the registry to stat.
+  vram_gb: 16

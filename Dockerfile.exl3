@@ -1,0 +1,40 @@
+# Opt-in overlay that adds the exllamav3 (EXL3) inference stack on top of
+# llamaswap:local, so backend/qwen3.8-27b-exl3.yaml can run the EXL3 model
+# in-process (exllamav3 + torch + Triton) alongside the llama.cpp models.
+#
+# Wheel variants are pinned to the exact stack proven in the tabbyapi
+# container (torch 2.9.0+cu128 / exllamav3 1.5.2+cu128.torch2.9.0 — the
+# same URLs tabbyAPI's own pyproject.toml [cu12] extra installs for
+# cp312/linux). exllamav3 prebuilt wheels are NOT on PyPI; they live on
+# the project's GitHub releases.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.exl3.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.exl3.yml up -d
+
+FROM llamaswap:local
+
+# Triton's JIT compiles a small C launcher module at runtime (needed by the
+# torch/exllamav3 EXL3 kernels), so a C compiler must be present in the
+# runtime image. Python headers ship with the official python base image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# torch first so exllamav3's dependency resolution sees the pinned build
+# instead of pulling a mismatched one from PyPI. flash-linear-attention is
+# required by hybrid recurrent/linear-attention models (e.g. Qwen3.8).
+RUN pip install --no-cache-dir \
+        "https://download.pytorch.org/whl/cu128/torch-2.9.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl" \
+        "triton==3.5.0" \
+    && pip install --no-cache-dir \
+        "https://github.com/turboderp-org/exllamav3/releases/download/v1.5.2/exllamav3-1.5.2%2Bcu128.torch2.9.0-cp312-cp312-linux_x86_64.whl" \
+        "flash-linear-attention==0.5.2" \
+        "transformers==5.17.0" \
+        "fastapi==0.141.1" \
+        "uvicorn==0.54.0"
+
+# Sanity check at build time: the native ext must import against the
+# bundled CUDA libs, not just resolve.
+RUN python3 -c "from exllamav3 import exllamav3_ext, version; \
+    print('exl3 stack OK:', version.__version__)"
