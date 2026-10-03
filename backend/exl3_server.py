@@ -27,6 +27,7 @@ import typing
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from jinja2.exceptions import TemplateError
 
 from exllamav3 import model_init
 from exllamav3.generator import AsyncGenerator, AsyncJob
@@ -212,8 +213,19 @@ def list_models():
     }
 
 
+ROLE_ALIASES = {"developer": "system", "function": "tool"}
+
+
 def _prompt_from_chat(body: dict) -> str:
     messages = body.get("messages") or []
+    # Normalize roles some OpenAI clients emit that HF chat templates don't
+    # know (e.g. the o-series "developer" role) — otherwise the template
+    # raises "Unexpected message role".
+    messages = [
+        {**m, "role": ROLE_ALIASES.get(m.get("role"), m.get("role"))}
+        if isinstance(m, dict) else m
+        for m in messages
+    ]
     template_kwargs = dict(body.get("chat_template_kwargs") or {})
     # tabbyAPI-style top-level "enable_thinking"; request-level
     # chat_template_kwargs wins if both are present.
@@ -356,6 +368,11 @@ async def _generate(body: dict, request: Request):
                     usage = u
         except ValueError as e:
             return oai_error(400, str(e))
+        except TemplateError as e:
+            return oai_error(400, f"chat template error: {e}")
+        except Exception as e:
+            log(f"request failed: {e!r}")
+            return oai_error(500, str(e))
         content = "".join(parts)
         return {
             "id": chunk_id,
@@ -386,8 +403,12 @@ async def _generate(body: dict, request: Request):
                             "finish_reason": None,
                         }],
                     })
-        except (ValueError, RuntimeError) as e:
-            yield _sse({"error": {"message": str(e)}})
+        except Exception as e:
+            # Never let an exception escape mid-stream: the connection would
+            # be dropped without a complete body (client-visible 502).
+            log(f"request failed: {e!r}")
+            yield _sse({"error": {"message": str(e),
+                                  "type": "server_error"}})
             yield "data: [DONE]\n\n"
             return
         yield _sse({
