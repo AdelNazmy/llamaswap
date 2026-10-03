@@ -6,7 +6,7 @@
 # llama-server process: SIGTERM = model unload + VRAM freed, and the usual
 # chat-LLM VRAM guards apply.
 #
-# Settings mirror ~/tabbyapi-config/config.yml (61k ctx = practical 16 GB
+# Settings mirror ~/tabbyapi-config/config.yml, raised to 65k ctx; chunk 256
 # ceiling with MTP; Q4 KV cache; chunk 512; sysmem tiers; no warmup — a
 # full-seq-len warmup dry-run causes an allocation spike on 16 GB).
 # NOTE: stop the tabbyapi container (docker stop tabbyapi) before loading
@@ -26,11 +26,11 @@ command:
     - "--display-name"
     - "qwen3.8-27b-exl3"
     - "-cs"
-    - "61440"
+    - "65536"
     - "-cq"
     - "4"
     - "-chunk_size"
-    - "512"
+    - "256"
     - "-ambs"
     - "2"
     - "--mtp"
@@ -39,6 +39,8 @@ command:
     - "8192"
     - "--sysmem-kv-cache-mb"
     - "2176"
+    - "--reserve-mb"
+    - "96"
   env:
     CUDA_VISIBLE_DEVICES: "0"
     # Triton JIT: -lcuda lookup needs an unversioned libcuda.so; WSL only
@@ -46,11 +48,17 @@ command:
     # uses (mounted by docker-compose.exl3.yml). Refresh after Windows
     # driver updates: cp /usr/lib/wsl/lib/libcuda.so ~/tabbyapi-config/cuda-shim/libcuda.so
     TRITON_LIBCUDA_PATH: "/opt/cuda-shim"
+    # At 65k ctx the card is within ~50 MiB of the wire: the final lm_head
+    # load shows 458 MiB headroom vs (256 MiB transient + margin). The
+    # engine's 256 MiB default margin doesn't fit; 128 keeps ~74 MiB of
+    # load slack and ~200 MiB of runtime headroom after the largest
+    # transient. If you ever see a runtime OOM, drop ctx back toward 61k.
+    EXL3_AUTOSPLIT_MARGIN_MB: "128"
 # internal binding, enforced by the proxy; one model at a time
 host: 127.0.0.1
 port: 8101
 meta:
-  context_length: 61440
+  context_length: 65536
   family: qwen
   capabilities: [chat]
   # Weights ~14.3 GB + Q4 KV @61k + MTP head; declared because there is no

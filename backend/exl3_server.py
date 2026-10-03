@@ -77,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     # memory.sysmem_kv_cache).
     parser.add_argument("--sysmem-recurrent-cache-mb", type=int, default=8192)
     parser.add_argument("--sysmem-kv-cache-mb", type=int, default=2176)
+    # Per-device load reserve in MiB (tabby default_reserve = 96 MB). The
+    # 14.3 GB model is within ~100 MB of the card limit, so this margin is
+    # the difference between fitting and "Insufficient VRAM in split".
+    parser.add_argument("--reserve-mb", type=int, default=96)
     return parser
 
 
@@ -138,7 +142,7 @@ class Engine:
         # split for model and cache". Forwarded verbatim to Model.load().
         result = model_init.init(
             a, quiet=True, progress=False,
-            reserve_per_device=[96 / 1024],
+            reserve_per_device=[a.reserve_mb / 1024],
         )
         if a.mtp:  # add_draft_model_args enabled -> 7-tuple
             model, config, cache, tokenizer, draft_model, _, draft_cache = result
@@ -211,6 +215,10 @@ def list_models():
 def _prompt_from_chat(body: dict) -> str:
     messages = body.get("messages") or []
     template_kwargs = dict(body.get("chat_template_kwargs") or {})
+    # tabbyAPI-style top-level "enable_thinking"; request-level
+    # chat_template_kwargs wins if both are present.
+    if "enable_thinking" in body and "enable_thinking" not in template_kwargs:
+        template_kwargs["enable_thinking"] = body["enable_thinking"]
     return engine.tokenizer.hf_chat_template(
         messages, add_generation_prompt=True, **template_kwargs
     )
@@ -244,13 +252,20 @@ def _max_new_tokens(body: dict, prompt_ids) -> int | None:
 
 
 async def run_job(body: dict):
-    """Yield (text, eos_reason_or_None) chunks for one request."""
+    """Yield (text, eos_reason_or_None, usage_or_None) chunks for one request.
+
+    ``usage`` is populated only on the final chunk, from the generator's own
+    timing stats: prompt/completion token counts plus prefill/generate
+    seconds (exllamav3 measures these server-side, wall-clock-accurate).
+    """
     if body.get("prompt") is not None:  # /v1/completions
         input_ids = engine.tokenizer.encode(
             body["prompt"], encode_special_tokens=True
         )
     else:
         input_ids = _prompt_from_chat(body)
+    prompt_tokens = int(input_ids.shape[1]) if hasattr(input_ids, "shape") \
+        else len(input_ids)
 
     job = AsyncJob(
         engine.generator,
@@ -264,9 +279,45 @@ async def run_job(body: dict):
     try:
         async for result in job:
             if result.get("stage") == "streaming":
-                eos_reason = result.get("eos_reason") if result.get("eos") \
-                    else None
-                yield result.get("text") or "", eos_reason
+                eos = result.get("eos")
+                eos_reason = result.get("eos_reason") if eos else None
+                usage = None
+                if eos:
+                    new_tokens = result.get("new_tokens") or 0
+                    t_prefill = result.get("time_prefill") or 0.0
+                    t_gen = result.get("time_generate") or 0.0
+                    t_queue = result.get("time_enqueued") or 0.0
+                    # llama.cpp-style timing lines — same format llama-server
+                    # prints ("slot print_timing"), so llamaswap's logs look
+                    # identical for exl3 and llama.cpp backends.
+                    serial = result.get("serial")
+                    prefill_tps = prompt_tokens / t_prefill if t_prefill else 0.0
+                    gen_tps = new_tokens / t_gen if t_gen else 0.0
+                    log(f"slot print_timing: id {serial} | task 0 |    "
+                        f"prompt eval time = {t_prefill * 1000:9.2f} ms /"
+                        f" {prompt_tokens:6d} tokens ({prefill_tps:8.2f} tokens per second)")
+                    log(f"slot print_timing: id {serial} | task 0 |    "
+                        f" eval time = {t_gen * 1000:9.2f} ms /"
+                        f" {new_tokens:6d} tokens ({gen_tps:8.2f} tokens per second)")
+                    log(f"slot print_timing: id {serial} | task 0 |   "
+                        f" total time = {(t_queue + t_prefill + t_gen) * 1000:9.2f} ms /"
+                        f" {prompt_tokens + new_tokens:6d} tokens")
+                    usage = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": new_tokens,
+                        "total_tokens": prompt_tokens + new_tokens,
+                        "prompt_tokens_per_sec":
+                            prompt_tokens / t_prefill if t_prefill else None,
+                        "completion_tokens_per_sec":
+                            new_tokens / t_gen if t_gen else None,
+                        "timings": {
+                            "prompt_ms": round(t_prefill * 1000),
+                            "first_token_ms":
+                                round((t_queue + t_prefill) * 1000),
+                            "generation_ms": round(t_gen * 1000),
+                        },
+                    }
+                yield result.get("text") or "", eos_reason, usage
     except BaseException:
         # Client disconnect / cancellation: release cache pages.
         try:
@@ -294,11 +345,15 @@ async def _generate(body: dict, request: Request):
     if not stream:
         parts: list[str] = []
         eos_reason = None
+        usage = {"prompt_tokens": 0, "completion_tokens": 0,
+                 "total_tokens": 0}
         try:
-            async for text, reason in run_job(body):
+            async for text, reason, u in run_job(body):
                 parts.append(text)
                 if reason:
                     eos_reason = reason
+                if u:
+                    usage = u
         except ValueError as e:
             return oai_error(400, str(e))
         content = "".join(parts)
@@ -313,16 +368,13 @@ async def _generate(body: dict, request: Request):
                 "finish_reason": "length" if eos_reason == "max_new_tokens"
                 else "stop",
             }],
-            "usage": {
-                "prompt_tokens": 0, "completion_tokens": 0,
-                "total_tokens": 0,
-            },
+            "usage": usage,
         }
 
     async def sse():
         eos_reason = None
         try:
-            async for text, reason in run_job(body):
+            async for text, reason, u in run_job(body):
                 if reason:
                     eos_reason = reason
                 if text:
