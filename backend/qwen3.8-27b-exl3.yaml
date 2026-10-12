@@ -15,7 +15,7 @@
 # Requires the exl3 image overlay (torch + exllamav3 + Triton):
 #   docker compose -f docker-compose.yml -f docker-compose.exl3.yml up -d --build
 name: qwen3.8-27b-exl3
-description: "Qwen3.8 27B dense, EXL3 3.5bpw (exllamav3), text chat 61k, MTP"
+description: "Qwen3.8 27B dense, EXL3 3.5bpw (exllamav3), text chat 65k, MTP"
 command:
   binary: /usr/local/bin/python3
   args:
