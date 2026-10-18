@@ -426,8 +426,10 @@ request. The response is binary audio (`audio/wav` by default; other
 `response_format` codecs are transcoded via ffmpeg like `/v1/audio/speech`).
 
 `role: image` edits (`/v1/images/edits`) need vision weights for models
-whose text encoder is an LLM — add `--llm_vision .../mmproj...gguf` to the
-YAML; `flux-schnell`/`qwen-image-2.1-uc` as shipped are text-to-image only.
+whose text encoder is a GGUF — add `--llm_vision .../mmproj...gguf` to the
+YAML in that case. `qwen-image-2.1-uc` supports editing out of the box (its
+safetensors Qwen3-VL text encoder carries the full vision weights);
+`flux-schnell` as shipped is text-to-image only.
 
 `meta.request_format` tells the proxy which request dialect the backend
 speaks (default `json`):

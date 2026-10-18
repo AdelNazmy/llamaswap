@@ -19,9 +19,10 @@
 # defaults: cfg 6.0, euler. For higher quality, swap the Q4_K_M file
 # for qwen-image-2.1-UC-Q8_0.gguf (7.6 GB, same repo).
 #
-# Note: /v1/images/edits (image editing) additionally needs vision
-# weights (--llm_vision mmproj-Qwen3VL-8B-Instruct-F16.gguf); this
-# config only enables text-to-image.
+# Note: /v1/images/edits (image editing) works out of the box — the
+# safetensors Qwen3-VL-8B text encoder carries the full vision weights
+# (--llm_vision with an mmproj GGUF is only needed when the text encoder
+# is a GGUF).
 #
 # Backend binary (see README "Building stable-diffusion.cpp (image)").
 #
