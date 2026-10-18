@@ -29,19 +29,21 @@ same idle-unload policy everywhere.
 
 A three-part VRAM policy keeps the GPU from being oversubscribed:
 requesting a "big" chat LLM (any model larger than the smallest) unloads
-the running TTS/ASR servers first — the embedding server stays up — so the
-big model fits; while both TTS and ASR are loaded, chat is served by the
-smallest LLM; and while a big chat LLM is loaded, TTS/ASR requests are
+the running TTS/ASR/music servers first — the embedding server stays up — so
+the big model fits; while both TTS and ASR are loaded, chat is served by the
+smallest LLM; and while a big chat LLM is loaded, audio requests are
 rejected with `409` (see `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`,
-`LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`).
+`LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`). Heavier
+still: the image and music servers evict everyone, and yield to every
+other workload in turn.
 
 ## How it works
 
 ```
 OpenAI client (port 11434)
         │  /v1/chat/completions, /v1/embeddings,
-        │  /v1/audio/speech, /v1/audio/transcriptions,
-        │  /v1/images/generations, /v1/images/edits, /v1/models
+        │  /v1/audio/speech(+ /stream), /v1/audio/transcriptions(+ /stream),
+        │  /v1/audio/music, /v1/images/generations, /v1/images/edits, /v1/models
         ▼
 llamaswap (FastAPI)
   • model registry        ← backend/*.yaml
@@ -49,13 +51,15 @@ llamaswap (FastAPI)
   • embedding manager     ← persistent embedding llama-server
   • audio managers        ← on-demand per-role TTS/ASR servers (t+r)
   • image manager         ← on-demand per-role image server
+  • music manager         ← on-demand per-role music server
         │  HTTP (streaming pass-through / binary pass-through)
         ├── llama-server chat   (127.0.0.1:8101, on-demand + idle unload)
         ├── llama-server embed (127.0.0.1:8102, persistent)
-        ├── audiocpp_server TTS (127.0.0.1:8103, on-demand, swappable)
-        ├── audiocpp_server ASR (127.0.0.1:8104, on-demand, swappable)
+        ├── audiocpp_server TTS (127.0.0.1:8103+, on-demand, swappable)
+        ├── audiocpp_server ASR (127.0.0.1:8104+, on-demand, swappable)
         ├── whisper-server ASR  (127.0.0.1:8105, on-demand, swappable)
-        └── sd-server image     (127.0.0.1:8109, on-demand, swappable)
+        ├── sd-server image     (127.0.0.1:8109, on-demand, swappable)
+        └── audiocpp_server music (127.0.0.1:8110, on-demand, swappable)
 ```
 ## The flow, simplified
 ![llamaswapv2.1](docs/images/llamaswapv2.1.png)
@@ -73,8 +77,12 @@ Read it left to right:
    Qwen3-TTS voice clone). Ollama has none of this natively.
 5. **IMAGE** = one on-demand diffusion server (stable-diffusion.cpp's
    `sd-server`) behind `/v1/images/generations` and `/v1/images/edits`. It
-   swaps image models per request and idle-unloads like everything else.
-6. **VRAM guard** — a set of deterministic rules (below) instead of hoping
+   swaps image models per request (FLUX.1-schnell ↔ Qwen-Image 2.1) and
+   idle-unloads like everything else.
+6. **MUSIC** = one on-demand music-generation server (audio.cpp's
+   `minimax_music3` family) behind `/v1/audio/music` — structured caption +
+   lyrics in, full-song WAV out.
+7. **VRAM guard** — a set of deterministic rules (below) instead of hoping
    the GPU evicts the right thing.
 
 ### The VRAM guard — complete behavior
@@ -240,6 +248,19 @@ refused with `409`.
   request stops the image server instead of stacking on it. Controlled by
   `LLAMASWAP_UNLOAD_ON_IMAGE`, `LLAMASWAP_UNLOAD_IMAGE_ON_LLM`, and
   `LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO` (all default true).
+- **VRAM guard (music direction).** Music generation (MiniMax Music 3,
+  ≈ 10 GiB peak with the Q4 component mix) gets the same whole-GPU
+  treatment as image: a `/v1/audio/music` request stops chat, TTS/ASR,
+  embedding, and the image server first; the next chat/audio/image request
+  stops the music server in turn. Controlled by `LLAMASWAP_UNLOAD_ON_MUSIC`,
+  `LLAMASWAP_UNLOAD_MUSIC_ON_LLM`, `LLAMASWAP_UNLOAD_MUSIC_ON_AUDIO`, and
+  `LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC` (all default true).
+- **Streaming TTS/ASR.** Backends configured with audio.cpp's
+  `mode: streaming` answer OpenAI-shaped SSE surfaces: `/v1/audio/speech/stream`
+  (audio chunks `speech.audio.delta` → `speech.audio.done`) and
+  `/v1/audio/transcriptions/stream` (transcription deltas). llamaswap
+  relays both unbuffered; offline backends are refused with a clear error
+  instead of degrading silently.
 - **Registry.** Every file in `backend/` is one model: the exact
   binary + arguments + env + port. Add a file, reload, done. Works for any
   OpenAI-compatible backend, not just llama-server.
@@ -268,8 +289,9 @@ flowchart TD
 
     R -->|"/v1/chat/completions /v1/completions"| CH
     R -->|"/v1/embeddings"| EM
-    R -->|"/v1/audio/speech /transcriptions ..."| AU
+    R -->|"/v1/audio/speech /stream /transcriptions /stream ..."| AU
     R -->|"/v1/images/generations /v1/images/edits"| IM
+    R -->|"/v1/audio/music"| MU
     R -->|"/v1/reset"| RS
     R -->|"/v1/models /health"| OUT
 
@@ -299,10 +321,17 @@ flowchart TD
     end
 
     subgraph IM["Image path (text-to-image / edit)"]
-        IM1["extract model<br/>default: first of role"] --> IM2["unload chat + TTS + ASR + embedding<br/>(unload_on_image)"]
+        IM1["extract model<br/>default: first of role"] --> IM2["unload chat + TTS + ASR + embedding + music<br/>(unload_on_image + unload_on_music)"]
         IM2 --> IM3["image manager: boot / swap<br/>sd-server, await /v1/models"]
         IM3 --> IM4["proxy image response"]
         IM4 --> OUT
+    end
+
+    subgraph MU["Music path (audio.cpp gen families)"]
+        MU1["extract model + caption/lyrics<br/>caption validated pre-load"] --> MU2["unload chat + TTS + ASR + embedding + image<br/>(unload_on_music + unload_image_on_music)"]
+        MU2 --> MU3["music manager: boot / swap<br/>audiocpp_server, await /health"]
+        MU3 --> MU4["POST /v1/tasks/run<br/>base64 WAV -> binary audio<br/>ffmpeg transcode response_format"]
+        MU4 --> OUT
     end
 
     subgraph EM["Embedding path"]
@@ -1009,18 +1038,20 @@ the reference, and `-o`/`--out` sets the output. Run
 | `POST /v1/responses` | OpenAI Responses API; proxies to llama-server's `/v1/responses` (streaming via `stream: true`). Requires a llama-server build that exposes the responses route |
 | `POST /v1/embeddings` | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path |
 | `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out. `response_format` (mp3/opus/aac/flac/pcm/wav) is transcoded from WAV internally via ffmpeg |
-| `POST /v1/audio/speech/stream` | Streaming TTS: chunked audio passthrough (backend codec) |
+| `POST /v1/audio/speech/stream` | Streaming TTS: relays audio.cpp's OpenAI-shaped audio SSE (`speech.audio.delta` base64-PCM chunks → `speech.audio.done`) unbuffered; needs a `mode: streaming` backend (e.g. `supertonic-3-stream`) — offline backends get a clear refusal |
 | `POST /v1/audio/transcriptions` | ASR (`role: asr`); OpenAI multipart upload → `{"text": ...}`. `response_format` = `json`/`text`/`srt`/`vtt`/`verbose_json` is honoured by the proxy regardless of backend |
+| `POST /v1/audio/transcriptions/stream` | Streaming ASR: OpenAI-shaped transcription SSE (`transcript.text.delta` → `transcript.text.done`); `mode: streaming` backends (e.g. `nemotron-asr-stream`, `qwen3-asr-stream`); multipart-only backends refused with 400 |
+| `POST /v1/audio/music` | Music generation (`role: music`, e.g. `minimax-music3` via audio.cpp): structured caption + lyrics in, binary WAV out; extras (seed, num_inference_steps, ...) pass through to the backend |
 | `POST /v1/audio/translations` | ASR translate-to-English (whisper.cpp supports via a `translate` form field; others pass through). Same `response_format` normalisation as transcriptions |
-| `GET /v1/audio/voices` | List TTS voices (boots the first configured TTS model if not running) |
+| `GET /v1/audio/voices` | List TTS voices; `?model=<id>` selects/boots a specific backend — supertonic-3 reports built-ins F1..F5/M1..M5, clone models grow cached/voice-dir lists |
 | `POST /v1/registry/reload` | Re-read `backend/*.yaml` (admin) |
 | `GET /v1/registry/info` | Registry summary: roles, VRAM ranking, warnings, degraded conditions |
-| `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
-| `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image status, plus registry warnings/degraded |
+| `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, the image and music servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
+| `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image, and music status, plus registry warnings/degraded |
 | `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests) |
 | `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
 | `GET /api/tags` | Ollama-compatible model list (one entry per registry model, with `size`, `digest`, `details`) |
-| `GET /api/ps` | Ollama-compatible running-models list (chat LLM, embedding, TTS/ASR, image that are resident now, with `expires_at` from the idle unloader) |
+| `GET /api/ps` | Ollama-compatible running-models list (chat LLM, embedding, TTS/ASR, image, music that are resident now, with `expires_at` from the idle unloader) |
 
 ### Examples
 
