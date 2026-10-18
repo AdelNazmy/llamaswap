@@ -503,8 +503,15 @@ MODEL_ROOT=/opt/models ./scripts/download-models.sh flux-schnell flux-vae flux-c
 Requirements: Docker with the NVIDIA container runtime on a CUDA host, and
 the model weights volume (default `/opt/models`, override with `MODEL_ROOT`).
 Keys/settings come from the same `.env` surface as the local build
-(`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...). The compose file publishes
-`11434`, `9090` and `1234`, all mapped to the container's `11434`.
+(`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...).
+
+Published ports — one listener (container `11434`), three host aliases:
+
+| Port | Purpose |
+|---|---|
+| `11434` | OpenAI-compatible API + admin dashboard (Ollama-style port; overridable via `LLAMASWAP_PORT`) |
+| `1234` | llama.cpp's default port — point llama.cpp clients straight at it |
+| `9090` | legacy graphify port kept for existing integrations |
 
 Verify:
 

@@ -40,6 +40,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY backend ./backend
 
-EXPOSE 11434
+# The container listens on 11434 only; docker-compose.yml publishes it on
+# the host as 11434 (default, LLAMASWAP_PORT-overridable), 9090 (legacy
+# graphify port) and 1234 (llama.cpp default port). EXPOSE documents all
+# three aliases for tooling/UX; they are the same listener.
+EXPOSE 1234 11434 9090
 
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11434"]
