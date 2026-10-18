@@ -31,6 +31,7 @@ services:
       LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
       LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS:-}"
       LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS:-}"
+      LLAMASWAP_IDLE_UNLOAD_MUSIC_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_MUSIC_SECONDS:-}"
       # While tts AND asr are both loaded, serve only the smallest chat
       # LLM (weights-file size) instead of the requested one.
       LLAMASWAP_AUDIO_VRAM_GUARD: "${LLAMASWAP_AUDIO_VRAM_GUARD:-true}"
@@ -42,6 +43,10 @@ services:
       LLAMASWAP_UNLOAD_ON_IMAGE: "${LLAMASWAP_UNLOAD_ON_IMAGE:-true}"
       LLAMASWAP_UNLOAD_IMAGE_ON_LLM: "${LLAMASWAP_UNLOAD_IMAGE_ON_LLM:-true}"
       LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO: "${LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO:-true}"
+      LLAMASWAP_UNLOAD_ON_MUSIC: "${LLAMASWAP_UNLOAD_ON_MUSIC:-true}"
+      LLAMASWAP_UNLOAD_MUSIC_ON_LLM: "${LLAMASWAP_UNLOAD_MUSIC_ON_LLM:-true}"
+      LLAMASWAP_UNLOAD_MUSIC_ON_AUDIO: "${LLAMASWAP_UNLOAD_MUSIC_ON_AUDIO:-true}"
+      LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC: "${LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC:-true}"
       # Boot the embedding server at startup (octen-embedding). Default
       # false: launch it on first use like the chat/TTS/ASR/image endpoints
       # (nothing holds VRAM until an embedding request arrives).

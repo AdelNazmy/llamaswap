@@ -55,7 +55,7 @@ class ModelMeta(BaseModel):
     model_config = {"extra": "allow"}
 
 
-ROLES = {"llm", "embedding", "tts", "asr", "image"}
+ROLES = {"llm", "embedding", "tts", "asr", "image", "music"}
 # Request dialects the proxy knows how to translate to/from.
 REQUEST_FORMATS = {"json", "multipart", "json_path"}
 
@@ -69,6 +69,7 @@ class ModelConfig(BaseModel):
       "tts"       — on-demand TTS server (RoleServerManager)
       "asr"       — on-demand ASR server (RoleServerManager)
       "image"     — on-demand image-generation server (RoleServerManager)
+      "music"     — on-demand music-generation server (RoleServerManager)
     """
 
     name: str

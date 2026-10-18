@@ -39,3 +39,7 @@ meta:
   family: supertonic
   capabilities: [tts]
   request_format: json
+  # Built-in preset voices (embedded voice_style_* resources in the GGUF,
+  # surfaced here because audio.cpp's /v1/audio/voices only reports
+  # cached/embedded-embedding voices, not built-in family presets).
+  preset_voices: [F1, F2, F3, F4, F5, M1, M2, M3, M4, M5]

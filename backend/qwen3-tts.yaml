@@ -39,6 +39,9 @@ meta:
   family: qwen3_tts
   capabilities: [tts, clone]
   request_format: json
+  # No built-in preset voices — the Base model is a cloning TTS: every
+  # request synthesizes from the reference WAV + transcript below.
+  # /v1/audio/voices lists cached clone voices only.
   # Qwen3-TTS Base clones a target voice from reference audio. The proxy
   # injects this WAV as the audio.cpp `voice_ref` (resolved to an absolute
   # server-side path at request time) for every /v1/audio/speech request,

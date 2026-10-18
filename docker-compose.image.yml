@@ -9,9 +9,9 @@
 #
 #   sdcpp-bin:  /opt/stable-diffusion.cpp/build/bin  (sd-server)
 #
-# On `up`, the image-models-init one-shot service downloads the FLUX
-# weights into the shared /opt/models directory (host dir) before llamaswap
-# starts. You can also run it manually:
+# On `up`, the image-models-init one-shot service downloads the FLUX and
+# Qwen-Image 2.1 weights into the shared /opt/models directory (host dir)
+# before llamaswap starts. You can also run it manually:
 #   docker compose -f docker-compose.yml -f docker-compose.image.yml run --rm image-models-init
 #
 # Usage:
@@ -36,7 +36,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - "apk add --no-cache curl aria2 >/dev/null 2>&1 && exec sh /scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl"
+      - "apk add --no-cache curl aria2 >/dev/null 2>&1 && exec sh /scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae"
 
   llamaswap:
     build:

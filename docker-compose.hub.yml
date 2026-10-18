@@ -1,0 +1,105 @@
+# Run llamaswap directly from the Docker Hub image (no local build):
+#
+#   docker compose -f docker-compose.hub.yml up -d
+#
+# The published image (docker.io/adelnazmy2002/llamaswap:latest) already
+# contains the audio/image overlay binaries — audiocpp_server (TTS/ASR/music,
+# incl. minimax_music3), whisper-server and sd-server (FLUX + Qwen-Image 2.1)
+# — so no opt-in overlays are needed and nothing is compiled locally.
+#
+# What is NOT in the image: model weights (~30 GB). Same as the local
+# deployment, they live in /opt/models on the host; point the volume at an
+# existing copy or let the models-init one-shot download the default
+# TTS/ASR/music bundle set:
+#
+#   docker compose -f docker-compose.hub.yml run --rm models-init
+#
+# Requirements: Docker with the NVIDIA container runtime (the container
+# reserves all GPUs for CUDA backends) and the model weights volume.
+
+services:
+  llamaswap:
+    # Same image that adelnazmy2002/llamaswap:latest publishes —
+    # pulled from Docker Hub, never built locally.
+    image: adelnazmy2002/llamaswap:latest
+    init: true
+    container_name: llamaswap
+    restart: unless-stopped
+    ports:
+      # Published twice: the repo-default port (overridable via
+      # LLAMASWAP_PORT) plus the legacy graphify port 9090. The container
+      # itself always listens on 11434.
+      - ${LLAMASWAP_PORT:-11434}:11434
+      - 9090:11434
+      - 1234:11434
+    environment:
+      LLAMASWAP_HOST: "${LLAMASWAP_HOST:-0.0.0.0}"
+      LLAMASWAP_PORT: "${LLAMASWAP_PORT:-11434}"
+      LLAMASWAP_BACKEND_DIR: "${LLAMASWAP_BACKEND_DIR:-backend}"
+      LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-600.0}"
+      LLAMASWAP_STOP_TIMEOUT: "${LLAMASWAP_STOP_TIMEOUT:-30.0}"
+      LLAMASWAP_HEALTH_INTERVAL: "${LLAMASWAP_HEALTH_INTERVAL:-1.0}"
+      # Unload the chat LLM AND audio (tts/asr) servers after this many
+      # idle seconds; only the embedding server stays up.
+      LLAMASWAP_IDLE_UNLOAD_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_SECONDS:-300}"
+      LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS:-}"
+      LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS:-}"
+      LLAMASWAP_IDLE_UNLOAD_MUSIC_SECONDS: "${LLAMASWAP_IDLE_UNLOAD_MUSIC_SECONDS:-}"
+      # While tts AND asr are both loaded, serve only the smallest chat
+      # LLM (weights-file size) instead of the requested one.
+      LLAMASWAP_AUDIO_VRAM_GUARD: "${LLAMASWAP_AUDIO_VRAM_GUARD:-true}"
+      # Reject TTS/ASR (409) while a big chat LLM (anything other than the
+      # smallest by weights-file size) is loaded.
+      LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM: "${LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM:-true}"
+      # Unload TTS/ASR when a big chat LLM is requested (embedding stays up).
+      LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM: "${LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM:-true}"
+      LLAMASWAP_UNLOAD_ON_IMAGE: "${LLAMASWAP_UNLOAD_ON_IMAGE:-true}"
+      LLAMASWAP_UNLOAD_IMAGE_ON_LLM: "${LLAMASWAP_UNLOAD_IMAGE_ON_LLM:-true}"
+      LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO: "${LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO:-true}"
+      LLAMASWAP_UNLOAD_ON_MUSIC: "${LLAMASWAP_UNLOAD_ON_MUSIC:-true}"
+      LLAMASWAP_UNLOAD_MUSIC_ON_LLM: "${LLAMASWAP_UNLOAD_MUSIC_ON_LLM:-true}"
+      LLAMASWAP_UNLOAD_MUSIC_ON_AUDIO: "${LLAMASWAP_UNLOAD_MUSIC_ON_AUDIO:-true}"
+      LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC: "${LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC:-true}"
+      LLAMASWAP_EMBEDDING_AUTO_START: "${LLAMASWAP_EMBEDDING_AUTO_START:-false}"
+      LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
+      LLAMASWAP_LOG_JSON: "${LLAMASWAP_LOG_JSON:-false}"
+      LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
+      LLAMASWAP_API_KEY: "${LLAMASWAP_API_KEY:-}"
+      LLAMASWAP_ADMIN_KEY: "${LLAMASWAP_ADMIN_KEY:-}"
+      LLAMASWAP_MAX_CONCURRENCY: "${LLAMASWAP_MAX_CONCURRENCY:-0}"
+    volumes:
+      # Model weights on host (/opt/models). rw because the optional
+      # models-init services below download into it.
+      - ${MODEL_ROOT:-/opt/models}:/opt/models
+      # Staging area for multipart audio uploads (audio.cpp transcriptions).
+      - /tmp/llamaswap-audio:/tmp/llamaswap-audio
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+
+  # One-shot weight download (tts/asr/music default bundle set) into the
+  # shared model root. Not wired as a dependency — run it explicitly before
+  # or after `up` (llamaswap boots immediately and just 404s/503s roles
+  # whose weights are still missing):
+  #   docker compose -f docker-compose.hub.yml run --rm models-init
+  # Requires this file to be run from a checkout of the llamaswap
+  # repository (it mounts ./scripts).
+  models-init:
+    image: alpine:3.20
+    container_name: llamaswap-hub-models-init
+    init: true
+    restart: "no"
+    environment:
+      MODEL_ROOT: /opt/models
+    volumes:
+      - ./scripts:/scripts:ro
+      - ${MODEL_ROOT:-/opt/models}:/opt/models
+    command:
+      - /bin/sh
+      - -c
+      - "apk add --no-cache curl aria2 >/dev/null 2>&1 && exec sh /scripts/download-models.sh"

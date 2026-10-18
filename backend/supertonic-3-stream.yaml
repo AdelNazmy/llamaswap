@@ -1,0 +1,56 @@
+# TTS model — live streaming variant: Supertonic 3 (Q8_0) via audio.cpp
+#
+# Same weights as supertonic-3 but configured with mode: "streaming" so
+# audio.cpp can synthesize chunk-by-chunk through the onc /v1/audio/speech
+# streaming surface, which llamaswap exposes at /v1/audio/speech/stream:
+#
+#   curl -N localhost:11434/v1/audio/speech/stream \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model": "supertonic-3-stream", "input": "Hello live audio."}'
+#
+# The proxy injects stream: true and relays the OpenAI-shaped SSE
+# (speech.audio.delta events with base64 PCM16 @ 44.1 kHz mono chunks for
+# supertonic, then speech.audio.done + [DONE]) unbuffered. Use response_format
+# "pcm" (default) — offline codecs (mp3/...) are a buffered operation and
+# ignored on the streaming path. stream_format "audio" may be passed through
+# for raw chunked PCM bytes instead of SSE.
+#
+# Swaps against the other tts models like any backend; idle-unloads like
+# its offline sibling.
+#
+# Managed by the RoleServerManager (on-demand per-role server, role: tts).
+# Same model install as supertonic-3:
+#   ./scripts/download-models.sh supertonic_3
+name: supertonic-3-stream
+description: "Supertonic 3 Q8_0 (audio.cpp, streaming mode) — live chunked TTS"
+role: tts
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+    - "--model-spec-override"
+    - "/opt/audio.cpp/model_specs"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: supertonic
+        path: /opt/models/Supertonic-3-GGUF/supertonic-3-q8_0.gguf
+        task: tts
+        mode: streaming
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8112
+meta:
+  family: supertonic
+  capabilities: [tts, streaming]
+  request_format: json
+  # Built-in preset voices (same embedded voice_style_* resources as the
+  # offline supertonic-3).
+  preset_voices: [F1, F2, F3, F4, F5, M1, M2, M3, M4, M5]

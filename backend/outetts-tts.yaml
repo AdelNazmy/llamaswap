@@ -48,3 +48,8 @@ meta:
   family: outetts
   capabilities: [tts, clone]
   request_format: json
+  # No built-in preset voices (audio.cpp docs: "Built-in voices: not
+  # exposed"); synthesis is text-only or voice-cloned from a reference
+  # WAV (`meta.reference_voice`, injected by the proxy for `clone`
+  # models). /v1/audio/voices lists cached clone voices and any *.wav in
+  # a voice_dir once configured — not this model's presets.

@@ -1,0 +1,71 @@
+# Image-generation model: Qwen-Image 2.1 Uncensored (Q4_K_M GGUF) via
+# stable-diffusion.cpp
+#
+# GGUF quantizations of hf.co/Qwen/Qwen-Image-2.1 with the text encoder
+# and VAE from the same repo (source: hf.co/abenzerps/
+# Qwen-Image-2.1-Uncensored-Quantized). Qwen-Image-2.1 uses Qwen3-VL-8B
+# as the text encoder and a dedicated VAE (the earlier Qwen-Image / Wan
+# 2.2 VAE weights are NOT interchangeable).
+#
+# Alternative switchable image backend alongside flux-schnell (same
+# role "image", same swap port 8109 — allowed within one role because
+# the RoleServerManager swaps between them; a request naming this model
+# stops FLUX and vice versa).
+#
+# VRAM: qwen-image-2.1-UC-Q4_K_M.gguf is 4.6 GB; the text encoder runs
+# on CPU (int8 ConvRot, ~9.35 GB in RAM) so a 16 GB card fits the
+# diffusion model + bf16 VAE comfortably once the image VRAM guard has
+# unloaded every other server (LLAMASWAP_UNLOAD_ON_IMAGE). Generation
+# defaults: cfg 6.0, euler. For higher quality, swap the Q4_K_M file
+# for qwen-image-2.1-UC-Q8_0.gguf (7.6 GB, same repo).
+#
+# Note: /v1/images/edits (image editing) additionally needs vision
+# weights (--llm_vision mmproj-Qwen3VL-8B-Instruct-F16.gguf); this
+# config only enables text-to-image.
+#
+# Backend binary (see README "Building stable-diffusion.cpp (image)").
+#
+# Install the model files (scripts/download-models.sh):
+#   ./scripts/download-models.sh qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae
+name: qwen-image-2.1-uc
+description: "Qwen-Image 2.1 Uncensored Q4_K_M GGUF (stable-diffusion.cpp) — text-to-image"
+role: image
+command:
+  binary: /opt/stable-diffusion.cpp/build/bin/sd-server
+  # sd-server spells its listen flags differently from --host/--port.
+  host_arg: "--listen-ip"
+  port_arg: "--listen-port"
+  args:
+    - "--diffusion-model"
+    - "/opt/models/Qwen-Image-2.1-Uncensored-Quantized/qwen-image-2.1-UC-Q4_K_M.gguf"
+    # Qwen3-VL-8B text encoder (int8 ConvRot quantization).
+    - "--llm"
+    - "/opt/models/Qwen-Image-2.1-Uncensored-Quantized/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+    - "--vae"
+    - "/opt/models/Qwen-Image-2.1-Uncensored-Quantized/vae/qwen_image_2.1_vae_bf16.safetensors"
+    - "--cfg-scale"
+    - "6.0"
+    - "--sampling-method"
+    - "euler"
+    # Random seed per generation (OpenAI images API has no seed field).
+    - "--seed"
+    - "-1"
+    # Diffusion model + VAE on the GPU; the Qwen3-VL-8B text encoder on
+    # CPU (~9 GB stays in RAM, text encoding runs once per prompt).
+    - "--diffusion-fa"
+    - "--backend"
+    - "diffusion=cuda0,vae=cuda0,te=cpu"
+    - "-v"
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+# Shared with flux-schnell (same role "image" — the registry allows a
+# duplicate listen address only within one role).
+port: 8109
+meta:
+  family: qwen_image
+  capabilities: [image, text-to-image]
+  request_format: json
+  # sd-server exposes no dedicated /health route; /v1/models is a stable
+  # readiness probe (the port only opens after model load completes).
+  health_path: /v1/models

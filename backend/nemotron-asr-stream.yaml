@@ -1,0 +1,46 @@
+# ASR — live-streaming variant: Nemotron 3.5 ASR 0.6B (Q8_0) via audio.cpp,
+# mode: streaming — serves /v1/audio/transcriptions/stream (OpenAI-style
+# transcription SSE). Offline sibling / same weights: nemotron-asr.
+#
+# NVIDIA 600M streaming ASR: low-latency transcription across 40
+# language-locales with native punctuation, capitalization and automatic
+# language detection. Launched in streaming mode so audio.cpp answers the
+# transcription route with OpenAI-style segment deltas.
+#
+# Like qwen3-asr, audio.cpp's transcription endpoint is NOT OpenAI-
+# multipart: it takes a JSON body whose `file` is a server-side path
+# (request_format: json_path). llamaswap hides this — it accepts the
+# standard OpenAI multipart upload, saves the audio to
+# LLAMASWAP_AUDIO_TMP_DIR, rewrites the request into audio.cpp's dialect
+# and forwards it.
+#
+# Install (already present for the offline sibling):
+#   ./scripts/download-models.sh nemotron_asr
+name: nemotron-asr-stream
+description: "Nemotron 3.5 ASR Streaming 0.6B Q8_0 (audio.cpp, streaming mode) — live transcription SSE"
+role: asr
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: nemotron_asr
+        path: /opt/models/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf
+        task: asr
+        mode: streaming
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8113
+meta:
+  family: nemotron_asr
+  capabilities: [asr, streaming]
+  request_format: json_path

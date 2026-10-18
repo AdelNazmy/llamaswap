@@ -1,0 +1,44 @@
+# ASR — live-streaming variant: Qwen3-ASR 0.6B via audio.cpp, mode:
+# streaming — serves /v1/audio/transcriptions/stream (OpenAI-style
+# transcription SSE). Offline sibling / same weights: qwen3-asr.
+#
+# Streaming-capable family (audio.cpp catalog: "GGUF 16/Q8, Stream") —
+# the model emits transcription segments as they are recognized, so the
+# proxy can relay OpenAI-shaped SSE deltas unbuffered.
+#
+# audio.cpp's transcription endpoint is NOT OpenAI-multipart: it takes a
+# JSON body whose `file` is a server-side path. llamaswap accepts the
+# standard OpenAI multipart upload, saves the audio to
+# LLAMASWAP_AUDIO_TMP_DIR, rewrites the request into audio.cpp's dialect
+# and forwards it (request_format: json_path selects that behaviour).
+#
+# Install (already present for the offline sibling):
+#   ./scripts/download-models.sh asr
+name: qwen3-asr-stream
+description: "Qwen3-ASR 0.6B (audio.cpp, streaming mode) — live transcription SSE"
+role: asr
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: qwen3_asr
+        path: /opt/models/Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf
+        task: asr
+        mode: streaming
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8114
+meta:
+  family: qwen3_asr
+  capabilities: [asr, streaming]
+  request_format: json_path

@@ -13,6 +13,13 @@ The OpenAI **audio API** is served by per-role TTS/ASR servers
 between backends per request — e.g. audio.cpp's Qwen3-ASR vs
 whisper.cpp's whisper-server — without touching the loaded chat LLM.
 
+**Image generation** (`/v1/images/generations`, `/v1/images/edits`) is
+served by an on-demand diffusion server (stable-diffusion.cpp's `sd-server`)
+with switchable backends (FLUX.1-schnell, Qwen-Image 2.1). **Music
+generation** (MiniMax Music 3) is served by `/v1/audio/music`, a small JSON
+dialect translated to audio.cpp's generic generation endpoint (caption +
+lyrics in, WAV song out).
+
 **The embedding server is persistent by default** (set
 `LLAMASWAP_EMBEDDING_AUTO_START=false` to make it on-demand like the
 others). The chat LLM and every TTS/ASR server are on-demand: nothing
@@ -72,16 +79,18 @@ Read it left to right:
 
 ### The VRAM guard — complete behavior
 **One invariant drives everything, Heaviness decides who loses.**
->The image
+The image
 server (FLUX ≈ 12 GB) is the heaviest tenant — it evicts whoever is
-resident when *it* loads, and it is evicted by every *other* request. A
+resident when *it* loads, and it is evicted by every *other* request. The
+music server (MiniMax Music 3 ≈ 10 GiB peak) sits just below it with the
+same whole-GPU behavior in both directions. A
 "big" chat LLM (anything larger than the smallest weights file, ≈ 7–13 GB)
 evicts audio but is never evicted *by* audio — audio is simply refused
 (`409`) while a big LLM holds the GPU. The embedding server (≈ 0.7 GB) is
 the most persistent: it survives chat/audio swaps and only yields to the
-image server (or a failed big-LLM load).
+image or music servers (or a failed big-LLM load).
 
-#### The four residents
+#### The five residents
 
 | Tenant | Manager | Lifetime |
 |---|---|---|
@@ -89,6 +98,7 @@ image server (or a failed big-LLM load).
 | Chat LLM | `ProcessManager` | on-demand, one at a time, idle-unloaded |
 | TTS / ASR | `RoleServerManager` ×2 | on-demand per role, idle-unloaded |
 | Image | `RoleServerManager` ×1 | on-demand, idle-unloaded |
+| Music | `RoleServerManager` ×1 | on-demand, idle-unloaded |
 
 `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default **300**) is the baseline: except
 embedding, every loaded server is shut down after that many seconds with no
@@ -98,13 +108,15 @@ requests (`0` disables idle unload).
 
 **Chat** (`/v1/chat/completions`, `/v1/completions`) — in order:
 
-1. Big LLM requested → stop TTS/ASR first (embedding stays up).
-   `unload_audio_on_big_llm` (true)
+1. Big LLM requested → stop TTS/ASR/music first (embedding stays up).
+   `unload_audio_on_big_llm` + `unload_on_music` (both true)
 2. Always unload the image server first (no-op if not loaded).
    `unload_image_on_llm` (true)
-3. If TTS *and* ASR are both still resident → serve the smallest LLM
+3. Always unload the music server first (no-op if not loaded).
+   `unload_music_on_llm` (true)
+4. If TTS *and* ASR are both still resident → serve the smallest LLM
    instead of the requested one. `audio_vram_guard` (true)
-4. Load the requested (or substituted) LLM. On load failure while embedding
+5. Load the requested (or substituted) LLM. On load failure while embedding
    is running: stop embedding, retry once, then best-effort relaunch
    embedding in the background.
 
@@ -120,22 +132,34 @@ requests (`0` disables idle unload).
    `block_audio_on_big_llm` (true)
 2. Unload the image server first (no-op if not loaded).
    `unload_image_on_audio` (true)
-3. Load/swap the requested audio role.
+3. Unload the music server first (no-op if not loaded).
+   `unload_music_on_audio` (true)
+4. Load/swap the requested audio role.
 
 This is the only path that returns `409` — and only against a big chat LLM,
-never against the image server.
+never against the image or music servers.
 
 **Image** (`/v1/images/generations`, `/v1/images/edits`):
 
 1. Stop chat LLM + TTS/ASR + embedding — free the whole GPU.
    `unload_on_image` (true)
-2. Load/swap the image server.
+2. Stop the music server too.
+   `unload_on_music` (true)
+3. Load/swap the image server.
+
+**Music** (`/v1/audio/music`):
+
+1. Stop chat LLM + TTS/ASR + embedding — free the whole GPU.
+   `unload_on_music` (true)
+2. Stop the image server first as well.
+   `unload_image_on_music` (true)
+3. Load/swap the music server.
 
 **Embedding** (`/v1/embeddings`): served directly by the dedicated server,
 never disturbs anything; if it was evicted it self-heals via
 `ensure_running()`.
 
-#### The six toggles
+#### The ten toggles
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -145,14 +169,18 @@ never disturbs anything; if it was evicted it self-heals via
 | `unload_on_image` | `true` | image load → evict chat + audio + embedding |
 | `unload_image_on_llm` | `true` | chat request → evict image |
 | `unload_image_on_audio` | `true` | audio request → evict image |
+| `unload_on_music` | `true` | music load → evict chat + audio + embedding; also evicted by image loads |
+| `unload_music_on_llm` | `true` | chat request → evict music |
+| `unload_music_on_audio` | `true` | audio request → evict music |
+| `unload_image_on_music` | `true` | music request → evict image |
 
 #### Embedding server — the special case
 
 The embedding server boots with the proxy and is **never** idle-unloaded. It
-is evicted in exactly two cases — an image request frees the whole GPU, and
-a big-LLM load fails and needs the VRAM for a retry — and it self-heals on
-the next `/v1/embeddings` request (directly) or the next chat request
-(background relaunch).
+is evicted in exactly three cases — an image or music request frees the
+whole GPU, and a big-LLM load fails and needs the VRAM for a retry — and it
+self-heals on the next `/v1/embeddings` request (directly) or the next chat
+request (background relaunch).
 
 #### Worked examples
 
@@ -167,6 +195,9 @@ the next `/v1/embeddings` request (directly) or the next chat request
   downgraded to the smallest LLM.
 - **Big LLM loaded, then audio:** audio is refused with `409`. With
   `block_audio_on_big_llm=false`, audio is allowed to stack and risks OOM.
+- **Music after chat:** the chat LLM, TTS/ASR, embedding, and image servers
+  are all stopped; MiniMax Music 3 loads with the whole GPU and generates
+  the song. The next chat/image/audio request unloads it again.
 
 No OOM roulette, no hidden GPU-driver eviction: every resident backend is
 either supported by an explicit rule, evicted by an explicit rule, or
@@ -283,7 +314,7 @@ flowchart TD
     end
 
     subgraph RS["Reset"]
-        RS1["unload chat + TTS + ASR + image + embedding"] --> RS2["return post-reset /health"]
+        RS1["unload chat + TTS + ASR + image + music + embedding"] --> RS2["return post-reset /health"]
         RS2 --> OUT
     end
 
@@ -303,7 +334,9 @@ llamaswap/
 │   ├── qwen3-asr.yaml        # ASR: Qwen3-ASR via audio.cpp (role: asr)
 │   ├── nemotron-asr.yaml     # ASR: Nemotron 3.5 ASR Streaming via audio.cpp
 │   ├── whisper-asr.yaml      # ASR: Whisper via whisper.cpp (role: asr)
-│   └── flux-schnell.yaml     # image: FLUX.1-schnell via sd-server (role: image)
+│   ├── flux-schnell.yaml     # image: FLUX.1-schnell via sd-server (role: image)
+│   ├── qwen-image-2.1-uc.yaml# image: Qwen-Image 2.1 Uncensored via sd-server (role: image)
+│   └── minimax-music3.yaml   # music: MiniMax Music 3 via audio.cpp (role: music)
 ├── app/
 │   ├── config.py             # settings (env prefix LLAMASWAP_)
 │   ├── registry.py           # YAML → validated ModelConfig objects
@@ -365,6 +398,7 @@ concurrently on different cards of a multi-GPU box.
 | `tts` | RoleServerManager | yes (among tts models) | `outetts`, `qwen3-tts`, `supertonic-3` |
 | `asr` | RoleServerManager | yes (among asr models) | `whisper-asr`, `qwen3-asr`, `nemotron-asr` |
 | `image` | RoleServerManager | yes (among image models) | `flux-schnell` |
+| `music` | RoleServerManager | yes (among music models) | `minimax-music3` |
 
 `role: llm` models are swapped on request by the normal path. A single
 `role: embedding` model runs persistently on its own port (usually `8102`)
@@ -382,6 +416,18 @@ the chat LLM). Each audio model needs its own port (`8103`+ recommended).
 `/v1/images/edits` (see `flux-schnell.yaml`; port `8109`), with the image
 VRAM guard unloading chat/audio before it — and vice-versa — so a
 diffusion model never shares the GPU.
+
+`role: music` works through `/v1/audio/music`, a small JSON dialect
+translated to audio.cpp's generic `POST /v1/tasks/run`:
+`{"model": "minimax-music3", "input": "<music caption>", "lyrics": "...",
+"duration": 30, "response_format": "wav"}` — any other field (seed,
+num_inference_steps, guidance_scale, ...) passes through to the backend
+request. The response is binary audio (`audio/wav` by default; other
+`response_format` codecs are transcoded via ffmpeg like `/v1/audio/speech`).
+
+`role: image` edits (`/v1/images/edits`) need vision weights for models
+whose text encoder is an LLM — add `--llm_vision .../mmproj...gguf` to the
+YAML; `flux-schnell`/`qwen-image-2.1-uc` as shipped are text-to-image only.
 
 `meta.request_format` tells the proxy which request dialect the backend
 speaks (default `json`):
@@ -599,10 +645,17 @@ trade-off for zh/en.
 #   flux-vae        FLUX VAE (ae.safetensors)
 #   flux-clip_l     FLUX clip_l text encoder
 #   flux-t5xxl      FLUX t5xxl text encoder (~10 GB)
+#   qwen-image-2.1-uc  Qwen-Image 2.1 Uncensored diffusion Q4_K_M GGUF (stable-diffusion.cpp)
+#   qwen-image-2.1-te  Qwen3-VL-8B int8 ConvRot text encoder (~9.35 GB)
+#   qwen-image-2.1-vae Qwen Image 2.1 VAE bf16
+#   music3-*        MiniMax Music 3 component package (config + GGUFs, ~7 GB)
 ./scripts/download-models.sh tts tts-qwen3 supertonic_3 asr nemotron_asr whisper
 
 # image generation (FLUX.1-schnell + shared encoders)
 ./scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl
+
+# Qwen-Image 2.1 (alternative image backend)
+./scripts/download-models.sh qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae
 ```
 
 The binary ends up at `build/bin/audiocpp_server`. The Docker overlay
@@ -1063,6 +1116,23 @@ curl -s localhost:11434/v1/audio/transcriptions \
 curl -s localhost:11434/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{"model": "flux-schnell", "prompt": "a cat piloting a tiny spaceship", "size": "1024x1024", "n": 1}'
+
+# Qwen-Image 2.1 — same endpoint, different backend (swaps FLUX out)
+curl -s localhost:11434/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen-image-2.1-uc", "prompt": "a red bicycle leaning on a brick wall", "size": "512x512"}'
+
+# music generation (MiniMax Music 3 via audio.cpp) — caption + lyrics in,
+# binary WAV out (unload_on_music frees the whole GPU before it loads)
+curl -s localhost:11434/v1/audio/music \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "minimax-music3",
+    "input": "A bright pop rock song with clean drums and a clear male vocal.",
+    "lyrics": "[verse] City lights are shining low.\n[chorus] Turn it up and let it fly.",
+    "duration": 30,
+    "response_format": "wav"
+  }' -o song.wav
 ```
 
 OpenAI SDK:
@@ -1096,13 +1166,22 @@ with open("speech.wav", "rb") as fh:
     print(tr.text)
 
 # image generation
-import base64
 img = client.images.generate(
-    model="flux-schnell",
+    model="qwen-image-2.1-uc",
     prompt="a cat piloting a tiny spaceship",
     size="1024x1024",
 )
 open("cat.png", "wb").write(base64.b64decode(img.data[0].b64_json))
+
+# music generation (no OpenAI SDK surface — plain JSON endpoint)
+import requests
+r = requests.post("http://localhost:11434/v1/audio/music", json={
+    "model": "minimax-music3",
+    "input": "A bright pop rock song with clean drums and a clear male vocal.",
+    "lyrics": "[verse] City lights are shining low.\n[chorus] Turn it up and let it fly.",
+    "duration": 30,
+})
+open("song.wav", "wb").write(r.content)
 ```
 
 ## Authentication, metrics & operations

@@ -52,6 +52,19 @@ class Settings(BaseSettings):
     unload_on_image: bool = True
     unload_image_on_llm: bool = True
     unload_image_on_audio: bool = True
+    # Music-generation VRAM guard. Music models (e.g. MiniMax Music 3, peak
+    # ~10 GiB with the Q4 component mix) need most of the GPU, so by
+    # default:
+    #   * before loading the music server, stop the chat LLM, TTS/ASR,
+    #     and embedding servers first to free the whole GPU
+    #   * before serving any chat request, stop the music server
+    #   * before serving any TTS/ASR request, stop the music server
+    #   * before serving any image request, stop the music server
+    #     (and vice versa: an image request stops the music server too)
+    unload_on_music: bool = True
+    unload_music_on_llm: bool = True
+    unload_music_on_audio: bool = True
+    unload_image_on_music: bool = True
     # The embedding server (role: embedding, e.g. octen-embedding) is
     # launched automatically at boot and kept running for the lifetime of
     # the proxy (only stopped to free VRAM for an LLM or the image server).
@@ -70,9 +83,11 @@ class Settings(BaseSettings):
     # wants a much shorter residency than a chat LLM.
     idle_unload_audio_seconds: Optional[float] = None
     idle_unload_image_seconds: Optional[float] = None
+    idle_unload_music_seconds: Optional[float] = None
 
     @field_validator(
-        "idle_unload_audio_seconds", "idle_unload_image_seconds", mode="before"
+        "idle_unload_audio_seconds", "idle_unload_image_seconds",
+        "idle_unload_music_seconds", mode="before",
     )
     @classmethod
     def _empty_string_to_none(cls, value):

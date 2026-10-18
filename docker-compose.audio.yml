@@ -15,7 +15,8 @@
 #
 # On `up`, the models-init one-shot service downloads the missing model
 # weights into the shared /opt/models directory (host dir) before llamaswap
-# starts. You can also run it manually:
+# starts (the script's default bundle set includes TTS/ASR and MiniMax
+# Music 3 music generation). You can also run it manually:
 #   docker compose -f docker-compose.yml -f docker-compose.audio.yml run --rm models-init
 services:
   models-init:

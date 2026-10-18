@@ -1,0 +1,65 @@
+# Music-generation model: MiniMax Music 3 (GGUF component package) via
+# audio.cpp audiocpp_server
+#
+# MiniMax Music 3 is a text-to-music model with lyrics conditioning: a
+# caption plus lyrics go in, a full stereo 44.1 kHz song comes out (the
+# GGUF package ships a Qwen3-8B AR language model, an RVQ depth decoder,
+# a 36-layer flow-matching transformer, a condition encoder, and a
+# vocoder). Upstream: hf.co/MiniMaxAI/MiniMax-Music3 (GGUF:
+# hf.co/audio-cpp/MiniMax-Music3-GGUF).
+#
+# NOT an OpenAI surface: music lives on a custom /v1/audio/music endpoint
+# that llamaswap translates to audio.cpp's generic POST /v1/tasks/run
+# (see _route_music in app/main.py). Lyrics are a required request option.
+#
+# The `path` is the model DIRECTORY (component package), not a single
+# GGUF. The default audio.cpp component mix is Q4_0 (language model +
+# flow transformer) / Q8_0 (RVQ depth decoder): ~9.8 GiB peak VRAM —
+# highest-VRAM audio workload after FLUX, so the music VRAM guard unloads
+# the chat LLM, TTS/ASR, embedding, and image servers first
+# (LLAMASWAP_UNLOAD_ON_MUSIC).
+#
+# Managed by the RoleServerManager (on-demand per-role server,
+# role: music).
+#
+# Requires an audio.cpp build with the minimax_music3 family (release
+# 0.7+; see README "Building audio.cpp (TTS + ASR)").
+#
+# Install the model (scripts/download-models.sh):
+#   ./scripts/download-models.sh music3-*
+#   # -> /opt/models/MiniMax-Music3-GGUF/{config,tokenizer,*.gguf}
+name: minimax-music3
+description: "MiniMax Music 3 GGUF component package (audio.cpp) — text-to-music song generation with lyrics"
+role: music
+command:
+  binary: /opt/audio.cpp/build/bin/audiocpp_server
+  args:
+    - "--config"
+    - "{config_path}"
+    - "--model-spec-override"
+    - "/opt/audio.cpp/model_specs"
+  config_json:
+    host: "{host}"
+    port: "{port}"
+    backend: cuda
+    device: 0
+    threads: 1
+    models:
+      - id: "{name}"
+        family: minimax_music3
+        path: /opt/models/MiniMax-Music3-GGUF
+        task: gen
+        mode: offline
+        # Music generation can run for minutes (a 5-minute song approaches
+        # realtime RTF); audio.cpp's default busy timeout is only 5 min.
+        busy_timeout_ms: 900000
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+host: 127.0.0.1
+port: 8110
+meta:
+  family: minimax_music3
+  capabilities: [music, lyrics, style_control]
+  request_format: json
+  # Declared footprint for the default Q4/Q8/Q4 component mix.
+  vram_gb: 10

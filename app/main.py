@@ -20,6 +20,11 @@ like the other on-demand servers:
     on first use, swaps between image models per request, and idle-unloads
     like the chat LLM; proxied through the OpenAI image endpoints
     (/v1/images/generations, /v1/images/edits).
+  * ``music`` — a music-generation server (RoleServerManager) that boots
+    on first use (e.g. MiniMax Music 3 via audio.cpp), swaps between
+    music models per request, and idle-unloads like the other roles;
+    proxied through /v1/audio/music (a JSON dialect translated to
+    audio.cpp's generic /v1/tasks/run).
 
 The OpenAI Responses API (``/v1/responses``) is proxied straight through to
 llama-server's responses route, alongside ``/v1/chat/completions`` and
@@ -44,6 +49,7 @@ server too (Settings.unload_image_on_audio).
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -52,7 +58,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -65,6 +71,7 @@ from .config import Settings, get_settings
 from .embedding_manager import EmbeddingLoadError, EmbeddingManager
 from .process_manager import ModelLoadError, ProcessManager
 from .proxy import (
+    _is_json,
     extract_model,
     extract_response_format,
     extract_speech_format,
@@ -150,6 +157,10 @@ def _runtime_state(request: Request, entry: dict) -> dict:
         st = request.app.state.image_manager.status()
         if st.get("model") == name:
             state = st.get("state", "stopped")
+    elif role == "music":
+        st = request.app.state.music_manager.status()
+        if st.get("model") == name:
+            state = st.get("state", "stopped")
     entry["state"] = state
     entry["loaded"] = state == "ready"
     return entry
@@ -220,6 +231,26 @@ async def lifespan(app: FastAPI):
     )
     app.state.image_manager.configure(app.state.registry.role_configs("image"))
 
+    # Music-generation manager: one on-demand server (swapped among the
+    # model configs of role "music", e.g. MiniMax Music 3 via audio.cpp),
+    # routed through the /v1/audio/music endpoint (translated to the
+    # backend's /v1/tasks/run). Nothing boots here; the first
+    # /v1/audio/music request launches it (see _route_music).
+    music_idle = (
+        settings.idle_unload_music_seconds
+        if settings.idle_unload_music_seconds is not None
+        else settings.idle_unload_seconds
+    )
+    app.state.music_manager = RoleServerManager(
+        "music",
+        startup_timeout=settings.startup_timeout,
+        stop_timeout=settings.stop_timeout,
+        health_interval=settings.health_interval,
+        idle_unload_seconds=music_idle,
+        config_dir=settings.audio_tmp_dir,
+    )
+    app.state.music_manager.configure(app.state.registry.role_configs("music"))
+
     # Dedicated embedding server: launched at boot and kept running for
     # the lifetime of the proxy (only stopped to free VRAM for an LLM),
     # unless LLAMASWAP_EMBEDDING_AUTO_START=false — then it boots on first
@@ -257,6 +288,7 @@ async def lifespan(app: FastAPI):
         for manager in app.state.audio_managers.values():
             await manager.shutdown()
         await app.state.image_manager.shutdown()
+        await app.state.music_manager.shutdown()
         if app.state.embedding_manager is not None:
             await app.state.embedding_manager.shutdown()
         await app.state.manager.shutdown()
@@ -275,7 +307,8 @@ def _health_snapshot(request: Request) -> dict:
     degraded = any(
         mgr.status().get("state") == "failed"
         for mgr in list(request.app.state.audio_managers.values())
-        + [request.app.state.image_manager, request.app.state.manager]
+        + [request.app.state.image_manager, request.app.state.music_manager,
+           request.app.state.manager]
     ) or bool(registry.degraded)
     return {
         "status": "degraded" if degraded else "ok",
@@ -290,6 +323,7 @@ def _health_snapshot(request: Request) -> dict:
             for role, manager in request.app.state.audio_managers.items()
         },
         "image": request.app.state.image_manager.status(),
+        "music": request.app.state.music_manager.status(),
         "registry": {
             "degraded": registry.degraded,
             "warnings": registry.warnings,
@@ -353,7 +387,7 @@ async def registry_info(request: Request):
         "models": registry.names(),
         "roles": {
             role: [c.name for c in registry.role_configs(role)]
-            for role in ("llm", "embedding", "tts", "asr", "image")
+            for role in ("llm", "embedding", "tts", "asr", "image", "music")
             if registry.role_configs(role)
         },
         "smallest_llm": registry.smallest_llm(),
@@ -373,11 +407,14 @@ async def reset(request: Request):
     chat_manager = request.app.state.manager
     audio_managers = request.app.state.audio_managers
     image_manager = request.app.state.image_manager
+    music_manager = request.app.state.music_manager
     embedding_manager = request.app.state.embedding_manager
 
     await chat_manager.unload()
     for mgr in audio_managers.values():
         await mgr.unload()
+    await image_manager.unload()
+    await music_manager.unload()
     await image_manager.unload()
     if embedding_manager is not None:
         await embedding_manager.stop()
@@ -423,15 +460,22 @@ async def _ensure_and_route(
     # LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM=false.
     if settings.unload_audio_on_big_llm and smallest is not None \
             and model != smallest:
-        logger.info("big model '%s' requested; unloading TTS/ASR", model)
+        logger.info("big model '%s' requested; unloading TTS/ASR/music", model)
         await asyncio.gather(*(
             mgr.unload() for mgr in request.app.state.audio_managers.values()
         ))
+        if settings.unload_on_music:
+            await request.app.state.music_manager.unload()
     # Image generation is the heaviest workload: stop the image server
     # before any chat request so the LLM fits (disable via
     # LLAMASWAP_UNLOAD_IMAGE_ON_LLM=false).
     if settings.unload_image_on_llm:
         await request.app.state.image_manager.unload()
+    # Music generation is heavy too (MiniMax Music 3 peaks around 10 GiB):
+    # stop the music server before any chat request (disable via
+    # LLAMASWAP_UNLOAD_MUSIC_ON_LLM=false).
+    if settings.unload_music_on_llm:
+        await request.app.state.music_manager.unload()
     # VRAM guard: while BOTH audio roles are loaded, only the smallest
     # chat LLM may be served (TTS + ASR + a big LLM may not fit on one
     # GPU). The requested model is transparently substituted and the swap
@@ -671,11 +715,16 @@ async def _route_audio(
                 "server_error",
             )
             return JSONResponse(status_code=status, content=payload)
-    # VRAM guard for image: a TTS/ASR request stops the image server
-    # first so audio never stacks on top of a diffusion model (FLUX etc.
-    # use most of the GPU). Disable via LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO=false.
+    # VRAM guard for image/music: a TTS/ASR request stops the image and
+    # music servers first so audio never stacks on top of a diffusion
+    # model (FLUX etc. use most of the GPU; disable via
+    # LLAMASWAP_UNLOAD_IMAGE_ON_AUDIO=false) or a music model (MiniMax
+    # Music 3 peaks around 10 GiB; disable via
+    # LLAMASWAP_UNLOAD_MUSIC_ON_AUDIO=false).
     if request.app.state.settings.unload_image_on_audio:
         await request.app.state.image_manager.unload()
+    if request.app.state.settings.unload_music_on_audio:
+        await request.app.state.music_manager.unload()
     try:
         cfg = await manager.ensure_model(model, registry)
     except RoleServerLoadError as exc:
@@ -695,9 +744,13 @@ async def _route_audio(
 
     # Backends whose transcription API expects a server-side file path
     # (audio.cpp) instead of the OpenAI multipart upload: translate.
+    # Applies to both /v1/audio/transcriptions and its streaming variant —
+    # audio.cpp's transcriptions stream (OpenAI-style transcription SSE) is
+    # driven by a `stream: true` flag on the same JSON-dialect route.
     translated: Optional[str] = None
     out_body = body
-    if backend_path == "/v1/audio/transcriptions" \
+    if backend_path in ("/v1/audio/transcriptions",
+                        "/v1/audio/transcriptions/stream") \
             and cfg.meta.request_format == "json_path":
         if "multipart/form-data" in content_type.lower():
             saved = save_audio_upload(body, content_type,
@@ -712,6 +765,8 @@ async def _route_audio(
                 "model": model,
                 "file": saved,
             }).encode()
+            if backend_path == "/v1/audio/transcriptions/stream":
+                out_body = json_inject_field(out_body, "stream", True)
             headers["Content-Type"] = "application/json"
         elif "application/json" in content_type.lower():
             # Client already sent the audio.cpp JSON dialect; pass through.
@@ -758,15 +813,59 @@ async def _route_audio(
             and "application/json" in content_type.lower():
         out_body = _apply_clone_reference(cfg, out_body)
 
+    # Whether a streaming relay branch took ownership of the staged-upload
+    # cleanup (its generator's finally removes the file after the body
+    # streams; a route-level finally would fire too early).
+    streaming_cleanup = False
     try:
+        if backend_path == "/v1/audio/transcriptions/stream":
+            # Streaming transcription: audio.cpp's transcriptions route with
+            # `stream: true` (mode=streaming ASR models) emits OpenAI-style
+            # transcription SSE — segments/words deltas, then done. Multipart
+            # backends (whisper-server) have no SSE surface: refuse clearly.
+            if cfg.meta.request_format == "multipart":
+                status, payload = _error(
+                    400,
+                    f"model '{model}' does not support streaming "
+                    "transcription (multipart backend)",
+                )
+                return JSONResponse(status_code=status, content=payload)
+            out_body = json_inject_field(out_body, "stream", True)
+
+            # NOTE: the staged upload must outlive the streaming response —
+            # a `finally` on the route coroutine runs when the
+            # StreamingResponse is *returned*, i.e. before the body
+            # streams and before the backend reads the file. Trail the
+            # cleanup on the relayed generator instead (the finally below
+            # only owns cleanup when no streaming relay took it over).
+            gen = proxy_raw_stream(
+                cfg.port, cfg.host, "/v1/audio/transcriptions",
+                out_body, headers,
+            )
+
+            async def relay():
+                try:
+                    async for chunk in gen:
+                        yield chunk
+                finally:
+                    remove_audio_upload(translated)
+            streaming_cleanup = True
+            return StreamingResponse(
+                relay(), media_type="text/event-stream"
+            )
         if backend_path == "/v1/audio/speech/stream":
             # Live chunked audio: stream bytes through without buffering.
+            # audio.cpp decides streaming on the request flags of its
+            # /v1/audio/speech route (stream+response_format=pcm on a
+            # mode=streaming model), so rewrite the llamaswap verb onto
+            # a fresh stream flag.
             # ``response_format`` transcoding is a buffered operation, so a
-            # non-wav format is ignored on the streaming path and the
+            # non-pcm format is ignored on the streaming path here and the
             # backend's native codec is relayed as-is.
             out_body = json_remove_key(out_body, "response_format")
+            out_body = json_inject_field(out_body, "stream", True)
             gen = proxy_raw_stream(
-                cfg.port, cfg.host, backend_path, out_body, headers
+                cfg.port, cfg.host, "/v1/audio/speech", out_body, headers
             )
             return StreamingResponse(
                 gen, media_type="application/octet-stream"
@@ -805,7 +904,8 @@ async def _route_audio(
             content=content, media_type=ctype, status_code=status
         )
     finally:
-        remove_audio_upload(translated)
+        if not streaming_cleanup:
+            remove_audio_upload(translated)
 
 
 def _maybe_json(data: bytes):
@@ -830,6 +930,11 @@ async def audio_transcriptions(request: Request):
     return await _route_audio(request, "asr", "/v1/audio/transcriptions")
 
 
+@app.post("/v1/audio/transcriptions/stream")
+async def audio_transcriptions_stream(request: Request):
+    return await _route_audio(request, "asr", "/v1/audio/transcriptions/stream")
+
+
 @app.post("/v1/audio/translations")
 async def audio_translations(request: Request):
     # OpenAI semantics: transcribe *and* translate to English. Backends
@@ -841,41 +946,227 @@ async def audio_translations(request: Request):
 
 
 @app.get("/v1/audio/voices")
-async def audio_voices(request: Request):
+async def audio_voices(request: Request, model: Optional[str] = None):
     """List voices from the TTS backend, booting the first configured TTS
-    model on demand so the endpoint is immediately useful."""
+    model on demand so the endpoint is immediately useful.
+
+    ``?model=<id>`` selects which TTS backend to query (and boots it if
+    needed) — families differ in what they report (e.g. supertonic lists
+    preset voices F1..F5/M1..M5, outetts has no presets and only grows a
+    cached-voice list via cloning).
+    """
     manager: RoleServerManager = request.app.state.audio_managers["tts"]
+    registry: Registry = request.app.state.registry
     cfg = manager.current_config
-    if not manager.is_running or cfg is None:
-        configs = request.app.state.registry.role_configs("tts")
-        if not configs:
-            status, payload = _error(
-                404, "no tts model configured", "server_error"
-            )
-            return JSONResponse(status_code=status, content=payload)
+    if model:
         try:
-            cfg = await manager.ensure_model(
-                configs[0].name, request.app.state.registry
-            )
-        except (RoleServerLoadError, UnknownModelError) as exc:
+            requested = registry.get(model)
+        except UnknownModelError as exc:
             status, payload = _error(
-                503, f"failed to load tts server: {exc}", "server_error"
+                404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
             )
             return JSONResponse(status_code=status, content=payload)
+        if requested.role != "tts":
+            status, payload = _error(
+                400, f"model '{model}' is not a tts model (role: {requested.role})"
+            )
+            return JSONResponse(status_code=status, content=payload)
+    if not manager.is_running or cfg is None or (model and cfg.name != model):
+        if model:
+            # A different TTS backend than the resident one was requested.
+            try:
+                cfg = await manager.ensure_model(model, registry)
+            except (RoleServerLoadError, UnknownModelError) as exc:
+                status, payload = _error(
+                    503, f"failed to load tts server: {exc}", "server_error"
+                )
+                return JSONResponse(status_code=status, content=payload)
+        else:
+            configs = registry.role_configs("tts")
+            if not configs:
+                status, payload = _error(
+                    404, "no tts model configured", "server_error"
+                )
+                return JSONResponse(status_code=status, content=payload)
+            try:
+                cfg = await manager.ensure_model(
+                    configs[0].name, registry
+                )
+            except (RoleServerLoadError, UnknownModelError) as exc:
+                status, payload = _error(
+                    503, f"failed to load tts server: {exc}", "server_error"
+                )
+                return JSONResponse(status_code=status, content=payload)
     headers = _fwd_headers(request)
+    # Seed the response with preset voices declared in the model config
+    # (e.g. supertonic's built-in F1..F5/M1..M5 styles — audio.cpp's
+    # voices listing only covers cached/embeddings/voice-dir voices).
+    preset_seed: Optional[list] = getattr(cfg.meta, "preset_voices", None)
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=5.0)
         ) as client:
             resp = await client.get(
-                f"http://{cfg.host}:{cfg.port}/v1/audio/voices",
+                f"http://{cfg.host}:{cfg.port}/v1/audio/voices?model={cfg.name}",
                 headers=headers,
             )
     except httpx.HTTPError as exc:
         status, payload = _error(502, f"voices lookup failed: {exc}")
         return JSONResponse(status_code=status, content=payload)
-    return Response(content=resp.content, media_type=resp.headers.get(
-        "content-type", "application/json"), status_code=resp.status_code)
+    voices_payload = resp.json() if _is_json(resp.content) else {}
+    merged: list = voices_payload.get("voices", [])
+    for v in preset_seed or []:
+        if v not in merged:
+            merged.append(v)
+    return JSONResponse(status_code=resp.status_code,
+                        content={"voices": merged})
+
+
+# ---------------------------------------------------------------------------
+# Music generation API (audio.cpp gen-task families via /v1/tasks/run)
+# ---------------------------------------------------------------------------
+
+async def _route_music(request: Request):
+    """Route a music-generation request to the on-demand music server.
+
+    Music models (audio.cpp ``minimax_music3``, ace_step, yue2, ...) are
+    not TTS: they take a caption + lyrics and return full songs, so there
+    is no OpenAI surface for them. llamaswap exposes a small JSON dialect
+    at ``/v1/audio/music`` and translates it to audio.cpp's generic
+    ``POST /v1/tasks/run``::
+
+        {"model": "minimax-music3",          # llamaswap registry name
+         "input":   "<music description>",   # caption (also: prompt|text)
+         "lyrics":  "[verse] ...",           # optional
+         "duration": 30,                     # optional (-> duration_sec)
+         "seed": 0, "response_format": "wav", ...}
+
+    Any other field is passed through into the backend ``request`` object
+    (num_inference_steps, guidance_scale, ar_guidance_scale, top_k, ...
+    — audio.cpp request options), so new family options work without
+    proxy changes. The response is binary audio (default WAV, transcoded
+    via ffmpeg like the TTS route when ``response_format`` names a
+    codec); the raw backend JSON is relayed when it carries no audio.
+
+    The model field selects which music backend to load; the server boots
+    on first use and idle-unloads like the other on-demand roles. Before
+    a music request the chat LLM, TTS/ASR, embedding, and image servers
+    are unloaded so the generator gets the whole GPU
+    (Settings.unload_on_music / unload_image_on_music).
+    """
+    registry: Registry = request.app.state.registry
+    manager: RoleServerManager = request.app.state.music_manager
+    settings: Settings = request.app.state.settings
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    try:
+        model = extract_model(body, content_type)
+    except Exception:  # noqa: BLE001
+        model = None
+    if model is None:
+        configs = registry.role_configs("music")
+        if not configs:
+            status, payload = _error(
+                404, "no music model configured", "server_error"
+            )
+            return JSONResponse(status_code=status, content=payload)
+        model = configs[0].name
+    try:
+        cfg = registry.get(model)
+    except UnknownModelError as exc:
+        status, payload = _error(
+            404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=payload)
+    if cfg.role != "music":
+        status, payload = _error(
+            400, f"model '{model}' is not a music model (role: {cfg.role})"
+        )
+        return JSONResponse(status_code=status, content=payload)
+
+    # VRAM guard: a music model wants most of the GPU, so stop the chat
+    # LLM, TTS/ASR, the embedding server, and the image server first.
+    # Disable via LLAMASWAP_UNLOAD_ON_MUSIC / LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC
+    # =false.
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        obj = None
+    if not isinstance(obj, dict):
+        status, payload = _error(400, "music request body must be a JSON object")
+        return JSONResponse(status_code=status, content=payload)
+    if settings.unload_on_music:
+        await asyncio.gather(
+            request.app.state.manager.unload(),
+            *(mgr.unload() for mgr in request.app.state.audio_managers.values()),
+        )
+        if settings.unload_image_on_music:
+            await request.app.state.image_manager.unload()
+        embedding_manager = request.app.state.embedding_manager
+        if embedding_manager is not None and embedding_manager.is_running:
+            await embedding_manager.stop_for_resources(reason="the music model")
+    try:
+        cfg = await manager.ensure_model(model, registry)
+    except RoleServerLoadError as exc:
+        status, payload = _error(
+            503, f"failed to load music model '{model}': {exc}",
+            "server_error",
+        )
+        return JSONResponse(status_code=status, content=payload)
+    except UnknownModelError as exc:
+        status, payload = _error(
+            404, f"model '{exc.name}' not found; available: {', '.join(exc.known)}"
+        )
+        return JSONResponse(status_code=status, content=payload)
+
+    _apply_pin(request, manager)
+    headers = _fwd_headers(request)
+
+    response_format = str(obj.get("response_format") or "wav").strip().lower()
+    # Caption aliases -> audio.cpp request.text ("text" wins when given).
+    request_obj: dict[str, Any] = {
+        k: v for k, v in obj.items()
+        if k not in ("model", "input", "prompt", "text", "response_format")
+    }
+    text = (
+        obj.get("text")
+        if obj.get("text") is not None
+        else obj.get("input")
+        if obj.get("input") is not None
+        else obj.get("prompt")
+    )
+    if text is not None:
+        request_obj["text"] = str(text)
+    # OpenAI-ish duration alias (seconds) -> audio.cpp duration_sec.
+    if "duration" in request_obj:
+        request_obj.setdefault("duration_sec", request_obj.pop("duration"))
+    upstream = json.dumps({"model": model, "request": request_obj}).encode()
+
+    status, data = await proxy_json(
+        cfg.port, cfg.host, "/v1/tasks/run", upstream, model, headers
+    )
+    if status != 200:
+        if isinstance(data, dict):
+            return JSONResponse(status_code=status, content=data)
+        return JSONResponse(status_code=status, content=_maybe_json(
+            data if isinstance(data, (bytes, bytearray)) else data.encode()
+        ))
+    audio_b64 = data.get("audio") if isinstance(data, dict) else None
+    if not isinstance(audio_b64, str) or not audio_b64:
+        # No audio output (errors, future text/artifact families): relay.
+        return JSONResponse(status_code=status, content=data)
+    audio = base64.b64decode(audio_b64)
+    if response_format and response_format not in ("wav", "b64_json", "json"):
+        transcoded = await transcode_audio(audio, response_format)
+        if transcoded is not None:
+            audio, ctype = transcoded
+            return Response(content=audio, media_type=ctype)
+    return Response(content=audio, media_type="audio/wav")
+
+
+@app.post("/v1/audio/music")
+async def audio_music(request: Request):
+    return await _route_music(request)
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +1223,8 @@ async def _route_image(request: Request, path: str):
         embedding_manager = request.app.state.embedding_manager
         if embedding_manager is not None and embedding_manager.is_running:
             await embedding_manager.stop_for_resources(reason="the image model")
+        if settings.unload_on_music:
+            await request.app.state.music_manager.unload()
     try:
         cfg = await manager.ensure_model(model, registry)
     except RoleServerLoadError as exc:
@@ -1120,6 +1413,10 @@ async def api_ps(request: Request):
     if st.get("state") == "ready":
         add(st.get("model"), st)
 
+    st = request.app.state.music_manager.status()
+    if st.get("state") == "ready":
+        add(st.get("model"), st)
+
     return {"models": models}
 
 
@@ -1135,7 +1432,8 @@ async def get_metrics(request: Request):
     degraded = bool(registry.degraded) or any(
         m.status().get("state") == "failed"
         for m in list(request.app.state.audio_managers.values())
-        + [request.app.state.image_manager, request.app.state.manager]
+        + [request.app.state.image_manager, request.app.state.music_manager,
+           request.app.state.manager]
     )
     metrics.set_gauge("llamaswap_status", 1.0 if degraded else 0.0)
     return Response(
@@ -1203,6 +1501,8 @@ async def load_model(model: str, request: Request):
             )
         elif cfg.role == "image":
             await request.app.state.image_manager.ensure_model(model, registry)
+        elif cfg.role == "music":
+            await request.app.state.music_manager.ensure_model(model, registry)
     except (ModelLoadError, RoleServerLoadError) as exc:
         status, body = _error(
             503, f"failed to load model '{model}': {exc}", "server_error"
@@ -1237,6 +1537,8 @@ async def unload_model(model: str, request: Request):
         await request.app.state.audio_managers[cfg.role].unload()
     elif cfg.role == "image":
         await request.app.state.image_manager.unload()
+    elif cfg.role == "music":
+        await request.app.state.music_manager.unload()
     return _health_snapshot(request)
 
 

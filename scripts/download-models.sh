@@ -25,6 +25,20 @@
 #   flux-vae  FLUX VAE ae.safetensors     (shared FLUX auxiliary)
 #   flux-clip_l FLUX clip_l text encoder  (shared FLUX auxiliary)
 #   flux-t5xxl FLUX t5xxl text encoder    (shared FLUX auxiliary, ~10 GB)
+#   qwen-image-2.1-uc  Qwen-Image 2.1 Uncensored diffusion Q4_K_M GGUF
+#            (stable-diffusion.cpp, used by backend/qwen-image-2.1-uc.yaml)
+#   qwen-image-2.1-te  Qwen3-VL-8B int8 ConvRot text encoder (~9.35 GB)
+#   qwen-image-2.1-vae Qwen Image 2.1 VAE bf16
+#   music3-config   MiniMax Music 3 package metadata (config.json)
+#   music3-cfg-*    MiniMax Music 3 per-component config JSONs
+#   music3-tok-*    MiniMax Music 3 tokenizer files
+#   music3-lm       MiniMax Music 3 Qwen3-8B language model q4_0 (~6 GB)
+#   music3-depth    MiniMax Music 3 RVQ depth decoder q8_0
+#   music3-cond     MiniMax Music 3 condition encoder
+#   music3-tr       MiniMax Music 3 flow transformer q4_0
+#   music3-vocoder  MiniMax Music 3 vocoder
+#            (all from hf.co/audio-cpp/MiniMax-Music3-GGUF, used by
+#            backend/minimax-music3.yaml)
 #
 # Env:
 #   MODEL_ROOT  model directory (default: /opt/models)
@@ -49,6 +63,22 @@ flux-schnell|https://huggingface.co/leejet/FLUX.1-schnell-gguf/resolve/main/flux
 flux-vae|https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors|FLUX.1-common/ae.safetensors
 flux-clip_l|https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors|FLUX.1-common/clip_l.safetensors
 flux-t5xxl|https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors|FLUX.1-common/t5xxl_fp16.safetensors
+qwen-image-2.1-uc|https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-Quantized/resolve/main/qwen-image-2.1-UC-Q4_K_M.gguf|Qwen-Image-2.1-Uncensored-Quantized/qwen-image-2.1-UC-Q4_K_M.gguf
+qwen-image-2.1-te|https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-Quantized/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors|Qwen-Image-2.1-Uncensored-Quantized/text_encoders/qwen3vl_8b_int8_convrot.safetensors
+qwen-image-2.1-vae|https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-Quantized/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors|Qwen-Image-2.1-Uncensored-Quantized/vae/qwen_image_2.1_vae_bf16.safetensors
+music3-config|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/config.json|MiniMax-Music3-GGUF/config.json
+music3-cfg-lm|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/config/language_model.json|MiniMax-Music3-GGUF/config/language_model.json
+music3-cfg-depth|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/config/rvq_depth_decoder.json|MiniMax-Music3-GGUF/config/rvq_depth_decoder.json
+music3-cfg-cond|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/config/condition_encoder.json|MiniMax-Music3-GGUF/config/condition_encoder.json
+music3-cfg-tr|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/config/transformer.json|MiniMax-Music3-GGUF/config/transformer.json
+music3-cfg-voc|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/config/vocoder.json|MiniMax-Music3-GGUF/config/vocoder.json
+music3-tok|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/tokenizer/tokenizer.json|MiniMax-Music3-GGUF/tokenizer/tokenizer.json
+music3-tok-cfg|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/tokenizer/tokenizer_config.json|MiniMax-Music3-GGUF/tokenizer/tokenizer_config.json
+music3-lm|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/language_model_q4_0.gguf|MiniMax-Music3-GGUF/language_model_q4_0.gguf
+music3-depth|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/rvq_depth_decoder_q8_0.gguf|MiniMax-Music3-GGUF/rvq_depth_decoder_q8_0.gguf
+music3-cond|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/condition_encoder.gguf|MiniMax-Music3-GGUF/condition_encoder.gguf
+music3-tr|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/transformer_q4_0.gguf|MiniMax-Music3-GGUF/transformer_q4_0.gguf
+music3-vocoder|https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF/resolve/main/vocoder.gguf|MiniMax-Music3-GGUF/vocoder.gguf
 '
 
 resolve() { # name -> url|relpath
@@ -105,7 +135,10 @@ main() {
     done
 
     if [ $# -eq 0 ]; then
-        set -- tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3
+        set -- tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3 \
+            music3-config music3-cfg-lm music3-cfg-depth music3-cfg-cond \
+            music3-cfg-tr music3-cfg-voc music3-tok music3-tok-cfg \
+            music3-lm music3-depth music3-cond music3-tr music3-vocoder
     fi
 
     if [ "$missing_only" = 1 ]; then
@@ -118,7 +151,7 @@ main() {
     for name in "$@"; do
         spec=$(resolve "$name")
         if [ -z "$spec" ]; then
-            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi nemotron_asr supertonic_3 flux-schnell flux-vae flux-clip_l flux-t5xxl)" >&2
+            echo "  [error] unknown bundle '$name' (known: tts tts-qwen3 asr whisper whisper-multi nemotron_asr supertonic_3 flux-schnell flux-vae flux-clip_l flux-t5xxl qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae music3-config music3-cfg-lm music3-cfg-depth music3-cfg-cond music3-cfg-tr music3-cfg-voc music3-tok music3-tok-cfg music3-lm music3-depth music3-cond music3-tr music3-vocoder)" >&2
             rc=1
             continue
         fi
