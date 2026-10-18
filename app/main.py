@@ -1084,10 +1084,6 @@ async def _route_music(request: Request):
         )
         return JSONResponse(status_code=status, content=payload)
 
-    # VRAM guard: a music model wants most of the GPU, so stop the chat
-    # LLM, TTS/ASR, the embedding server, and the image server first.
-    # Disable via LLAMASWAP_UNLOAD_ON_MUSIC / LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC
-    # =false.
     try:
         obj = json.loads(body)
     except (ValueError, TypeError):
@@ -1095,6 +1091,30 @@ async def _route_music(request: Request):
     if not isinstance(obj, dict):
         status, payload = _error(400, "music request body must be a JSON object")
         return JSONResponse(status_code=status, content=payload)
+    # Validate the caption HERE — before the VRAM guard tears down the
+    # resident servers and before the (multi-GB) model load. A missing
+    # caption must cost nothing.
+    text = (
+        obj.get("text")
+        if obj.get("text") is not None
+        else obj.get("input")
+        if obj.get("input") is not None
+        else obj.get("prompt")
+    )
+    text = str(text).strip() if text is not None else ""
+    if not text:
+        status, payload = _error(
+            400,
+            f"music request needs a caption ('input' — a music description, "
+            f"genre/mood/vocals/arrangement; model '{model}' generates lyrics-"
+            "conditioned songs; pass 'lyrics' too when you have one)",
+        )
+        return JSONResponse(status_code=status, content=payload)
+
+    # VRAM guard: a music model wants most of the GPU, so stop the chat
+    # LLM, TTS/ASR, the embedding server, and the image server first.
+    # Disable via LLAMASWAP_UNLOAD_ON_MUSIC / LLAMASWAP_UNLOAD_IMAGE_ON_MUSIC
+    # =false.
     if settings.unload_on_music:
         await asyncio.gather(
             request.app.state.manager.unload(),
@@ -1123,20 +1143,12 @@ async def _route_music(request: Request):
     headers = _fwd_headers(request)
 
     response_format = str(obj.get("response_format") or "wav").strip().lower()
-    # Caption aliases -> audio.cpp request.text ("text" wins when given).
+    # Caption validated earlier (pre-guard); "text" alias resolved there.
     request_obj: dict[str, Any] = {
         k: v for k, v in obj.items()
         if k not in ("model", "input", "prompt", "text", "response_format")
     }
-    text = (
-        obj.get("text")
-        if obj.get("text") is not None
-        else obj.get("input")
-        if obj.get("input") is not None
-        else obj.get("prompt")
-    )
-    if text is not None:
-        request_obj["text"] = str(text)
+    request_obj["text"] = text
     # OpenAI-ish duration alias (seconds) -> audio.cpp duration_sec.
     if "duration" in request_obj:
         request_obj.setdefault("duration_sec", request_obj.pop("duration"))
