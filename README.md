@@ -283,6 +283,8 @@ refused with `409`.
 
 ### Request flow
 
+![llamaswap request flow](docs/images/llamaswap-request-flow.png)
+
 ```mermaid
 flowchart TD
     IN["OpenAI-compatible request (port 11434)"] --> R{Route by path}
