@@ -480,6 +480,39 @@ hand-written JSON files needed.
 fight over the internal port.
 
 # Installation
+## Quick start — from the Docker Hub image (no local build)
+
+The published image already contains everything: the proxy, the audio.cpp /
+whisper.cpp / sd-server backends, and ffmpeg — nothing is compiled locally.
+
+```bash
+# 1) pull and start (weights mount + GPU reservation come with the compose file)
+docker compose -f docker-compose.hub.yml up -d
+
+# 2) download the model weights (~30 GB default bundle set: TTS/ASR/music)
+#    into the shared model root (one-shot; needs this repo checkout for ./scripts)
+docker compose -f docker-compose.hub.yml run --rm models-init
+
+# 3) optional: the image-generation weights (FLUX + Qwen-Image 2.1 encoders)
+MODEL_ROOT=/opt/models ./scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl \
+    qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae
+```
+
+Requirements: Docker with the NVIDIA container runtime on a CUDA host, and
+the model weights volume (default `/opt/models`, override with `MODEL_ROOT`).
+Keys/settings come from the same `.env` surface as the local build
+(`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...). The compose file publishes
+`11434`, `9090` and `1234`, all mapped to the container's `11434`.
+
+Verify:
+
+```bash
+curl -s localhost:11434/health | jq '.status, .music, .image'
+curl -s localhost:11434/v1/models | jq -r '.data[].id'
+```
+
+## Manual build
+
 ## LLMs download
 
 ```bash
