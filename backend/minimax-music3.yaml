@@ -9,8 +9,13 @@
 # hf.co/audio-cpp/MiniMax-Music3-GGUF).
 #
 # NOT an OpenAI surface: music lives on a custom /v1/audio/music endpoint
+# Lyrics are a required request option. LANGUAGE: use the official MiniMax
+# structured caption (Genre/BPM/Key/Vocals/Arrangement sections) and lyric
+# section tags capitalized on their own lines — with a loose caption the
+# AR stage tends to drift to Chinese vocals regardless of seed/AR-CFG;
+# the structured format produces English vocals as documented upstream.
 # that llamaswap translates to audio.cpp's generic POST /v1/tasks/run
-# (see _route_music in app/main.py). Lyrics are a required request option.
+# (see _route_music in app/main.py).
 #
 # The `path` is the model DIRECTORY (component package), not a single
 # GGUF. The default audio.cpp component mix is Q4_0 (language model +

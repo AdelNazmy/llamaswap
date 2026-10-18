@@ -1125,14 +1125,17 @@ curl -s localhost:11434/v1/images/generations \
   -d '{"model": "qwen-image-2.1-uc", "prompt": "a red bicycle leaning on a brick wall", "size": "512x512"}'
 
 # music generation (MiniMax Music 3 via audio.cpp) — caption + lyrics in,
-# binary WAV out (unload_on_music frees the whole GPU before it loads)
+# binary WAV out (unload_on_music frees the whole GPU before it loads).
+# Use the official MiniMax structured caption + capitalized section tags on
+# their own lines: with a loose caption the AR stage drifts to Chinese vocals.
 curl -s localhost:11434/v1/audio/music \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "minimax-music3",
-    "input": "A bright pop rock song with clean drums and a clear male vocal.",
-    "lyrics": "[verse] City lights are shining low.\n[chorus] Turn it up and let it fly.",
+    "input": "Genre: pop rock. BPM: 128. Key: E major. Bright, energetic, polished studio production. Vocals: clear male lead, English vocal language. Arrangement: clean drums, crisp rhythm guitars, wide stereo choruses.",
+    "lyrics": "[Verse]\nCity lights are shining low\n[Chorus]\nTurn it up and let it fly",
     "duration": 30,
+    "seed": 7,
     "response_format": "wav"
   }' -o song.wav
 ```
