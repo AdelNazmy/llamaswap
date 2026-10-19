@@ -28,7 +28,15 @@ like the other on-demand servers:
 
 The OpenAI Responses API (``/v1/responses``) is proxied straight through to
 llama-server's responses route, alongside ``/v1/chat/completions`` and
-``/v1/completions``. Two Ollama-compatible read-only endpoints are also
+``/v1/completions``. llama.cpp's native surface is proxied onto the loaded
+chat LLM too: ``/completion``, ``/tokenize``, ``/detokenize``,
+``/apply-template``, ``/infill``, ``/props`` (GET/POST), ``/slots`` +
+``/slots/{id}?action=save|restore|erase``, and ``/lora-adapters``
+(GET/POST) — plus the Anthropic-compatible ``/v1/messages`` and the
+reranking routes (``/v1/rerank``, ``/v1/reranking``, ``/rerank``). Those
+requests carry no OpenAI ``model`` field, so the backend is resolved via
+``?model=`` in the query string, the resident chat LLM, or the first
+configured LLM. Two Ollama-compatible read-only endpoints are also
 served: ``/api/tags`` (registry model list) and ``/api/ps`` (currently
 resident backends).
 
@@ -82,6 +90,7 @@ from .proxy import (
     json_remove_key,
     multipart_inject_field,
     proxy_json,
+    proxy_get_json,
     proxy_raw,
     proxy_raw_stream,
     proxy_stream,
@@ -357,6 +366,53 @@ async def get_model(model: str, request: Request):
     return _runtime_state(request, data)
 
 
+@app.get("/v1/model/info")
+async def model_info(request: Request):
+    """llama.cpp-compatibility model metadata (llama-server endpoint).
+
+    Reports the chat LLM the client would be served next in llama-server's
+    response shape: the currently loaded one if any, else the dedicated
+    embedding model, else the first configured chat LLM. ``?model=NAME``
+    selects explicitly. Extra ``llamaswap`` fields carry the live load state.
+    """
+    registry: Registry = request.app.state.registry
+    name = request.query_params.get("model")
+    if not name:
+        st = request.app.state.manager.status()
+        if st.get("model") and st.get("state") in ("loading", "ready"):
+            name = st["model"]
+    if not name:
+        emb = registry.embedding_config()
+        name = emb.name if emb else None
+    if not name:
+        llms = registry.role_configs("llm")
+        name = llms[0].name if llms else None
+    if not name:
+        status, body = _error(404, "no models configured", "server_error")
+        return JSONResponse(status_code=status, content=body)
+    try:
+        cfg = registry.get(name)
+    except UnknownModelError:
+        status, body = _error(404, f"model '{name}' not found")
+        return JSONResponse(status_code=status, content=body)
+    entry = _runtime_state(request, registry.to_openai(name))
+    return {
+        "model_path": registry.model_path(name),
+        "models": [
+            {
+                "model": cfg.name,
+                "endpoint": "/v1/chat/completions",
+                "params": [],
+            }
+        ],
+        "llamaswap": {
+            "role": cfg.role,
+            "state": entry["state"],
+            "loaded": entry["loaded"],
+        },
+    }
+
+
 @app.post("/v1/registry/reload")
 async def reload_registry(request: Request):
     registry: Registry = request.app.state.registry
@@ -424,8 +480,20 @@ async def reset(request: Request):
 
 
 async def _ensure_and_route(
-    request: Request, path: str,
+    request: Request, path: str, *, require_model: bool = True,
+    native: bool = False, method: str = "POST",
 ):
+    """Ensure the chat LLM named by the request is loaded, then proxy.
+
+    With ``require_model=False`` (llama.cpp native endpoints, which carry
+    no OpenAI ``model`` field) the model falls back to ``?model=`` in the
+    query string, then the currently loaded chat LLM, then the first
+    configured LLM — the same heuristic as ``/v1/model/info``.
+    ``native=True`` strips the ``model`` field from the body before
+    forwarding (llamaswap uses it only to pick the backend), and
+    ``method`` selects GET vs POST forwarding; the incoming query string
+    is always preserved (needed by ``/slots/{id}?action=save|restore``).
+    """
     registry: Registry = request.app.state.registry
     manager: ProcessManager = request.app.state.manager
     body = await request.body()
@@ -434,7 +502,25 @@ async def _ensure_and_route(
     except Exception:  # noqa: BLE001
         model = None
     if model is None:
-        status, payload = _error(400, "'model' is required in the request body")
+        model = request.query_params.get("model") or None
+    if model is None and not require_model:
+        # Resident chat LLM first, then the first configured one.
+        st = manager.status()
+        if st.get("model") and st.get("state") in ("loading", "ready"):
+            model = st["model"]
+    if model is None and not require_model:
+        llms = registry.role_configs("llm")
+        model = llms[0].name if llms else None
+    if model is None:
+        if require_model:
+            status, payload = _error(
+                400, "'model' is required in the request body"
+            )
+            return JSONResponse(status_code=status, content=payload)
+        status, payload = _error(
+            503, "no chat LLM is configured to serve llama.cpp native "
+            "endpoints", "server_error",
+        )
         return JSONResponse(status_code=status, content=payload)
     try:
         cfg = registry.get(model)
@@ -533,9 +619,19 @@ async def _ensure_and_route(
         )
     _apply_pin(request, manager)
     headers = _fwd_headers(request)
+    # Native llama.cpp endpoints carry no OpenAI `model` selector (it is
+    # llamaswap's routing key only), so drop it before forwarding.
+    if native:
+        body = json_remove_key(body, "model")
+    upstream_path = f"{path}?{request.url.query}" if request.url.query else path
+    if method.upper() == "GET":
+        status, data = await proxy_get_json(
+            port, cfg.host, upstream_path, headers
+        )
+        return JSONResponse(status_code=status, content=data)
     if extract_stream_flag(body):
         gen = proxy_stream(
-            port, cfg.host, path, body, model, headers
+            port, cfg.host, upstream_path, body, model, headers
         )
         return StreamingResponse(
             gen,
@@ -546,7 +642,9 @@ async def _ensure_and_route(
                 "Connection": "keep-alive",
             },
         )
-    status, data = await proxy_json(port, cfg.host, path, body, model, headers)
+    status, data = await proxy_json(
+        port, cfg.host, upstream_path, body, model, headers
+    )
     return JSONResponse(status_code=status, content=data)
 
 
@@ -563,6 +661,118 @@ async def completions(request: Request):
 @app.post("/v1/responses")
 async def responses(request: Request):
     return await _ensure_and_route(request, "/v1/responses")
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API passthrough (llama.cpp natively compatible)."""
+    return await _ensure_and_route(request, "/v1/messages")
+
+
+@app.post("/v1/rerank")
+@app.post("/v1/reranking")
+@app.post("/rerank")
+async def rerank(request: Request):
+    """Rerank documents against a query (Cohere/Jina-shaped).
+
+    Served by a reranker model configured as a normal ``role: llm`` entry
+    (launched with ``--embedding --pooling rank``); the body's ``model``
+    field is optional, so the fallback model chain applies.
+    """
+    return await _ensure_and_route(
+        request, "/v1/rerank", require_model=False, native=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp native API (target the loaded chat LLM)
+# ---------------------------------------------------------------------------
+# llama-server's native endpoints beyond the OpenAI surface. None carry an
+# OpenAI ``model`` field: llamaswap resolves the backend via the fallback
+# chain (``?model=`` query param → resident chat LLM → first configured
+# LLM) and forwards, preserving query strings (slot save/restore/erase).
+
+@app.post("/completion")
+async def native_completion(request: Request):
+    """Native completion with the full llama.cpp option set (streams SSE
+    when ``stream: true``)."""
+    return await _ensure_and_route(
+        request, "/completion", require_model=False, native=True
+    )
+
+
+@app.post("/tokenize")
+async def tokenize(request: Request):
+    return await _ensure_and_route(
+        request, "/tokenize", require_model=False, native=True
+    )
+
+
+@app.post("/detokenize")
+async def detokenize(request: Request):
+    return await _ensure_and_route(
+        request, "/detokenize", require_model=False, native=True
+    )
+
+
+@app.post("/apply-template")
+async def apply_template(request: Request):
+    return await _ensure_and_route(
+        request, "/apply-template", require_model=False, native=True
+    )
+
+
+@app.post("/infill")
+async def infill(request: Request):
+    return await _ensure_and_route(
+        request, "/infill", require_model=False, native=True
+    )
+
+
+@app.get("/props")
+async def props_get(request: Request):
+    return await _ensure_and_route(
+        request, "/props", require_model=False, native=True, method="GET"
+    )
+
+
+@app.post("/props")
+async def props_set(request: Request):
+    """Change global overridable properties (requires --props upstream)."""
+    return await _ensure_and_route(
+        request, "/props", require_model=False, native=True
+    )
+
+
+@app.get("/slots")
+async def slots_get(request: Request):
+    return await _ensure_and_route(
+        request, "/slots", require_model=False, native=True, method="GET"
+    )
+
+
+@app.post("/slots/{id_slot}")
+async def slots_action(id_slot: int, request: Request):
+    """Slot KV-cache management: ``?action=save|restore|erase``."""
+    return await _ensure_and_route(
+        request, f"/slots/{id_slot}", require_model=False, native=True
+    )
+
+
+@app.get("/lora-adapters")
+async def lora_adapters_get(request: Request):
+    return await _ensure_and_route(
+        request, "/lora-adapters", require_model=False, native=True,
+        method="GET",
+    )
+
+
+@app.post("/lora-adapters")
+async def lora_adapters_set(request: Request):
+    """Set LoRA adapter scales at runtime."""
+    return await _ensure_and_route(
+        request, "/lora-adapters", require_model=False, native=True
+    )
 
 
 @app.post("/v1/embeddings")

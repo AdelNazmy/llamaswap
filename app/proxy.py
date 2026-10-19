@@ -202,6 +202,32 @@ async def proxy_raw_stream(
         yield json.dumps({"error": {"message": str(exc)}}).encode()
 
 
+async def proxy_get_json(
+    port: int, host: str, path: str, headers: dict[str, str],
+) -> tuple[int, Any]:
+    """GET forward for llama-server's native read-only endpoints
+    (/props, /slots, /lora-adapters); returns (status, parsed_json_or_text).
+    """
+    url = f"http://{host}:{port}{path}"
+    fwd_headers = {k: v for k, v in headers.items()
+                   if k.lower() not in ("host", "content-length", "accept-encoding")}
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=10.0)
+        ) as client:
+            resp = await client.get(url, headers=fwd_headers)
+    except httpx.ConnectError:
+        return 503, {"error": {"message": "backend llama-server is not reachable"}}
+    except httpx.HTTPError as exc:
+        return 502, {"error": {"message": str(exc)}}
+    if _is_json(resp.content):
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            pass
+    return resp.status_code, resp.text
+
+
 def _is_json(content: bytes) -> bool:
     head = content.lstrip()[:1]
     return head in (b"{", b"[")
@@ -211,6 +237,8 @@ def extract_stream_flag(body: bytes) -> bool:
     try:
         obj = json.loads(body)
     except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict):
         return False
     return bool(obj.get("stream"))
 

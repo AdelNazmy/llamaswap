@@ -43,7 +43,10 @@ other workload in turn.
 OpenAI client (port 11434)
         │  /v1/chat/completions, /v1/embeddings,
         │  /v1/audio/speech(+ /stream), /v1/audio/transcriptions(+ /stream),
-        │  /v1/audio/music, /v1/images/generations, /v1/images/edits, /v1/models
+        │  /v1/audio/music, /v1/images/generations, /v1/images/edits, /v1/models,
+        │  /v1/responses, /v1/messages, /v1/rerank,
+        │  /completion, /tokenize, /detokenize, /apply-template, /infill,
+        │  /props, /slots[/{id}], /lora-adapters (llama.cpp native)
         ▼
 llamaswap (FastAPI)
   • model registry        ← backend/*.yaml
@@ -1013,6 +1016,25 @@ the reference, and `-o`/`--out` sets the output. Run
 | `POST /v1/completions` | Text completions |
 | `POST /v1/responses` | OpenAI Responses API; proxies to llama-server's `/v1/responses` (streaming via `stream: true`). Requires a llama-server build that exposes the responses route |
 | `POST /v1/embeddings` | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path |
+| `POST /v1/messages` | Anthropic Messages API passthrough (llama.cpp speaks it natively; `model` is required as usual) |
+| `POST /v1/rerank` (also `/v1/reranking`, `/rerank`) | Rerank documents against a query — served by a `role: llm` reranker entry (launched with `--embedding --pooling rank`); `model` is optional |
+| `POST /completion` | llama.cpp native completion with the full option set (token arrays, `n_probs`, `id_slot`, per-request LoRA, …); `stream: true` for SSE |
+| `POST /tokenize` · `POST /detokenize` | Convert between text and tokens (native) |
+| `POST /apply-template` | Apply the model's chat template without running inference (native) |
+| `POST /infill` | Fill-in-the-middle completion (native; deprecated upstream) |
+| `GET /props` · `POST /props` | Server/model properties (context size, chat template, modalities); POST changes overridable props (requires `--props` upstream) |
+| `GET /slots` · `POST /slots/{id_slot}?action=save\|restore\|erase` | Slot monitoring and KV-cache management (save/restore need `--slot-save-path` upstream) |
+| `GET /lora-adapters` · `POST /lora-adapters` | List and set LoRA adapter scales at runtime |
+
+**Native-endpoint model selection.** The llama.cpp native routes
+(`/completion`, `/tokenize`, `/detokenize`, `/apply-template`, `/infill`,
+`/props`, `/slots*`, `/lora-adapters`) and `/v1/rerank` carry no OpenAI
+`model` field. llamaswap resolves the backend via ``?model=`` in the query
+string, then the currently loaded chat LLM, then the first configured LLM
+(booting it on demand). All VRAM guards and `X-Pin-Seconds` apply exactly
+as for chat.
+
+
 | `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out. `response_format` (mp3/opus/aac/flac/pcm/wav) is transcoded from WAV internally via ffmpeg |
 | `POST /v1/audio/speech/stream` | Streaming TTS: relays audio.cpp's OpenAI-shaped audio SSE (`speech.audio.delta` base64-PCM chunks → `speech.audio.done`) unbuffered; needs a `mode: streaming` backend (e.g. `supertonic-3-stream`) — offline backends get a clear refusal |
 | `POST /v1/audio/transcriptions` | ASR (`role: asr`); OpenAI multipart upload → `{"text": ...}`. `response_format` = `json`/`text`/`srt`/`vtt`/`verbose_json` is honoured by the proxy regardless of backend |
@@ -1079,6 +1101,30 @@ curl -s localhost:11434/v1/chat/completions -d '{
 curl -s localhost:11434/v1/embeddings -d '{
   "model": "octen-embedding-0.6b",
   "input": "hello world"
+}'
+
+# llama.cpp native — tokenize/detokenize round-trip (no model field needed;
+# add ?model=<id> to target a specific LLM, else the resident one is served)
+curl -s localhost:11434/tokenize -d '{"text": "hello world"}'
+curl -s localhost:11434/detokenize -d '{"tokens": [15339, 1917]}'
+
+# llama.cpp native — server/model properties and slot monitoring
+curl -s localhost:11434/props | jq '.default_generation_settings.n_ctx'
+curl -s 'localhost:11434/slots?id_slot=0' | jq '.[0] | {id, state, model}'
+
+# llama.cpp native — raw completion (streams SSE like the OpenAI routes)
+curl -sN localhost:11434/completion -d '{
+  "prompt": "Building a website can be done in 10 simple steps:",
+  "n_predict": 64,
+  "stream": true
+}'
+
+# rerank — served by a role: llm reranker (bge-reranker-v2-m3 style,
+# launched with --embedding --pooling rank)
+curl -s localhost:11434/v1/rerank -d '{
+  "model": "bge-reranker-v2-m3",
+  "query": "What is a panda?",
+  "documents": ["A panda is a bear", "A panda is not a car"]
 }'
 
 # TTS — boots on first use, then idle-unloads like the chat LLM (audio.cpp / outetts)

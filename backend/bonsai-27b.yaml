@@ -7,23 +7,31 @@ command:
     - "--model"
     - "/opt/models/Ternary-Bonsai-2-27B-PQ2_0.gguf"
     - "--ctx-size"
-    - "131000"
+    - "262144"
     - "--n-gpu-layers"
-    - "999"
+    - "99"
     - "--flash-attn"
     - "on"
-    - "-c"
-    - "131000"
+    - "--cache-type-k"
+    - "q8_0"
+    - "--cache-type-v"
+    - "q8_0"
     - "--temp"
     - "1.0"
     - "--top-p"
     - "0.95"
     - "--top-k"
     - "20"
-    - "--parallel"
-    - "1"
+    - "--min-p"
+    - "0.05"
+    - "--presence-penalty"
+    - "0.0"
     - "--reasoning-budget"
     - "1024"
+    - "--threads"
+    - "14"
+    - "--parallel"
+    - "1"
     - "-lv"
     - "4"
     - "--log-colors"
@@ -34,6 +42,6 @@ command:
 host: 127.0.0.1
 port: 8111
 meta:
-  context_length: 131000
+  context_length: 262144
   family: qwen
   capabilities: [chat]

@@ -62,6 +62,9 @@ command:
     # Diffusion model + VAE on the GPU; text encoders on CPU (T5-XXL is
     # ~10 GB) so everything fits in 16 GB VRAM with flash attention.
     - "--diffusion-fa"
+    # Tile the VAE decode — the full 1024x1024 decode graph does not fit
+    # next to the resident Q8_0 diffusion model on a 16 GB card.
+    - "--vae-tiling"
     - "--backend"
     - "diffusion=cuda0,vae=cuda0,te=cpu"
     - "-v"

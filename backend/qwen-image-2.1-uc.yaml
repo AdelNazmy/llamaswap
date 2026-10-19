@@ -55,7 +55,7 @@ command:
     # CPU (~9 GB stays in RAM, text encoding runs once per prompt).
     - "--diffusion-fa"
     - "--backend"
-    - "diffusion=cuda0,vae=cuda0,te=cpu"
+    - "diffusion=cuda0,vae=cuda0,te=cuda0"
     - "-v"
   env:
     CUDA_VISIBLE_DEVICES: "0"
