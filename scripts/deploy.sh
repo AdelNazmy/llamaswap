@@ -14,6 +14,12 @@
 # (base -> audio -> image). Rebuilding the base out of order silently drops
 # the audio/overlay layers already in the tag.
 #
+# Strata (docker-compose.strata.yml) is different: it builds nothing — it
+# only bind-mounts the Strata install and the model disk (read-only) and
+# raises the startup timeout. It is deployed by default like every other
+# backend; a machine without the Strata files skips it automatically
+# (--no-strata silences the check, --strata makes missing files an error).
+#
 # Nothing is compiled inside the image — every backend is built on the HOST
 # first and stamped in via compose `additional_contexts` (see the README
 # "Building ..." sections). A missing binary aborts the matching build.
@@ -31,6 +37,7 @@
 #   ./scripts/deploy.sh --build-only          # build all, do not start
 #   ./scripts/deploy.sh --no-audio            # skip audio (base + image)
 #   ./scripts/deploy.sh --no-image            # skip image (base + audio)
+#   ./scripts/deploy.sh --no-strata           # skip the Strata engine
 #   ./scripts/deploy.sh --no-audio --no-image # base only
 #   ./scripts/deploy.sh --verify              # also smoke-test after start
 #
@@ -40,6 +47,9 @@
 #                         (default: 180)
 #   MODEL_ROOT            shared model dir to check/download into
 #                         (default: /opt/models)
+#   STRATA_HOME           Strata install to mount with --strata
+#                         (default: /home/adnathan/.local/share/strata —
+#                         must match docker-compose.strata.yml)
 
 set -eu
 
@@ -48,6 +58,8 @@ cd "$ROOT"
 
 INCLUDE_AUDIO=1
 INCLUDE_IMAGE=1
+INCLUDE_STRATA=1
+STRATA_EXPLICIT=0
 DO_UP=1
 VERIFY=0
 PORT="${LLAMASWAP_PORT:-11434}"
@@ -63,12 +75,17 @@ Deploy the full llamaswap stack. All backends are enabled by default.
 Options:
   --no-audio      skip the audio overlay (base + image only)
   --no-image      skip the image overlay (base + audio only)
+  --no-strata     skip the Strata overlay (mounts the Strata install +
+                  model disk; runtime-only, builds nothing)
+  --strata        require the Strata overlay (missing files abort instead
+                  of auto-skipping)
   --build-only    build the images without starting the stack
   --verify        smoke-test /health and /v1/models after starting
   -h, --help      show this help
 
 Backends: base (llama.cpp), audio (audio.cpp + whisper.cpp),
-          image (stable-diffusion.cpp).
+          image (stable-diffusion.cpp), strata (runtime-only, no image;
+          auto-skipped on machines without the files).
 EOF
     exit "${1:-0}"
 }
@@ -78,6 +95,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --no-audio)   INCLUDE_AUDIO=0 ;;
         --no-image)   INCLUDE_IMAGE=0 ;;
+        --strata)     INCLUDE_STRATA=1; STRATA_EXPLICIT=1 ;;
+        --no-strata)  INCLUDE_STRATA=0 ;;
         --build-only) DO_UP=0 ;;
         --verify)     VERIFY=1 ;;
         -h|--help)    usage 0 ;;
@@ -122,6 +141,56 @@ if [ "$INCLUDE_IMAGE" = 1 ]; then
     require_x /opt/stable-diffusion.cpp/build/bin/sd-server
 fi
 
+# Strata: runtime-only overlay — no image to build, but the bind mounts and
+# the pack files must exist on the host (paths must match
+# docker-compose.strata.yml, which mounts STRATA_HOME at the same path).
+# A default deploy auto-skips strata when they are missing; an explicit
+# --strata makes that an error instead.
+if [ "$INCLUDE_STRATA" = 1 ]; then
+    STRATA_HOME="${STRATA_HOME:-/home/adnathan/.local/share/strata}"
+    STRATA_MODELS="${STRATA_MODELS:-/mnt/d/MODELS}"
+    STRATA_PACK="$STRATA_MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M"
+
+    require_x "$STRATA_HOME/terminal/current/bin/strata"
+    for shard in 00001 00002; do
+        f="$STRATA_PACK/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-$shard-of-00002.gguf"
+        [ -f "$f" ] || {
+            echo "deploy: missing strata weights shard: $f" >&2
+            MISSING=1
+        }
+    done
+    [ -d "$STRATA_PACK/STRATA/packs/coder-iq1_m" ] || {
+        echo "deploy: missing strata pack dir: $STRATA_PACK/STRATA/packs/coder-iq1_m" >&2
+        MISSING=1
+    }
+    [ -d "$STRATA_PACK/STRATA/mtp/rt" ] || {
+        echo "deploy: missing strata MTP dir: $STRATA_PACK/STRATA/mtp/rt" >&2
+        MISSING=1
+    }
+
+    if [ "$MISSING" = 1 ]; then
+        if [ "$STRATA_EXPLICIT" = 1 ]; then
+            echo "deploy: --strata requested but the files above are missing" >&2
+            exit 1
+        fi
+        echo "deploy: strata files missing; continuing WITHOUT the strata" >&2
+        echo "        overlay (--no-strata silences this check, --strata makes" >&2
+        echo "        it an error)" >&2
+        INCLUDE_STRATA=0
+        MISSING=0
+    fi
+
+    # A standalone strata instance holds the same ~15.2 GiB the managed
+    # pack needs — warn (it is this deployment's own main model, so only
+    # the user can decide to stop it).
+    if [ "$INCLUDE_STRATA" = 1 ] && command -v pgrep >/dev/null 2>&1 \
+            && pgrep -f "strata serve" >/dev/null 2>&1; then
+        echo "deploy: warning: a standalone 'strata serve' is running and holds" >&2
+        echo "        the VRAM the managed pack needs; stop it (pkill -f 'strata serve')" >&2
+        echo "        and repoint its clients at llamaswap's published port" >&2
+    fi
+fi
+
 if [ "$MISSING" = 1 ]; then
     echo "deploy: build the missing backend(s) on the host first" \
         "(see README 'Building ...' sections)" >&2
@@ -138,6 +207,7 @@ else
 fi
 
 # --- build in order: base -> audio -> image ---------------------------------
+# (strata builds nothing — it is a runtime-only overlay, see --strata)
 echo "==> [1/3] build base image (llama.cpp)"
 docker compose -f docker-compose.yml build
 
@@ -258,6 +328,7 @@ fi
 FILES="-f docker-compose.yml"
 [ "$INCLUDE_AUDIO" = 1 ] && FILES="$FILES -f docker-compose.audio.yml"
 [ "$INCLUDE_IMAGE" = 1 ] && FILES="$FILES -f docker-compose.image.yml"
+[ "$INCLUDE_STRATA" = 1 ] && FILES="$FILES -f docker-compose.strata.yml"
 
 if [ "$DO_UP" = 1 ]; then
     echo "==> start stack (docker compose up -d)"
@@ -272,6 +343,12 @@ if [ "$DO_UP" = 1 ]; then
     echo "  health:  http://localhost:$PORT/health"
     echo "  models:  http://localhost:$PORT/v1/models"
     echo "  logs:    docker compose $FILES logs -f llamaswap"
+    if [ "$INCLUDE_STRATA" = 1 ]; then
+        echo
+        echo "  strata:  first request loads the pack (~2.5 min; the first"
+        echo "           boot after a reboot can take ~13 min); it stays"
+        echo "           resident for 4 h idle, then unloads"
+    fi
 else
     echo "==> build-only requested; skipping 'up -d'"
     echo "    start with: docker compose $FILES up -d"

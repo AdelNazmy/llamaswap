@@ -1,6 +1,7 @@
 """Model registry: loads per-model YAML launch configs from the backend dir."""
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,7 +53,21 @@ class ModelMeta(BaseModel):
     # launch, so chat/embed/audio/image can run concurrently on different
     # cards of a multi-GPU box.
     gpu: Optional[int] = None
+    # Per-model idle-unload override for this model's role. None inherits the
+    # role's configured window (see LLAMASWAP_IDLE_UNLOAD_SECONDS); 0 disables
+    # idle unload for this model, so it stays resident until something else
+    # needs the VRAM. Set it long (or 0) for backends whose model load is very
+    # expensive — a 20 GB+ engine reload costs minutes, so evicting it on the
+    # 300 s default is a false economy.
+    idle_unload_seconds: Optional[float] = None
     model_config = {"extra": "allow"}
+
+    @field_validator("idle_unload_seconds")
+    @classmethod
+    def _validate_idle(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v < 0:
+            raise ValueError("meta.idle_unload_seconds must be >= 0")
+        return v
 
 
 ROLES = {"llm", "embedding", "tts", "asr", "image", "music"}
@@ -152,15 +167,24 @@ class ModelConfig(BaseModel):
 
         Placeholders inside the JSON structure, values, and keys are
         substituted: ``{host}``, ``{port}``, ``{name}``, ``{config_path}``.
+        A value that was wholly a placeholder (e.g. ``"{port}"``) renders
+        back to its native type — backends with typed config files
+        (audio.cpp) want a number for the port. Literal numeric strings
+        elsewhere are left alone: a blanket coercion would mangle engine
+        argv values like ``--spec "4"``.
         """
         raw = self.command.config_json or {}
+        placeholder = re.compile(r"\{[a-z_]+\}")
 
         def _sub(value: Any) -> Any:
             if isinstance(value, str):
-                return value.format(
+                out = value.format(
                     host=self.host, port=self.port, name=self.name,
                     config_path=config_path,
                 )
+                if placeholder.fullmatch(value):
+                    return _coerce_num_strings(out)
+                return out
             if isinstance(value, dict):
                 return {_sub(k): _sub(v) for k, v in value.items()}
             if isinstance(value, list):
@@ -171,7 +195,7 @@ class ModelConfig(BaseModel):
         # The backend's own host/port always follow the enforced YAML values.
         cfg["host"] = self.host
         cfg["port"] = self.port
-        return _coerce_num_strings(cfg)
+        return cfg
 
 
 def _coerce_num_strings(value: Any) -> Any:
@@ -286,10 +310,25 @@ class Registry:
             if path:
                 try:
                     llm_vram[name] = Path(path).stat().st_size / (1024 * 1024)
+                    continue
                 except OSError:
                     logger.warning(
                         "cannot stat model file for '%s': %s", name, path
                     )
+            # No declared footprint and no stat-able --model: backends launched
+            # from a structured config (strata's --pack/--native, exl3's
+            # loader JSON) name no single weights file, and the on-disk size
+            # of a multi-shard set would mislead the guards anyway (the PLE
+            # table of a strata pack never enters VRAM). Declare it instead.
+            self.warnings.append(
+                f"{name}: chat LLM has no VRAM estimate "
+                f"(declare meta.vram_gb)"
+            )
+            logger.warning(
+                "'%s': no VRAM estimate for this chat LLM; declare "
+                "meta.vram_gb so the audio/image guards can rank it",
+                name,
+            )
         self._llm_vram = llm_vram
         llms = [c.name for c in models.values() if c.role == "llm"]
         if llms and not llm_vram:
@@ -394,4 +433,5 @@ class Registry:
             "capabilities": meta.capabilities,
             "vram_gb": meta.vram_gb,
             "gpu": meta.gpu,
+            "idle_unload_seconds": meta.idle_unload_seconds,
         }

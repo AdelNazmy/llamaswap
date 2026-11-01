@@ -54,6 +54,9 @@ services:
       LLAMASWAP_LOG_LEVEL: "${LLAMASWAP_LOG_LEVEL:-INFO}"
       LLAMASWAP_LOG_JSON: "${LLAMASWAP_LOG_JSON:-false}"
       LLAMASWAP_AUDIO_TMP_DIR: "${LLAMASWAP_AUDIO_TMP_DIR:-/tmp/llamaswap-audio}"
+      # Where per-model config files for structured-config chat backends
+      # (strata serve --profile) are rendered before launch.
+      LLAMASWAP_LLM_TMP_DIR: "${LLAMASWAP_LLM_TMP_DIR:-/tmp/llamaswap-llm}"
       LLAMASWAP_API_KEY: "${LLAMASWAP_API_KEY:-}"
       LLAMASWAP_ADMIN_KEY: "${LLAMASWAP_ADMIN_KEY:-}"
       LLAMASWAP_MAX_CONCURRENCY: "${LLAMASWAP_MAX_CONCURRENCY:-0}"

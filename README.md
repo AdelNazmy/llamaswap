@@ -113,7 +113,12 @@ image or music servers (or a failed big-LLM load).
 
 `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default **300**) is the baseline: except
 embedding, every loaded server is shut down after that many seconds with no
-requests (`0` disables idle unload).
+requests (`0` disables idle unload). A model can override the window for
+itself with `meta.idle_unload_seconds` in its YAML — `0` keeps that model
+resident until something else needs the VRAM, and a longer window (e.g.
+14400) protects backends whose load is expensive (the 176.9B Strata pack
+reloads in ~2.5 min of disk thrash, so it stays resident for 4 h instead
+of being evicted on the 300 s default).
 
 #### Rules by request type
 
@@ -308,7 +313,7 @@ llamaswap/
 ├── app/
 │   ├── config.py             # settings (env prefix LLAMASWAP_)
 │   ├── registry.py           # YAML → validated ModelConfig objects
-│   ├── process_manager.py    # chat llama-server lifecycle + health checks
+│   ├── process_manager.py    # chat backend lifecycle (llama-server, Strata, ...) + health checks
 │   ├── embedding_manager.py  # persistent embedding llama-server lifecycle
 │   ├── server_manager.py     # on-demand per-role TTS/ASR/image lifecycle + swap + idle unload
 │   ├── proxy.py              # async reverse proxy (stream / raw / multipart)
@@ -348,14 +353,19 @@ meta:
   capabilities: [chat]
   vram_gb: 13.0      # optional: declared VRAM footprint (scheduler uses this)
   gpu: 0             # optional: pin CUDA_VISIBLE_DEVICES to this card
+  idle_unload_seconds: 14400  # optional: per-model idle-unload window (overrides the global one; 0 = never unload)
 ```
 
 `meta.vram_gb` (optional) declares the model's VRAM footprint in GiB and is
 used by the audio/image VRAM guards instead of the on-disk weights-file
 size — set it wherever the weights live on a remote/streamed mount or the
-file-size estimate is misleading. `meta.gpu` (optional) pins the backend to
-a specific GPU (`CUDA_VISIBLE_DEVICES`) so chat/embed/audio/image can run
-concurrently on different cards of a multi-GPU box.
+file-size estimate is misleading. Chat LLMs whose launch names no single
+`--model` weights file (Strata's `--pack`/`--native` shards, exl3's
+loader) **must** declare it: there is no file to stat, and without an
+estimate the guards are disabled (surfaced as a `warnings` entry in
+`/health` and `/v1/registry/info`). `meta.gpu` (optional) pins the backend
+to a specific GPU (`CUDA_VISIBLE_DEVICES`) so chat/embed/audio/image can
+run concurrently on different cards of a multi-GPU box.
 
 `role` can be:
 
@@ -409,10 +419,14 @@ speaks (default `json`):
   (audio.cpp `/v1/audio/transcriptions`)
 
 `command.config_json` (optional) is rendered to a temp file at launch for
-structured-config backends (audio.cpp). Placeholders `{host}`, `{port}`,
-`{name}`, `{config_path}` are substituted, and `host`/`port` always follow
-the enforced YAML values — ready-to-use audio.cpp server configs, no
-hand-written JSON files needed.
+structured-config backends (audio.cpp's server, Strata's
+`strata serve --profile`). Placeholders `{host}`, `{port}`, `{name}`,
+`{config_path}` are substituted (a value that is wholly a placeholder
+renders back to its native type, so `{port}` becomes a JSON number), and
+`host`/`port` always follow the enforced YAML values — no hand-written
+JSON files needed. The rendered file lands in `LLAMASWAP_LLM_TMP_DIR`
+(chat role) or `LLAMASWAP_AUDIO_TMP_DIR` (other roles) and is deleted when
+the backend stops.
 
 `host`/`port` are always enforced by the proxy (any `--host`/`--port` in
 `args` is stripped, and audio.cpp configs are rewritten) so models never
@@ -1330,7 +1344,8 @@ piling up on a slow model load.
   chat load or an embedding request restarts them.
 - Model load failures are surfaced as `503` with the last llama-server
   log lines in the server console; the proxy stays up.
-- `llama-server` stderr is mirrored to the proxy log as
+- A chat backend's output (stdout AND stderr — Strata's server logs to
+  stdout, llama-server to stderr) is mirrored to the proxy log as
   `llama-server[<model>]: ...`; embedding server lines are tagged
   `llama-server[embed <model>]: ...`.
 

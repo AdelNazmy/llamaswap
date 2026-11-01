@@ -1,0 +1,123 @@
+# Text chat model: Qwen3.8 Flash Next coder, Strata IQ1_M pack, served by
+# the Strata terminal bundle's own OpenAI-compatible server
+# (`strata serve --profile <config>`) instead of llama-server.
+#
+# Strata is a managed backend like any other: llamaswap renders the run
+# config (command.config_json) to a temp file, spawns `strata serve`,
+# waits for /health to report the model loaded, and forwards chat traffic.
+# SIGTERM unloads the pack and frees VRAM (~15.2 GiB of 16 GiB measured on
+# the RTX 4070 Ti SUPER).
+#
+# IMPORTANT:
+#   * Strata's own lifecycle knobs stay off in the rendered config
+#     (idle_unload_s: 0, no --lazy, no min_free_vram_mib): llamaswap is the
+#     sole lifecycle authority. --lazy would break startup entirely — the
+#     server binds its port with loaded: false and llamaswap (correctly)
+#     waits for the real load.
+#   * A warm reload of the 176.9B pack takes ~2.5 min (measured 135 s); the
+#     first boot after a reboot is slower (cold page cache over the WSL
+#     mount: 807 s once measured). The model still overrides the idle
+#     window with meta.idle_unload_seconds: 14400 (4 h): a reload is
+#     minutes of disk thrash, so the pack stays resident across idle
+#     pauses and only swaps or a manual unload free the VRAM.
+#   * Stop the standalone strata instance (it holds the same ~15.2 GiB)
+#     and any big llama.cpp model before loading this one — the card fits
+#     one 176.9B pack.
+#
+# Requires the strata compose overlay (bind-mounts the terminal bundle and
+# the model disk, read-only):
+#   docker compose -f docker-compose.yml -f docker-compose.strata.yml up -d
+#
+# Strata's admin endpoints (/v1/vram, /v1/load, /v1/unload) are NOT
+# proxied — lifecycle belongs to llamaswap; use
+# POST /v1/models/<model>/unload.
+name: qwen3.8-flash-next-coder-iq1_m
+description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — text chat"
+command:
+  # The `strata` launcher is a /bin/sh script that resolves its own install
+  # dir (preferring the bundled python) — bind-mounted at the same path it
+  # has on the host by docker-compose.strata.yml, so bundle-relative paths
+  # keep working. Do NOT copy/symlink it elsewhere: bundle resolution
+  # breaks.
+  binary: /home/adnathan/.local/share/strata/terminal/current/bin/strata
+  args:
+    - "serve"
+    - "--profile"
+    - "{config_path}"
+    # Offline: no MCP servers, no before_load hooks. Also silences the
+    # telemetry handshake; the pack, weights and expert profile are local.
+    - "--offline"
+    # Strata takes a while to tear down (PLE table + expert cache); give it
+    # room so SIGTERM stays a clean exit inside the stop timeout.
+    - "--shutdown-timeout"
+    - "20"
+  # Rendered to <llm_tmp_dir>/llm-<name>.json and passed via --profile.
+  # Shape mirrors the launcher's own run configs
+  # (~/.local/state/strata/launch/*.json); the enforced host/port are
+  # overwritten by the proxy after rendering, and --host/--port are added
+  # to the CLI (CLI beats config).
+  config_json:
+    # "component:strata-engine" is resolved (and SHA-256 checked) by the
+    # strata server itself against the installed component — survives
+    # engine updates without touching this file.
+    exe: "component:strata-engine"
+    args:
+      - "--native"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+      - "--ple-gguf"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+      - "--expert-profile"
+      - "/home/adnathan/.local/share/strata/terminal/0.1.54/data/expert-profile-coder.bin"
+      - "--expert-cache"
+      - "auto"
+      - "--prefill"
+      - "auto"
+      - "--spec"
+      - "4"
+      - "--spec-min-p"
+      - "0.5"
+      - "--max-context"
+      - "131072"
+      - "--kv"
+      - "int8"
+      - "--resident-experts"
+      - "--mtp"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/mtp/rt"
+      - "--pack"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m"
+    # The engine's own log file, colocated with the rendered profile
+    # ({config_path} = the profile file llamaswap just wrote, so its
+    # directory is guaranteed to exist). Strata also prints everything to
+    # stdout, which llamaswap tails into its log under
+    # llama-server[<model>]:.
+    log: "{config_path}.engine.log"
+    cwd: /home/adnathan/.local/share/strata/terminal/current
+    tokenizer: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m/tokenizer
+    model_name: "{name}"
+    # Keep strata's own idle unload off: llamaswap decides when to unload.
+    idle_unload_s: 0
+    open_browser: false
+  env:
+    # GEMM tuning table preset the launcher writes for this box.
+    STRATA_DEFAULTS: "026"
+    CUDA_VISIBLE_DEVICES: "0"
+    # Strata resolves its install (~/.local/share/strata: components,
+    # bundle data) via $HOME; the container runs as root, so pin the home
+    # the compose overlay mounts the share at.
+    HOME: /home/adnathan
+# internal binding, enforced by the proxy; one model at a time
+host: 127.0.0.1
+port: 8101
+meta:
+  context_length: 131072
+  family: qwen
+  capabilities: [chat]
+  # Measured with the pack resident: 15536 MiB of 16376 MiB. Declared
+  # because the shards (29.6 GB + 28.8 GB; the PLE table never enters
+  # VRAM) would make any file-size estimate meaningless — and would
+  # wrongly disable the audio/image VRAM guards.
+  vram_gb: 15.2
+  # Reload ~2.5 min warm (135 s measured; cold-cache first boot after a
+  # reboot took 807 s once): keep it resident far longer than the default
+  # window. 0 would mean "never unload".
+  idle_unload_seconds: 14400

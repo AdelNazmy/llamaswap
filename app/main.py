@@ -199,6 +199,7 @@ async def lifespan(app: FastAPI):
         stop_timeout=settings.stop_timeout,
         health_interval=settings.health_interval,
         idle_unload_seconds=settings.idle_unload_seconds,
+        config_dir=settings.llm_tmp_dir,
     )
     # Audio (tts/asr) managers: one per role, on-demand like the chat
     # LLM — nothing boots here, the first request launches a server

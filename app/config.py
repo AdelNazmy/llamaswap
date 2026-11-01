@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # transcription API takes a server-side path (audio.cpp). Must be
     # writable by llamaswap AND readable by the backend process.
     audio_tmp_dir: str = "/tmp/llamaswap-audio"
+    # Where the proxy renders per-model config files for chat backends
+    # launched from a structured config (strata serve --profile). Must be
+    # writable by llamaswap AND readable by the backend process.
+    llm_tmp_dir: str = "/tmp/llamaswap-llm"
     log_level: str = "INFO"
 
     # Per-role idle-unload overrides. None inherits idle_unload_seconds;

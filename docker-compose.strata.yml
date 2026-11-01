@@ -1,0 +1,45 @@
+# Opt-in compose overlay that enables the Strata engine as a managed chat
+# backend — see backend/qwen3.8-flash-next-coder-iq1_m.yaml (text) and
+# backend/qwen3.8-flash-next-coder-iq1_m-vision.yaml (picture reading) for
+# the model entries.
+#
+# Usage:
+#   ./scripts/deploy.sh            # includes strata by default (auto-skips
+#                                  # on machines without the files)
+#   or directly:
+#   docker compose -f docker-compose.yml -f docker-compose.strata.yml up -d
+#
+# What is mounted:
+#   * The Strata install (~/.local/share/strata: the terminal bundle with
+#     the `strata` launcher and the engine components) — read-only, at the
+#     SAME path it has on the host, so the paths in the model YAMLs are
+#     valid in both worlds. The backend process runs as root in the
+#     container, and Strata resolves its install via $HOME — the model
+#     YAMLs pin HOME to /home/adnathan for exactly this reason.
+#   * The model disk (/mnt/d/MODELS: packs, shards, mmproj, MTP) —
+#     read-only, same path as on the host.
+#
+# Strata's own state (launch records, engine logs under
+# LLAMASWAP_LLM_TMP_DIR) lands on the container's writable layer; nothing
+# in the mounts is written.
+#
+# NOTE: the standalone Strata instance (strata serve on :8081) holds the
+# same ~15.2 GiB this backend needs. Stop it before loading the model
+# through llamaswap, and point its clients (e.g. opencode's `strata`
+# provider, http://localhost:8081/v1) at llamaswap's published port
+# instead — the proxy then boots/stops Strata per demand:
+#   pkill -f "strata serve"
+services:
+  llamaswap:
+    environment:
+      # The IQ1_M pack reloads in ~2.5 min warm (135 s measured), but the
+      # FIRST boot after a reboot is much slower (cold page cache over the
+      # WSL mount: 807 s once measured) — over the base 600 s ceiling, so
+      # the strata deployment raises it. Idle unload is unchanged (the
+      # models themselves override it with meta.idle_unload_seconds).
+      LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-1800}"
+    volumes:
+      # Strata terminal bundle + engine components (ro, same-path)
+      - /home/adnathan/.local/share/strata:/home/adnathan/.local/share/strata:ro
+      # Model weights: shards, STRATA packs, MTP, mmproj (ro, same-path)
+      - /mnt/d/MODELS:/mnt/d/MODELS:ro

@@ -1,0 +1,90 @@
+# Vision-capable chat model: same Strata IQ1_M pack as
+# backend/qwen3.8-flash-next-coder-iq1_m.yaml, plus the picture reader
+# (bare --vision + a `vision` section in the run config). The strata
+# server starts `strata-vision` beside the engine; image parts of chat
+# messages are embedded by the reader (mmproj) and answered by the text
+# engine.
+#
+# The reader needs the mmproj file and the text model path (opened
+# vocab-only); both live on the model disk mounted by
+# docker-compose.strata.yml. Image GENERATION is unrelated and stays on
+# the sd-server tenants (role: image) — this variant only READS pictures.
+#
+# Same role (llm) and same port as the text-only variant: swapping between
+# them is an ordinary model swap. The picture reader runs on the CPU (see
+# the vision section below), so it adds no VRAM on top of the pack's
+# ~15.2 GiB (meta.vram_gb covers the pack).
+#
+# NOTE: an engine update changes the components folder name — refresh the
+# pinned strata-vision path below after `strata components engine` adds a
+# new version (the top-level engine itself is "component:strata-engine"
+# and needs no edit).
+name: qwen3.8-flash-next-coder-iq1_m-vision
+description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — chat + picture reading"
+command:
+  binary: /home/adnathan/.local/share/strata/terminal/current/bin/strata
+  args:
+    - "serve"
+    - "--profile"
+    - "{config_path}"
+    - "--offline"
+    - "--shutdown-timeout"
+    - "20"
+  config_json:
+    exe: "component:strata-engine"
+    args:
+      - "--vision"
+      - "--native"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+      - "--ple-gguf"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+      - "--expert-profile"
+      - "/home/adnathan/.local/share/strata/terminal/0.1.54/data/expert-profile-coder.bin"
+      - "--expert-cache"
+      - "auto"
+      - "--prefill"
+      - "auto"
+      - "--spec"
+      - "4"
+      - "--spec-min-p"
+      - "0.5"
+      - "--max-context"
+      - "131072"
+      - "--kv"
+      - "int8"
+      - "--resident-experts"
+      - "--mtp"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/mtp/rt"
+      - "--pack"
+      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m"
+    # The picture reader. "model" is the text gguf (vocab-only read).
+    # gpu: false → the reader runs on the CPU: the pack alone takes
+    # ~15.2 GiB of the 16 GB card, so the GPU reader (~1.1 GB more) would
+    # not fit — and the reader on the CPU takes no VRAM (strata's own
+    # sizing also puts readers on the CPU below its GPU threshold). Flip
+    # to true only on a bigger card.
+    vision:
+      exe: /home/adnathan/.local/share/strata/components/engine/0.1.54-linux-x86_64-cuda-cuda13/strata-vision
+      mmproj: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+      model: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
+      gpu: false
+      max_tokens: 300
+    log: "{config_path}.engine.log"
+    cwd: /home/adnathan/.local/share/strata/terminal/current
+    tokenizer: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m/tokenizer
+    model_name: "{name}"
+    idle_unload_s: 0
+    open_browser: false
+  env:
+    STRATA_DEFAULTS: "026"
+    CUDA_VISIBLE_DEVICES: "0"
+    # Strata resolves its install via $HOME; see the text-only variant.
+    HOME: /home/adnathan
+host: 127.0.0.1
+port: 8101
+meta:
+  context_length: 131072
+  family: qwen
+  capabilities: [chat, vision]
+  vram_gb: 15.2
+  idle_unload_seconds: 14400
