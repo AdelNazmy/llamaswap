@@ -15,14 +15,18 @@
 # the vision section below), so it adds no VRAM on top of the pack's
 # ~15.2 GiB (meta.vram_gb covers the pack).
 #
-# NOTE: an engine update changes the components folder name — refresh the
-# pinned strata-vision path below after `strata components engine` adds a
-# new version (the top-level engine itself is "component:strata-engine"
-# and needs no edit).
+# NOTE: an engine update changes the components folder name — deploy.sh
+# sniffs it into ${STRATA_ENGINE_DIR} on every deploy (deploy-time env
+# expansion, see app/registry.py), so no edit is needed; the top-level
+# engine itself is "component:strata-engine" and never needed one.
 name: qwen3.8-flash-next-coder-iq1_m-vision
 description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — chat + picture reading"
 command:
-  binary: /home/adnathan/.local/share/strata/terminal/current/bin/strata
+  # Fixed container mount (docker-compose.strata.yml) + deploy-time version
+  # pin; terminal/current is deliberately NOT used — it is an absolute
+  # symlink into the HOST home and dies inside the container (see the
+  # text-only variant).
+  binary: /opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/bin/strata
   args:
     - "serve"
     - "--profile"
@@ -35,11 +39,11 @@ command:
     args:
       - "--vision"
       - "--native"
-      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
       - "--ple-gguf"
-      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
       - "--expert-profile"
-      - "/home/adnathan/.local/share/strata/terminal/0.1.54/data/expert-profile-coder.bin"
+      - "/opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/data/expert-profile-coder.bin"
       - "--expert-cache"
       - "auto"
       - "--prefill"
@@ -54,9 +58,9 @@ command:
       - "int8"
       - "--resident-experts"
       - "--mtp"
-      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/mtp/rt"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/mtp/rt"
       - "--pack"
-      - "/mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m"
     # The picture reader. "model" is the text gguf (vocab-only read).
     # gpu: false → the reader runs on the CPU: the pack alone takes
     # ~15.2 GiB of the 16 GB card, so the GPU reader (~1.1 GB more) would
@@ -64,14 +68,15 @@ command:
     # sizing also puts readers on the CPU below its GPU threshold). Flip
     # to true only on a bigger card.
     vision:
-      exe: /home/adnathan/.local/share/strata/components/engine/0.1.54-linux-x86_64-cuda-cuda13/strata-vision
-      mmproj: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mmproj-Qwen3.8-Flash-Next-BF16.gguf
-      model: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
+      exe: /opt/strata/.local/share/strata/${STRATA_ENGINE_DIR}/strata-vision
+      mmproj: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+      model: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
       gpu: false
       max_tokens: 300
     log: "{config_path}.engine.log"
-    cwd: /home/adnathan/.local/share/strata/terminal/current
-    tokenizer: /mnt/d/MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m/tokenizer
+    # versioned terminal dir, not terminal/current (see binary, above)
+    cwd: /opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}
+    tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m/tokenizer
     model_name: "{name}"
     idle_unload_s: 0
     open_browser: false
@@ -79,7 +84,7 @@ command:
     STRATA_DEFAULTS: "026"
     CUDA_VISIBLE_DEVICES: "0"
     # Strata resolves its install via $HOME; see the text-only variant.
-    HOME: /home/adnathan
+    HOME: /opt/strata
 host: 127.0.0.1
 port: 8101
 meta:

@@ -1,14 +1,13 @@
 """llamaswap — an OpenAI-compatible proxy in front of llama-server.
 
 Model registry lives in backend/*.yaml; the requested model is launched
-(or swapped in) transparently on demand. The embedding server is started
-at boot and kept running (only stopped to free VRAM for an LLM) unless
-``embedding_auto_start`` is false, in which case it boots on first use
-like the other on-demand servers:
+(or swapped in) transparently on demand. The embedding server boots on
+first use like the other on-demand servers (set ``embedding_auto_start``
+to true to start it at boot instead):
 
   * ``embedding`` — dedicated embedding llama-server (EmbeddingManager),
-    started at boot by default (or on the first /v1/embeddings request
-    when ``LLAMASWAP_EMBEDDING_AUTO_START=false``)
+    started on the first /v1/embeddings request (or at boot when
+    ``LLAMASWAP_EMBEDDING_AUTO_START=true``)
   * ``chat`` — one LLM at a time (ProcessManager), swapped on request and
     unloaded after ``idle_unload_seconds`` with no requests
   * ``tts`` / ``asr`` — audio servers (RoleServerManager) that boot on
@@ -261,10 +260,11 @@ async def lifespan(app: FastAPI):
     )
     app.state.music_manager.configure(app.state.registry.role_configs("music"))
 
-    # Dedicated embedding server: launched at boot and kept running for
-    # the lifetime of the proxy (only stopped to free VRAM for an LLM),
-    # unless LLAMASWAP_EMBEDDING_AUTO_START=false — then it boots on first
-    # use like the other on-demand servers (chat, TTS/ASR, image).
+    # Dedicated embedding server: boots on first use like the other
+    # on-demand servers (chat, TTS/ASR, image); with
+    # LLAMASWAP_EMBEDDING_AUTO_START=true it is launched at boot instead
+    # and kept running for the proxy's lifetime (only stopped to free
+    # VRAM for an LLM).
     app.state.embedding_manager = None
     emb_cfg = app.state.registry.embedding_config()
     if emb_cfg is not None:
@@ -284,9 +284,10 @@ async def lifespan(app: FastAPI):
                 )
         else:
             logger.info(
-                "embedding server '%s' is on-demand "
-                "(LLAMASWAP_EMBEDDING_AUTO_START=false); it will launch "
-                "on the first /v1/embeddings request", emb_cfg.name,
+                "embedding server '%s' is on-demand (default); set "
+                "LLAMASWAP_EMBEDDING_AUTO_START=true to start it at boot — "
+                "it will launch on the first /v1/embeddings request",
+                emb_cfg.name,
             )
     logger.info(
         "llamaswap ready on %s:%d (%d models)",

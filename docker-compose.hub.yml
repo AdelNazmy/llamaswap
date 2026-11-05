@@ -14,6 +14,27 @@
 #
 #   docker compose -f docker-compose.hub.yml run --rm models-init
 #
+# Strata engine: included in this file — nothing to layer, nothing to
+# build (Strata is runtime-only). Two host requirements:
+#
+#   1. a Strata install at ~/.local/share/strata (override: STRATA_HOME).
+#      It is bind-mounted read-only at the fixed container path
+#      /opt/strata/.local/share/strata; the entrypoint sniffs the installed
+#      version pins at startup (no deploy.sh needed).
+#   2. the Strata weights (shards, pack, MTP, mmproj) under /opt/models,
+#      the same shared model root as every other backend:
+#      /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/...
+#
+# Without an install the container runs fine — docker creates an empty dir
+# and the two strata models sit unusable in the registry. Stop any
+# standalone `strata serve` first: it holds the same ~15.2 GiB of VRAM.
+#
+# IMAGE STALENESS: the published image must be newer than the Strata
+# backend configs and the registry ${...} env expansion (app/registry.py)
+# — an older image logs
+# `binary not found: /opt/strata/.../${STRATA_TERMINAL_VERSION}...`
+# warnings; rebuild + republish, or run from the local compose files.
+#
 # Requirements: Docker with the NVIDIA container runtime (the container
 # reserves all GPUs for CUDA backends) and the model weights volume.
 
@@ -36,7 +57,10 @@ services:
       LLAMASWAP_HOST: "${LLAMASWAP_HOST:-0.0.0.0}"
       LLAMASWAP_PORT: "${LLAMASWAP_PORT:-11434}"
       LLAMASWAP_BACKEND_DIR: "${LLAMASWAP_BACKEND_DIR:-backend}"
-      LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-600.0}"
+      # Raised over the 600 s app default to cover the Strata pack's cold
+      # first load (~13 min after a reboot); every other backend loads in
+      # seconds, so an inflated ceiling is harmless.
+      LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-1800.0}"
       LLAMASWAP_STOP_TIMEOUT: "${LLAMASWAP_STOP_TIMEOUT:-30.0}"
       LLAMASWAP_HEALTH_INTERVAL: "${LLAMASWAP_HEALTH_INTERVAL:-1.0}"
       # Unload the chat LLM AND audio (tts/asr) servers after this many
@@ -67,12 +91,27 @@ services:
       LLAMASWAP_API_KEY: "${LLAMASWAP_API_KEY:-}"
       LLAMASWAP_ADMIN_KEY: "${LLAMASWAP_ADMIN_KEY:-}"
       LLAMASWAP_MAX_CONCURRENCY: "${LLAMASWAP_MAX_CONCURRENCY:-0}"
+      # Deploy-time pins for the optional Strata backends. Empty = the
+      # entrypoint sniffs them off the mounted install at startup
+      # (scripts/docker-entrypoint.sh); set them explicitly only if the
+      # sniff cannot match your install's layout.
+      STRATA_TERMINAL_VERSION: "${STRATA_TERMINAL_VERSION:-}"
+      STRATA_ENGINE_DIR: "${STRATA_ENGINE_DIR:-}"
     volumes:
       # Model weights on host (/opt/models). rw because the optional
-      # models-init services below download into it.
+      # models-init services below download into it. Also serves the
+      # Strata shards/packs/MTP — they live under the same shared root
+      # (STRATA_MODELS-style separation is only needed by the stacked
+      # local deployment, docker-compose.strata.yml).
       - ${MODEL_ROOT:-/opt/models}:/opt/models
       # Staging area for multipart audio uploads (audio.cpp transcriptions).
       - /tmp/llamaswap-audio:/tmp/llamaswap-audio
+      # Optional Strata install (terminal bundle + engine components),
+      # read-only at the fixed container path the backend YAMLs reference.
+      # Absent install: docker creates an empty dir, the entrypoint skips
+      # its sniff and the two strata models simply sit unusable in the
+      # registry, like any backend with missing weights.
+      - ${STRATA_HOME:-$HOME/.local/share/strata}:/opt/strata/.local/share/strata:ro
     deploy:
       resources:
         reservations:

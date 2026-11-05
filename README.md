@@ -20,9 +20,9 @@ generation** (MiniMax Music 3) is served by `/v1/audio/music`, a small JSON
 dialect translated to audio.cpp's generic generation endpoint (caption +
 lyrics in, WAV song out).
 
-**The embedding server is persistent by default** (set
-`LLAMASWAP_EMBEDDING_AUTO_START=false` to make it on-demand like the
-others). The chat LLM and every TTS/ASR server are on-demand: nothing
+**The embedding server is on-demand by default** (set
+`LLAMASWAP_EMBEDDING_AUTO_START=true` to boot it at startup and keep it
+persistent). The chat LLM and every TTS/ASR server are on-demand: nothing
 boots until a request names them, and each is stopped again after
 `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default 300 s) with no requests — the
 same idle-unload policy everywhere.
@@ -105,7 +105,7 @@ image or music servers (or a failed big-LLM load).
 
 | Tenant | Manager | Lifetime |
 |---|---|---|
-| Embedding | `EmbeddingManager` | persistent by default (boots at startup); on-demand when `LLAMASWAP_EMBEDDING_AUTO_START=false` |
+| Embedding | `EmbeddingManager` | on-demand by default; persistent when `LLAMASWAP_EMBEDDING_AUTO_START=true` |
 | Chat LLM | `ProcessManager` | on-demand, one at a time, idle-unloaded |
 | TTS / ASR | `RoleServerManager` ×2 | on-demand per role, idle-unloaded |
 | Image | `RoleServerManager` ×1 | on-demand, idle-unloaded |
@@ -437,6 +437,13 @@ fight over the internal port.
 
 The published image already contains everything: the proxy, the audio.cpp /
 whisper.cpp / sd-server backends, and ffmpeg — nothing is compiled locally.
+The Strata engine is included too (runtime-only): when the host has a
+Strata install at `~/.local/share/strata` (override: `STRATA_HOME`) it is
+bind-mounted read-only at a fixed container path and the entrypoint sniffs
+the installed version pins at startup — zero configuration. Its weights
+(shards, STRATA pack, MTP, mmproj) live under the shared `/opt/models`
+root like every other backend. Without an install the container runs fine
+and the two strata models simply sit unused in the registry.
 
 ```bash
 # 1) pull and start (weights mount + GPU reservation come with the compose file)
@@ -1292,11 +1299,12 @@ piling up on a slow model load.
 
 ## Notes
 
-- The embedding server starts with the proxy by default. If it fails to
-  start, the proxy still starts and reports the embedding state in
-  `/health`. Set `LLAMASWAP_EMBEDDING_AUTO_START=false` to make it boot
-  on first use like the chat LLM, TTS/ASR, and image servers, which
-  always start on first use instead of booting with the proxy.
+- The embedding server boots on first use by default, like the chat LLM,
+  TTS/ASR, and image servers, which always start on first use instead of
+  booting with the proxy. If it fails to start, the proxy still starts
+  and reports the embedding state in `/health`. Set
+  `LLAMASWAP_EMBEDDING_AUTO_START=true` to launch it with the proxy and
+  keep it resident.
 - Requesting a "big" chat LLM (anything other than the smallest by
   weights-file size) unloads any running TTS/ASR servers first to free
   VRAM — the embedding server is left running. Disable with

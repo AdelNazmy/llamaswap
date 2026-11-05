@@ -10,14 +10,31 @@
 #   docker compose -f docker-compose.yml -f docker-compose.strata.yml up -d
 #
 # What is mounted:
-#   * The Strata install (~/.local/share/strata: the terminal bundle with
-#     the `strata` launcher and the engine components) — read-only, at the
-#     SAME path it has on the host, so the paths in the model YAMLs are
-#     valid in both worlds. The backend process runs as root in the
-#     container, and Strata resolves its install via $HOME — the model
-#     YAMLs pin HOME to /home/adnathan for exactly this reason.
-#   * The model disk (/mnt/d/MODELS: packs, shards, mmproj, MTP) —
-#     read-only, same path as on the host.
+#   * The Strata install (STRATA_HOME, default $HOME/.local/share/strata:
+#     the terminal bundle with the `strata` launcher and the engine
+#     components) — read-only, at a FIXED container path
+#     (/opt/strata/.local/share/strata). The backend process runs as root
+#     in the container, and Strata resolves its install via $HOME — the
+#     model YAMLs pin HOME to /opt/strata for exactly this reason. Keeping
+#     the container side fixed (while the host side adapts to whoever
+#     installed Strata) means no username appears anywhere in the model
+#     YAMLs, like the /opt/... paths of the llama.cpp backends.
+#   * The model disk (STRATA_MODELS, default /opt/models — the same shared
+#     model root as every other backend: shards, STRATA pack, MTP, mmproj)
+#     — read-only, mounted at the same /opt/models path the YAML args
+#     reference. Point STRATA_MODELS elsewhere (e.g. a dedicated data
+#     disk) if the Strata weights live outside the shared root; the
+#     container-side target stays /opt/models either way.
+#
+# Deploy-time values the registry YAMLs expand (${STRATA_TERMINAL_VERSION},
+# ${STRATA_ENGINE_DIR} — see app/registry.py): deploy.sh sniffs both off
+# the installed bundle and exports them; without deploy.sh, the image's
+# entrypoint (scripts/docker-entrypoint.sh) sniffs the same values at
+# container start. There are no hardcoded version defaults.
+#
+# Inside the container, paths must reference the VERSIONED terminal dir
+# (terminal/<version>), never terminal/current: that symlink carries an
+# ABSOLUTE host path (<home>/<user>/...) that does not exist here.
 #
 # Strata's own state (launch records, engine logs under
 # LLAMASWAP_LLM_TMP_DIR) lands on the container's writable layer; nothing
@@ -33,13 +50,27 @@ services:
   llamaswap:
     environment:
       # The IQ1_M pack reloads in ~2.5 min warm (135 s measured), but the
-      # FIRST boot after a reboot is much slower (cold page cache over the
-      # WSL mount: 807 s once measured) — over the base 600 s ceiling, so
-      # the strata deployment raises it. Idle unload is unchanged (the
-      # models themselves override it with meta.idle_unload_seconds).
+      # FIRST boot after a reboot is much slower (cold page cache; 807 s
+      # once measured while the weights still lived on a WSL drive mount)
+      # — over the base 600 s ceiling, so the strata deployment raises it.
+      # Idle unload is unchanged (the models themselves override it with
+      # meta.idle_unload_seconds).
       LLAMASWAP_STARTUP_TIMEOUT: "${LLAMASWAP_STARTUP_TIMEOUT:-1800}"
+      # Deploy-time pins for the registry YAMLs' ${...} env expansion.
+      # deploy.sh exports the sniffed values; direct stacked compose users
+      # get them from the image entrypoint's sniff (scripts/
+      # docker-entrypoint.sh) — hence the empty pass-through defaults.
+      STRATA_TERMINAL_VERSION: "${STRATA_TERMINAL_VERSION:-}"
+      STRATA_ENGINE_DIR: "${STRATA_ENGINE_DIR:-}"
     volumes:
-      # Strata terminal bundle + engine components (ro, same-path)
-      - /home/adnathan/.local/share/strata:/home/adnathan/.local/share/strata:ro
-      # Model weights: shards, STRATA packs, MTP, mmproj (ro, same-path)
-      - /mnt/d/MODELS:/mnt/d/MODELS:ro
+      # Strata terminal bundle + engine components (ro, fixed container
+      # path; host side adapts via STRATA_HOME)
+      - ${STRATA_HOME:-$HOME/.local/share/strata}:/opt/strata/.local/share/strata:ro
+      # Model weights: shards, STRATA packs, MTP, mmproj (ro, fixed
+      # container path; host side adapts via STRATA_MODELS — by default the
+      # shared /opt/models root, which the base compose already mounts; the
+      # explicit entry lets STRATA_MODELS point at a different disk).
+      # deploy.sh exports STRATA_MODELS=$MODEL_ROOT automatically; direct
+      # hub+strata users with a relocated MODEL_ROOT must set
+      # STRATA_MODELS to match (compose cannot chain the two defaults).
+      - ${STRATA_MODELS:-/opt/models}:/opt/models:ro

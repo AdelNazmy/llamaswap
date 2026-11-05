@@ -48,13 +48,66 @@
 #   MODEL_ROOT            shared model dir to check/download into
 #                         (default: /opt/models)
 #   STRATA_HOME           Strata install to mount with --strata
-#                         (default: /home/adnathan/.local/share/strata —
-#                         must match docker-compose.strata.yml)
+#                         (default: $HOME/.local/share/strata; the
+#                         container side is always /opt/strata/...)
+#   STRATA_MODELS         model disk to mount with --strata
+#                         (default: $MODEL_ROOT)
+#   STRATA_TERMINAL_VERSION / STRATA_ENGINE_DIR
+#                         version pins the model YAMLs expand (auto-sniffed
+#                         off the install; see app/registry.py)
+#
+# An optional ./.env is sourced before any of these defaults are applied —
+# precedence matches docker compose: shell environment beats .env.
 
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
+
+# --- optional .env (host-side deploy configuration) --------------------------
+# Source ./.env (if present) so THIS script's own logic — the path
+# validations, version sniff, health-check port — agrees with what
+# `docker compose` substitutes into the services. Compose reads .env itself;
+# sourcing only aligns deploy.sh with it. Precedence mirrors compose:
+# a variable already in the shell environment wins over the file, so
+# `STRATA_HOME=/x ./scripts/deploy.sh` always beats the .env value.
+# Recognized lines: comments, blanks, KEY=VALUE, optional `export ` prefix,
+# optional surrounding quotes, inline ` # comment` on unquoted values,
+# CRLF line endings.
+if [ -f .env ]; then
+    cr=$(printf '\r')
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%"$cr"}
+        case $line in
+            ''|\#*) continue ;;
+            export\ *) line=${line#export } ;;
+        esac
+        case $line in
+            *=*) ;;
+            *) continue ;;
+        esac
+        key=${line%%=*}
+        value=${line#*=}
+        # only valid shell identifiers become variables
+        case $key in
+            ''|*[!A-Za-z0-9_]*) continue ;;
+        esac
+        case $value in
+            # quoted: cut at the CLOSING quote — anything after it (e.g.
+            # ` # comment`) is dropped, and `#` inside the quotes survives
+            \"*) value=${value#\"}; value=${value%%\"*} ;;
+            \'*) value=${value#\'}; value=${value%%\'*} ;;
+            # unquoted: strip an inline comment
+            *) value=${value%%' #'*} ;;
+        esac
+        # shell environment wins: skip keys already set (even to empty) —
+        # `${VAR+x}` is "x" when set, empty when unset; the key was
+        # validated as an identifier above, so the eval is safe.
+        if [ -z "$(eval "printf '%s' \"\${$key+x}\"")" ]; then
+            export "$key=$value"
+        fi
+    done < .env
+fi
 
 INCLUDE_AUDIO=1
 INCLUDE_IMAGE=1
@@ -64,6 +117,10 @@ DO_UP=1
 VERIFY=0
 PORT="${LLAMASWAP_PORT:-11434}"
 WAIT="${LLAMASWAP_DEPLOY_WAIT:-180}"
+# Shared model root — the single source of truth for STRATA_MODELS below
+# and for download-models.sh (exported so the `sh` subprocess sees it).
+MODEL_ROOT="${MODEL_ROOT:-/opt/models}"
+export MODEL_ROOT
 
 usage() {
     cat <<'EOF'
@@ -142,13 +199,13 @@ if [ "$INCLUDE_IMAGE" = 1 ]; then
 fi
 
 # Strata: runtime-only overlay — no image to build, but the bind mounts and
-# the pack files must exist on the host (paths must match
-# docker-compose.strata.yml, which mounts STRATA_HOME at the same path).
-# A default deploy auto-skips strata when they are missing; an explicit
-# --strata makes that an error instead.
+# the pack files must exist on the host (docker-compose.strata.yml mounts
+# STRATA_HOME at the fixed container path /opt/strata/... and STRATA_MODELS
+# at /opt/models). A default deploy auto-skips strata when they are
+# missing; an explicit --strata makes that an error instead.
 if [ "$INCLUDE_STRATA" = 1 ]; then
-    STRATA_HOME="${STRATA_HOME:-/home/adnathan/.local/share/strata}"
-    STRATA_MODELS="${STRATA_MODELS:-/mnt/d/MODELS}"
+    STRATA_HOME="${STRATA_HOME:-$HOME/.local/share/strata}"
+    STRATA_MODELS="${STRATA_MODELS:-$MODEL_ROOT}"
     STRATA_PACK="$STRATA_MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M"
 
     require_x "$STRATA_HOME/terminal/current/bin/strata"
@@ -189,6 +246,18 @@ if [ "$INCLUDE_STRATA" = 1 ]; then
         echo "        the VRAM the managed pack needs; stop it (pkill -f 'strata serve')" >&2
         echo "        and repoint its clients at llamaswap's published port" >&2
     fi
+fi
+
+# Strata version pins, sniffed off the install: the model YAMLs reference
+# the versioned terminal dir and engine folder via ${STRATA_TERMINAL_VERSION}
+# / ${STRATA_ENGINE_DIR} (expanded by app/registry.py from the environment
+# docker-compose.strata.yml passes into the container). Run AFTER the file
+# checks: they guarantee both sources exist. Overrides stay respected.
+if [ "$INCLUDE_STRATA" = 1 ]; then
+    : "${STRATA_TERMINAL_VERSION:=$(basename "$(readlink -f "$STRATA_HOME/terminal/current")")}"
+    : "${STRATA_ENGINE_DIR:=$(ls -1 "$STRATA_HOME/components/engine" 2>/dev/null | head -n1)}"
+    export STRATA_TERMINAL_VERSION STRATA_ENGINE_DIR
+    echo "==> strata version pins: terminal=$STRATA_TERMINAL_VERSION engine=$STRATA_ENGINE_DIR"
 fi
 
 if [ "$MISSING" = 1 ]; then
@@ -293,9 +362,6 @@ ensure_aria2c() { # -> 0 once aria2c is on PATH
 # required bundles are missing and only invoke the download when there is
 # work to do.
 if [ "$DO_UP" = 1 ]; then
-    MODEL_ROOT="${MODEL_ROOT:-/opt/models}"
-    export MODEL_ROOT
-
     NEEDED=
     if [ "$INCLUDE_AUDIO" = 1 ]; then
         NEEDED="$NEEDED tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3"

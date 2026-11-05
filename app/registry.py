@@ -1,6 +1,7 @@
 """Model registry: loads per-model YAML launch configs from the backend dir."""
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -216,6 +217,37 @@ def _coerce_num_strings(value: Any) -> Any:
     return value
 
 
+ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env(value: Any) -> Any:
+    """Recursively expand ``${VAR}`` in strings from ``os.environ``.
+
+    Backends whose files live outside the image (Strata's terminal bundle
+    and engine components) are bind-mounted to a FIXED container path
+    (/opt/strata/...), but the installed version is only known at deploy
+    time — those paths come in as ``${STRATA_TERMINAL_VERSION}`` and friends,
+    set by docker-compose.strata.yml / scripts/deploy.sh.
+
+    Unknown or unset variables are left untouched: machines without the
+    Strata files keep loading the config and surface the usual
+    "binary not found" warning (deploy.sh auto-skips the overlay there)
+    instead of crashing the registry load. The single-brace ``{host}``/
+    ``{port}``/``{name}``/``{config_path}`` placeholders are unaffected —
+    this regex requires the ``$`` prefix, and expansion runs before
+    ``str.format`` sees the values.
+    """
+    if isinstance(value, str):
+        return ENV_PLACEHOLDER.sub(
+            lambda m: os.environ.get(m.group(1), m.group(0)), value
+        )
+    if isinstance(value, dict):
+        return {k: _expand_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(v) for v in value]
+    return value
+
+
 class RegistryError(Exception):
     """Raised when the registry cannot be loaded."""
 
@@ -265,7 +297,7 @@ class Registry:
         for path in sorted(self.backend_dir.glob("*.y*ml")):
             try:
                 raw: Any = yaml.safe_load(path.read_text()) or {}
-                cfg = ModelConfig.model_validate(raw)
+                cfg = ModelConfig.model_validate(_expand_env(raw))
             except Exception as exc:  # noqa: BLE001
                 raise RegistryError(f"invalid model config {path.name}: {exc}") from exc
             if cfg.name in seen_names:

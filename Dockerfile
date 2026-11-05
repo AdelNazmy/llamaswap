@@ -37,6 +37,12 @@ RUN chmod 0755 /opt/llama.cpp/build/bin/llama-prism-server
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Entrypoint: sniffes deploy-time Strata pins off the mounted install when
+# present (docker-compose.hub.yml); a no-op passthrough otherwise. CMD is
+# unchanged — the script `exec`s it.
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
 COPY app ./app
 COPY backend ./backend
 
@@ -46,4 +52,5 @@ COPY backend ./backend
 # three aliases for tooling/UX; they are the same listener.
 EXPOSE 1234 11434 9090
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11434"]
