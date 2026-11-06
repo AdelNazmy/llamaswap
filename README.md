@@ -1148,8 +1148,14 @@ as for chat.
 | `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image, and music status, plus registry warnings/degraded |
 | `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests) |
 | `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
+| `GET /api/version` | Ollama version probe (`{"version": "0.5.0"}`) |
 | `GET /api/tags` | Ollama-compatible model list (one entry per registry model, with `size`, `digest`, `details`) |
 | `GET /api/ps` | Ollama-compatible running-models list (chat LLM, embedding, TTS/ASR, image, music that are resident now, with `expires_at` from the idle unloader) |
+| `POST /api/show` | Ollama model metadata: `details`, `model_info` (context length), `capabilities`, `modified_at` |
+| `POST /api/chat` | Ollama chat adapter; NDJSON stream by default (`"stream": false` for one JSON object). Supports `messages`, `images` (base64), `tools`, `format`, and common `options` |
+| `POST /api/generate` | Ollama generate adapter around `prompt`/`system`/`images`; NDJSON stream by default; `raw` uses `/v1/completions` |
+| `POST /api/embed` | Ollama embeddings (`input` string or array) via the persistent embedding server |
+| `POST /api/embeddings` | Legacy Ollama single embedding (`prompt` or `input`) |
 
 ### Examples
 
@@ -1157,9 +1163,29 @@ as for chat.
 # list models
 curl -s localhost:11434/v1/models | jq
 
-# Ollama-compatible: list models (tags) and running models (ps)
+# Ollama-compatible: list models (tags), running models (ps), version
 curl -s localhost:11434/api/tags | jq
 curl -s localhost:11434/api/ps | jq
+curl -s localhost:11434/api/version | jq
+
+# Ollama-compatible chat (NDJSON stream by default)
+curl -N localhost:11434/api/chat -d '{
+  "model": "qwen3.5-9b",
+  "messages": [{"role": "user", "content": "Say hello in one word."}]
+}' | jq -c .
+
+# Ollama-compatible generate (add "stream": false for one JSON object)
+curl -s localhost:11434/api/generate -d '{
+  "model": "qwen3.5-9b",
+  "prompt": "Say hello in one word.",
+  "stream": false
+}' | jq
+
+# Ollama-compatible embeddings
+curl -s localhost:11434/api/embed -d '{
+  "model": "octen-embedding-0.6b",
+  "input": ["hello", "world"]
+}' | jq
 
 # OpenAI Responses API (non-streaming)
 curl -s localhost:11434/v1/responses -d '{
@@ -1292,6 +1318,19 @@ curl -s localhost:11434/v1/audio/music \
     "response_format": "wav"
   }' -o song.wav
 ```
+
+**Ollama compatibility notes.** Any client that speaks the Ollama API should
+work against `:11434`: `GET /api/tags`, `/api/ps`, `/api/version`,
+`POST /api/show`, `/api/chat`, `/api/generate`, `/api/embed` and legacy
+`/api/embeddings` are implemented. `/api/chat` and `/api/generate` stream
+NDJSON by default (`"stream": false` returns one JSON object), accept
+`images` as base64 strings, `tools`, `format`, and the common `options`
+(`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, `num_predict`,
+`presence_penalty`, `frequency_penalty`, `repeat_penalty`, ...). Models are
+the ones defined in `backend/*.yaml`; Ollama model-management endpoints
+(`/api/pull`, `/api/create`, `/api/delete`, `/api/copy`, `/api/push`) and
+per-request `num_ctx`/`keep_alive`/`template`/`suffix` are not implemented
+because the model and its context are fixed at launch time.
 
 OpenAI SDK:
 

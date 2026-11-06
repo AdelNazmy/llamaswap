@@ -35,9 +35,10 @@ chat LLM too: ``/completion``, ``/tokenize``, ``/detokenize``,
 reranking routes (``/v1/rerank``, ``/v1/reranking``, ``/rerank``). Those
 requests carry no OpenAI ``model`` field, so the backend is resolved via
 ``?model=`` in the query string, the resident chat LLM, or the first
-configured LLM. Two Ollama-compatible read-only endpoints are also
-served: ``/api/tags`` (registry model list) and ``/api/ps`` (currently
-resident backends).
+configured LLM. Ollama-compatible endpoints are served too:
+``/api/tags``, ``/api/ps``, ``/api/show``, ``/api/version``, and the
+``/api/chat``, ``/api/generate``, ``/api/embed`` and legacy
+``/api/embeddings`` adapters (NDJSON streaming by default).
 
 While tts AND asr are both loaded, a VRAM guard substitutes the smallest
 chat LLM for any requested chat model (see Settings.audio_vram_guard).
@@ -62,6 +63,7 @@ import hmac
 import json
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +73,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from . import ollama as ollama_api
 from .events import bus
 from .metrics import metrics
 from .server_manager import RoleServerLoadError, RoleServerManager
@@ -481,30 +484,19 @@ async def reset(request: Request):
     return _health_snapshot(request)
 
 
-async def _ensure_and_route(
-    request: Request, path: str, *, require_model: bool = True,
-    native: bool = False, method: str = "POST",
+async def _resolve_chat_model(
+    request: Request, model: Optional[str], *, require_model: bool = True,
 ):
-    """Ensure the chat LLM named by the request is loaded, then proxy.
+    """Resolve and load the chat LLM for a request.
 
-    With ``require_model=False`` (llama.cpp native endpoints, which carry
-    no OpenAI ``model`` field) the model falls back to ``?model=`` in the
-    query string, then the currently loaded chat LLM, then the first
-    configured LLM — the same heuristic as ``/v1/model/info``.
-    ``native=True`` strips the ``model`` field from the body before
-    forwarding (llamaswap uses it only to pick the backend), and
-    ``method`` selects GET vs POST forwarding; the incoming query string
-    is always preserved (needed by ``/slots/{id}?action=save|restore``).
+    Shared by the OpenAI/native passthrough routes and the Ollama adapters.
+    Returns ``(cfg, port, error_response)``; when ``error_response`` is not
+    None the caller should return it directly. Model fallback (query
+    parameter, resident LLM, first configured LLM) only applies when
+    ``require_model`` is false.
     """
     registry: Registry = request.app.state.registry
     manager: ProcessManager = request.app.state.manager
-    body = await request.body()
-    try:
-        model = extract_model(body)
-    except Exception:  # noqa: BLE001
-        model = None
-    if model is None:
-        model = request.query_params.get("model") or None
     if model is None and not require_model:
         # Resident chat LLM first, then the first configured one.
         st = manager.status()
@@ -513,17 +505,22 @@ async def _ensure_and_route(
     if model is None and not require_model:
         llms = registry.role_configs("llm")
         model = llms[0].name if llms else None
+    requested = model
+    if requested and requested not in registry.models:
+        base = requested.split(":", 1)[0]
+        if base in registry.models:
+            model = base
     if model is None:
         if require_model:
             status, payload = _error(
                 400, "'model' is required in the request body"
             )
-            return JSONResponse(status_code=status, content=payload)
+            return None, None, JSONResponse(status_code=status, content=payload)
         status, payload = _error(
             503, "no chat LLM is configured to serve llama.cpp native "
             "endpoints", "server_error",
         )
-        return JSONResponse(status_code=status, content=payload)
+        return None, None, JSONResponse(status_code=status, content=payload)
     try:
         cfg = registry.get(model)
     except UnknownModelError as exc:
@@ -531,15 +528,24 @@ async def _ensure_and_route(
         status, payload = _error(
             404, f"model '{exc.name}' not found; available: {known}"
         )
-        return JSONResponse(status_code=status, content=payload)
-    if cfg.role in ("embedding", "tts", "asr"):
+        return None, None, JSONResponse(status_code=status, content=payload)
+    if cfg.role != "llm":
+        if cfg.role == "embedding":
+            hint = "use /v1/embeddings or /api/embed instead"
+        elif cfg.role in ("tts", "asr"):
+            hint = ("use /v1/audio/speech or /v1/audio/transcriptions "
+                    "instead")
+        else:
+            hint = f"use the {cfg.role} endpoints instead"
+        article = "an" if cfg.role in (
+            "embedding", "asr", "image", "music"
+        ) else "a"
         status, payload = _error(
             400,
-            f"model '{model}' is a {cfg.role} model; "
-            "use /v1/embeddings, /v1/audio/speech or "
-            "/v1/audio/transcriptions instead",
+            f"model '{requested or model}' is {article} {cfg.role} "
+            f"model; {hint}",
         )
-        return JSONResponse(status_code=status, content=payload)
+        return None, None, JSONResponse(status_code=status, content=payload)
     settings: Settings = request.app.state.settings
     smallest = registry.smallest_llm()
     # Big-model request: stop TTS/ASR first to free VRAM (the embedding
@@ -603,13 +609,13 @@ async def _ensure_and_route(
                     f"failed to load model '{model}': {retry_exc}",
                     "server_error",
                 )
-                return JSONResponse(status_code=status, content=payload)
+                return None, None, JSONResponse(status_code=status, content=payload)
         else:
             logger.error("model load failed: %s", exc)
             status, payload = _error(
                 503, f"failed to load model '{model}': {exc}", "server_error"
             )
-            return JSONResponse(status_code=status, content=payload)
+            return None, None, JSONResponse(status_code=status, content=payload)
     # The LLM is ready. Best-effort bring the embedding server back up if
     # it was stopped to make room for an LLM; never block the response.
     # Skipped when auto-start is disabled — then the embedding server only
@@ -620,6 +626,41 @@ async def _ensure_and_route(
             embedding_manager.ensure_running()
         )
     _apply_pin(request, manager)
+    return cfg, port, None
+
+
+async def _ensure_and_route(
+    request: Request, path: str, *, require_model: bool = True,
+    native: bool = False, method: str = "POST",
+):
+    """Ensure the chat LLM named by the request is loaded, then proxy.
+
+    With ``require_model=False`` (llama.cpp native endpoints, which carry
+    no OpenAI ``model`` field) the model falls back to ``?model=`` in the
+    query string, then the currently loaded chat LLM, then the first
+    configured LLM — the same heuristic as ``/v1/model/info``.
+    ``native=True`` strips the ``model`` field from the body before
+    forwarding (llamaswap uses it only to pick the backend), and
+    ``method`` selects GET vs POST forwarding; the incoming query string
+    is always preserved (needed by ``/slots/{id}?action=save|restore``).
+    """
+    body = await request.body()
+    try:
+        model = extract_model(body)
+    except Exception:  # noqa: BLE001
+        model = None
+    if model is None:
+        model = request.query_params.get("model") or None
+    cfg, port, error = await _resolve_chat_model(
+        request, model, require_model=require_model
+    )
+    if error is not None:
+        return error
+    if cfg is None or port is None:
+        status, payload = _error(
+            503, "chat backend unavailable", "server_error"
+        )
+        return JSONResponse(status_code=status, content=payload)
     headers = _fwd_headers(request)
     # Native llama.cpp endpoints carry no OpenAI `model` selector (it is
     # llamaswap's routing key only), so drop it before forwarding.
@@ -633,7 +674,7 @@ async def _ensure_and_route(
         return JSONResponse(status_code=status, content=data)
     if extract_stream_flag(body):
         gen = proxy_stream(
-            port, cfg.host, upstream_path, body, model, headers
+            port, cfg.host, upstream_path, body, cfg.name, headers
         )
         return StreamingResponse(
             gen,
@@ -645,7 +686,7 @@ async def _ensure_and_route(
             },
         )
     status, data = await proxy_json(
-        port, cfg.host, upstream_path, body, model, headers
+        port, cfg.host, upstream_path, body, cfg.name, headers
     )
     return JSONResponse(status_code=status, content=data)
 
@@ -1650,6 +1691,362 @@ async def api_ps(request: Request):
         add(st.get("model"), st)
 
     return {"models": models}
+
+
+# ---------------------------------------------------------------------------
+# Ollama chat / generate / embed adapters
+# ---------------------------------------------------------------------------
+
+def _ollama_error(status: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": message})
+
+
+def _ollama_error_message(payload: Any) -> str:
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or err.get("type") or err)
+        if err is not None:
+            return str(err)
+        return json.dumps(payload, default=str)
+    return str(payload)
+
+
+def _ollama_error_from(response: JSONResponse) -> JSONResponse:
+    try:
+        payload = json.loads(response.body)
+    except (ValueError, TypeError):
+        return _ollama_error(response.status_code, "request failed")
+    return _ollama_error(response.status_code, _ollama_error_message(payload))
+
+
+def _ollama_upstream_error(status: int, payload: Any) -> JSONResponse:
+    return _ollama_error(status, _ollama_error_message(payload))
+
+
+async def _ollama_json(request: Request) -> Optional[dict]:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _ollama_model(registry: Registry, value: Any) -> str:
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    if name in registry.models:
+        return name
+    base = name.split(":", 1)[0]
+    if base in registry.models:
+        return base
+    return name
+
+
+def _ollama_headers(request: Request) -> dict[str, str]:
+    headers = _fwd_headers(request)
+    headers["content-type"] = "application/json"
+    return headers
+
+
+def _ollama_body_bytes(payload: dict) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode()
+
+
+def _ollama_stream_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+
+
+def _ollama_capabilities(cfg: ModelConfig) -> list[str]:
+    caps: list[str] = []
+    if cfg.role == "llm":
+        caps.append("completion")
+    elif cfg.role == "embedding":
+        caps.append("embedding")
+    if "vision" in cfg.meta.capabilities:
+        caps.append("vision")
+    if cfg.role == "llm" and any(
+        arg in ("--jinja", "--chat-template") for arg in cfg.command.args
+    ):
+        caps.append("tools")
+    return list(dict.fromkeys(caps))
+
+
+def _ollama_model_info(cfg: ModelConfig) -> dict[str, Any]:
+    info: dict[str, Any] = {}
+    family = cfg.meta.family or cfg.name
+    info["general.architecture"] = family
+    if cfg.meta.context_length:
+        info[f"{family}.context_length"] = cfg.meta.context_length
+        info["general.context_length"] = cfg.meta.context_length
+    return info
+
+
+def _ollama_embedding_input(obj: dict, *, legacy: bool) -> Optional[list[str]]:
+    value = obj.get("input")
+    if value is None and legacy:
+        value = obj.get("prompt")
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and value and all(
+        isinstance(item, str) for item in value
+    ):
+        return value
+    return None
+
+
+def _ollama_embedding_payload(
+    data: Any, *, model: str, load_ns: int, total_ns: int,
+) -> dict[str, Any]:
+    vectors: list[list[float]] = []
+    entries = data.get("data") if isinstance(data, dict) else None
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                embedding = entry.get("embedding")
+                if isinstance(embedding, list):
+                    vectors.append(embedding)
+    usage = data.get("usage") if isinstance(data, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    return {
+        "model": model,
+        "embeddings": vectors,
+        "total_duration": int(total_ns),
+        "load_duration": int(load_ns),
+        "prompt_eval_count": int(usage.get("prompt_tokens") or 0),
+    }
+
+
+@app.get("/api/version")
+async def api_version():
+    """Ollama version probe (clients use this to detect the API)."""
+    return {"version": "0.5.0"}
+
+
+@app.post("/api/show")
+async def api_show(request: Request):
+    """Ollama model metadata: details, context length and capabilities."""
+    obj = await _ollama_json(request)
+    if obj is None:
+        return _ollama_error(400, "invalid JSON body")
+    registry: Registry = request.app.state.registry
+    requested = _ollama_model(registry, obj.get("model"))
+    if not requested:
+        return _ollama_error(400, "model is required")
+    try:
+        cfg = registry.get(requested)
+    except UnknownModelError as exc:
+        return _ollama_error(
+            404,
+            f"model '{exc.name}' not found; available: {', '.join(exc.known)}",
+        )
+    _, modified_at = _model_file_info(registry, cfg)
+    return {
+        "license": "",
+        "modelfile": f"FROM {cfg.name}\n",
+        "parameters": "",
+        "template": "",
+        "details": _ollama_details(cfg),
+        "model_info": _ollama_model_info(cfg),
+        "capabilities": _ollama_capabilities(cfg),
+        "modified_at": modified_at,
+    }
+
+
+@app.post("/api/chat")
+async def api_chat(request: Request):
+    """Ollama chat completion adapter (NDJSON stream by default)."""
+    obj = await _ollama_json(request)
+    if obj is None:
+        return _ollama_error(400, "invalid JSON body")
+    registry: Registry = request.app.state.registry
+    requested = _ollama_model(registry, obj.get("model"))
+    if not requested:
+        return _ollama_error(400, "model is required")
+    messages = obj.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return _ollama_error(400, "messages must be a non-empty array")
+    started = time.perf_counter()
+    cfg, port, error = await _resolve_chat_model(request, requested)
+    load_ns = int((time.perf_counter() - started) * 1e9)
+    if error is not None:
+        return _ollama_error_from(error)
+    if cfg is None or port is None:
+        return _ollama_error(503, "chat backend unavailable")
+    obj["model"] = cfg.name
+    _, body, stream = ollama_api.openai_chat_body(obj)
+    body["model"] = cfg.name
+    headers = _ollama_headers(request)
+    created_at = ollama_api.now_rfc3339()
+    if stream:
+        sse = proxy_stream(
+            port, cfg.host, "/v1/chat/completions",
+            _ollama_body_bytes(body), cfg.name, headers,
+        )
+        ndjson = ollama_api.stream_response(
+            sse, cfg.name, generate=False, created_at=created_at,
+            started=started, load_ns=load_ns,
+        )
+        return StreamingResponse(
+            ndjson, media_type="application/x-ndjson",
+            headers=_ollama_stream_headers(),
+        )
+    status, data = await proxy_json(
+        port, cfg.host, "/v1/chat/completions",
+        _ollama_body_bytes(body), cfg.name, headers,
+    )
+    total_ns = int((time.perf_counter() - started) * 1e9)
+    if status != 200:
+        return _ollama_upstream_error(status, data)
+    return JSONResponse(
+        status_code=200,
+        content=ollama_api.chat_response(
+            data, cfg.name, created_at=created_at,
+            load_ns=load_ns, total_ns=total_ns,
+        ),
+    )
+
+
+@app.post("/api/generate")
+async def api_generate(request: Request):
+    """Ollama text-generation adapter (NDJSON stream by default)."""
+    obj = await _ollama_json(request)
+    if obj is None:
+        return _ollama_error(400, "invalid JSON body")
+    registry: Registry = request.app.state.registry
+    requested = _ollama_model(registry, obj.get("model"))
+    if not requested:
+        return _ollama_error(400, "model is required")
+    started = time.perf_counter()
+    cfg, port, error = await _resolve_chat_model(request, requested)
+    load_ns = int((time.perf_counter() - started) * 1e9)
+    if error is not None:
+        return _ollama_error_from(error)
+    if cfg is None or port is None:
+        return _ollama_error(503, "chat backend unavailable")
+    obj["model"] = cfg.name
+    _, body, stream, path = ollama_api.openai_generate_body(obj)
+    body["model"] = cfg.name
+    headers = _ollama_headers(request)
+    created_at = ollama_api.now_rfc3339()
+    if stream:
+        sse = proxy_stream(
+            port, cfg.host, path, _ollama_body_bytes(body),
+            cfg.name, headers,
+        )
+        ndjson = ollama_api.stream_response(
+            sse, cfg.name, generate=True, created_at=created_at,
+            started=started, load_ns=load_ns,
+        )
+        return StreamingResponse(
+            ndjson, media_type="application/x-ndjson",
+            headers=_ollama_stream_headers(),
+        )
+    status, data = await proxy_json(
+        port, cfg.host, path, _ollama_body_bytes(body),
+        cfg.name, headers,
+    )
+    total_ns = int((time.perf_counter() - started) * 1e9)
+    if status != 200:
+        return _ollama_upstream_error(status, data)
+    return JSONResponse(
+        status_code=200,
+        content=ollama_api.generate_response(
+            data, cfg.name, created_at=created_at,
+            load_ns=load_ns, total_ns=total_ns,
+        ),
+    )
+
+
+async def _ollama_embed_impl(request: Request, *, legacy: bool):
+    obj = await _ollama_json(request)
+    if obj is None:
+        return _ollama_error(400, "invalid JSON body")
+    registry: Registry = request.app.state.registry
+    requested = _ollama_model(registry, obj.get("model"))
+    if not requested:
+        return _ollama_error(400, "model is required")
+    try:
+        cfg = registry.get(requested)
+    except UnknownModelError as exc:
+        return _ollama_error(
+            404,
+            f"model '{exc.name}' not found; available: {', '.join(exc.known)}",
+        )
+    if cfg.role != "embedding":
+        return _ollama_error(
+            400, f"model '{requested}' is not an embedding model"
+        )
+    embedding_manager: Optional[EmbeddingManager] = (
+        request.app.state.embedding_manager
+    )
+    if embedding_manager is None:
+        return _ollama_error(503, "no embedding model is configured")
+    inputs = _ollama_embedding_input(obj, legacy=legacy)
+    if inputs is None:
+        return _ollama_error(
+            400, "input must be a string or an array of strings"
+        )
+    started = time.perf_counter()
+    load_ns = 0
+    if not embedding_manager.is_running:
+        load_started = time.perf_counter()
+        try:
+            running = await embedding_manager.ensure_running()
+        except EmbeddingLoadError as exc:
+            return _ollama_error(
+                503,
+                f"failed to load embedding model "
+                f"'{embedding_manager.name}': {exc}",
+            )
+        if not running:
+            return _ollama_error(503, "embedding server is not running")
+        load_ns = int((time.perf_counter() - load_started) * 1e9)
+    body = {"model": embedding_manager.name, "input": inputs}
+    headers = _ollama_headers(request)
+    status, data = await proxy_json(
+        embedding_manager.config.port,
+        embedding_manager.config.host,
+        "/v1/embeddings",
+        _ollama_body_bytes(body),
+        embedding_manager.name,
+        headers,
+    )
+    total_ns = int((time.perf_counter() - started) * 1e9)
+    if status != 200:
+        return _ollama_upstream_error(status, data)
+    payload = _ollama_embedding_payload(
+        data, model=embedding_manager.name,
+        load_ns=load_ns, total_ns=total_ns,
+    )
+    if legacy:
+        vectors = payload["embeddings"]
+        if not vectors:
+            return _ollama_error(
+                502, "embedding backend returned no embeddings"
+            )
+        return JSONResponse(status_code=200, content={"embedding": vectors[0]})
+    return JSONResponse(status_code=200, content=payload)
+
+
+@app.post("/api/embed")
+async def api_embed(request: Request):
+    """Ollama embedding adapter (``embeddings`` array)."""
+    return await _ollama_embed_impl(request, legacy=False)
+
+
+@app.post("/api/embeddings")
+async def api_embeddings(request: Request):
+    """Legacy Ollama embedding endpoint (single ``embedding`` array)."""
+    return await _ollama_embed_impl(request, legacy=True)
 
 
 # ---------------------------------------------------------------------------
