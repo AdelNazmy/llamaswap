@@ -39,4 +39,32 @@ if [ -d "$STRATA_INSTALL/components/engine" ] && [ -d "$STRATA_INSTALL/terminal"
     fi
 fi
 
+# Optional: install/refresh the llamaswap provider + artist/music-composer
+# skills in a mounted opencode config dir. docker-compose.hub.yml mounts the
+# host's ~/.config/opencode at /host-opencode-config and sets
+# LLAMASWAP_OPENCODE_CONFIG_DIR, so the Hub image configures opencode on
+# every start. LLAMASWAP_INSTALL_OPENCODE=0/false/no/off disables it.
+case "${LLAMASWAP_INSTALL_OPENCODE:-1}" in
+    0|false|no|off) ;;
+    *)
+        if [ -n "${LLAMASWAP_OPENCODE_CONFIG_DIR:-}" ] \
+                && [ -f /app/scripts/install-opencode.py ]; then
+            if command -v python3 >/dev/null 2>&1; then
+                if [ -n "${LLAMASWAP_OPENCODE_BASE_URL:-}" ]; then
+                    python3 /app/scripts/install-opencode.py \
+                        --config-dir "$LLAMASWAP_OPENCODE_CONFIG_DIR" \
+                        --base-url "$LLAMASWAP_OPENCODE_BASE_URL" \
+                        || echo "entrypoint: warning: opencode integration failed" >&2
+                else
+                    python3 /app/scripts/install-opencode.py \
+                        --config-dir "$LLAMASWAP_OPENCODE_CONFIG_DIR" \
+                        || echo "entrypoint: warning: opencode integration failed" >&2
+                fi
+            else
+                echo "entrypoint: warning: python3 missing; cannot install opencode integration" >&2
+            fi
+        fi
+        ;;
+esac
+
 exec "$@"

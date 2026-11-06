@@ -115,6 +115,12 @@ INCLUDE_STRATA=1
 STRATA_EXPLICIT=0
 DO_UP=1
 VERIFY=0
+# Install/refresh llamaswap's provider + skills in the user's opencode
+# config (LLAMASWAP_INSTALL_OPENCODE=0 or --no-opencode disables).
+case "${LLAMASWAP_INSTALL_OPENCODE:-1}" in
+    0|false|no|off) INSTALL_OPENCODE=0 ;;
+    *) INSTALL_OPENCODE=1 ;;
+esac
 PORT="${LLAMASWAP_PORT:-11434}"
 WAIT="${LLAMASWAP_DEPLOY_WAIT:-180}"
 # Shared model root — the single source of truth for STRATA_MODELS below
@@ -138,6 +144,8 @@ Options:
                   of auto-skipping)
   --build-only    build the images without starting the stack
   --verify        smoke-test /health and /v1/models after starting
+  --no-opencode   skip installing the llamaswap provider + skills into the
+                  default opencode config (~/.config/opencode)
   -h, --help      show this help
 
 Backends: base (llama.cpp), audio (audio.cpp + whisper.cpp),
@@ -156,6 +164,7 @@ while [ $# -gt 0 ]; do
         --no-strata)  INCLUDE_STRATA=0 ;;
         --build-only) DO_UP=0 ;;
         --verify)     VERIFY=1 ;;
+        --no-opencode) INSTALL_OPENCODE=0 ;;
         -h|--help)    usage 0 ;;
         *) echo "deploy: unknown option '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -387,6 +396,23 @@ if [ "$DO_UP" = 1 ]; then
         else
             echo "==> all required model weights present under $MODEL_ROOT"
         fi
+    fi
+fi
+
+# --- opencode integration ---------------------------------------------------
+# Merge the llamaswap provider + skills into the user's default opencode
+# config so `opencode` can select the local models (and the artist /
+# music-composer skills) without manual setup. Non-fatal: a missing python3
+# or an unwritable config never blocks the deployment.
+if [ "$INSTALL_OPENCODE" = 1 ]; then
+    echo "==> install opencode integration (llamaswap provider + skills)"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 "$ROOT/scripts/install-opencode.py" \
+            --config-dir "${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}" \
+            --base-url "${LLAMASWAP_OPENCODE_BASE_URL:-http://localhost:9090/v1}" \
+            || echo "deploy: warning: failed to update the opencode config" >&2
+    else
+        echo "deploy: python3 not found; skipping opencode integration" >&2
     fi
 fi
 

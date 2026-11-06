@@ -1,0 +1,79 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "llamaswap": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Llamaswap",
+      "options": {
+        "baseURL": "http://localhost:9090/v1"
+      },
+      "models": {
+        "qwen3.5-9b": {
+          "name": "Qwen3.5 9B",
+          "family": "qwen",
+          "attachment": true,
+          "tool_call": true,
+          "limit": {
+            "context": 32000,
+            "output": 8192
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "qwen3.6-35b": {
+          "name": "Qwen3.6 35B",
+          "family": "qwen",
+          "tool_call": true,
+          "limit": {
+            "context": 150000,
+            "output": 8192
+          }
+        },
+        "qwen3.8-27b-ridge": {
+          "name": "Qwen3.8 27B Ridge",
+          "family": "qwen",
+          "tool_call": true,
+          "limit": {
+            "context": 131000,
+            "output": 8192
+          }
+        },
+        "qwen3.8-flash-next-coder-iq1_m": {
+          "name": "Qwen3.8 Flash Next Coder IQ1_M",
+          "family": "qwen",
+          "tool_call": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "qwen3.8-flash-next-coder-iq1_m-vision": {
+          "name": "Qwen3.8 Flash Next Coder IQ1_M Vision",
+          "family": "qwen",
+          "attachment": true,
+          "tool_call": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

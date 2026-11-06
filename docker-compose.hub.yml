@@ -106,6 +106,11 @@ services:
       # sniff cannot match your install's layout.
       STRATA_TERMINAL_VERSION: "${STRATA_TERMINAL_VERSION:-}"
       STRATA_ENGINE_DIR: "${STRATA_ENGINE_DIR:-}"
+      # Install/refresh llamaswap's opencode provider + skills in the host
+      # config mounted below. Set LLAMASWAP_INSTALL_OPENCODE=false to opt out.
+      LLAMASWAP_INSTALL_OPENCODE: "${LLAMASWAP_INSTALL_OPENCODE:-true}"
+      LLAMASWAP_OPENCODE_CONFIG_DIR: "/host-opencode-config"
+      LLAMASWAP_OPENCODE_BASE_URL: "${LLAMASWAP_OPENCODE_BASE_URL:-http://localhost:9090/v1}"
     volumes:
       # Overlay the checkout's proxy code, backend configs and entrypoint
       # on top of the image. The Hub image is only rebuilt on release, so
@@ -116,6 +121,12 @@ services:
       - ./app:/app/app:ro
       - ./backend:/app/backend:ro
       - ./scripts/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
+      # opencode integration: the bundle + installer, plus the host config
+      # dir the entrypoint merges into (provider + artist/music-composer
+      # skills). Override the target with OPENCODE_CONFIG_DIR.
+      - ./opencode:/app/opencode:ro
+      - ./scripts/install-opencode.py:/app/scripts/install-opencode.py:ro
+      - ${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}:/host-opencode-config
       # Model weights on host (/opt/models). rw because the optional
       # models-init services below download into it. Also serves the
       # Strata shards/packs/MTP — they live under the same shared root

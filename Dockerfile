@@ -46,6 +46,14 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 COPY app ./app
 COPY backend ./backend
 
+# opencode integration: the provider fragment + local skills installed by
+# scripts/install-opencode.py. deploy.sh uses the checkout on the host; the
+# Hub image entrypoint uses this copy when an opencode config dir is mounted
+# (docker-compose.hub.yml).
+COPY opencode ./opencode
+COPY scripts/install-opencode.py ./scripts/install-opencode.py
+RUN chmod 0755 ./scripts/install-opencode.py
+
 # The container listens on 11434 only; docker-compose.yml publishes it on
 # the host as 11434 (default, LLAMASWAP_PORT-overridable), 9090 (legacy
 # graphify port) and 1234 (llama.cpp default port). EXPOSE documents all

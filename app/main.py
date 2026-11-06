@@ -1253,7 +1253,7 @@ async def _route_music(request: Request):
          "duration": 30,                     # optional (-> duration_sec)
          "seed": 0, "response_format": "wav", ...}
 
-    Any other field is passed through into the backend ``request`` object
+    Any other field is passed through as a backend ``request.options`` entry
     (num_inference_steps, guidance_scale, ar_guidance_scale, top_k, ...
     — audio.cpp request options), so new family options work without
     proxy changes. The response is binary audio (default WAV, transcoded
@@ -1361,9 +1361,17 @@ async def _route_music(request: Request):
         if k not in ("model", "input", "prompt", "text", "response_format")
     }
     request_obj["text"] = text
+    raw_options = request_obj.pop("options", None)
+    options = dict(raw_options) if isinstance(raw_options, dict) else {}
+    for key in list(request_obj):
+        if key in ("text", "audio", "audio_base64", "artifacts", "voice", "voice_ref"):
+            continue
+        options.setdefault(key, request_obj.pop(key))
     # OpenAI-ish duration alias (seconds) -> audio.cpp duration_sec.
-    if "duration" in request_obj:
-        request_obj.setdefault("duration_sec", request_obj.pop("duration"))
+    if "duration" in options:
+        options.setdefault("duration_sec", options.pop("duration"))
+    if options:
+        request_obj["options"] = options
     upstream = json.dumps({"model": model, "request": request_obj}).encode()
 
     status, data = await proxy_json(
