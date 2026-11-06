@@ -1005,7 +1005,8 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_IDLE_UNLOAD_AUDIO_SECONDS`, `LLAMASWAP_IDLE_UNLOAD_IMAGE_SECONDS`,
 `LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`,
 `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`, `LLAMASWAP_EMBEDDING_AUTO_START`,
-`LLAMASWAP_API_KEY`, `LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`.
+`LLAMASWAP_API_KEY`, `LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`,
+`LLAMASWAP_TOOL_RECONCILE`, `LLAMASWAP_TOOL_RECONCILE_MIN_RATIO`.
 
 ## Voice cloning with Qwen3-TTS
 
@@ -1146,7 +1147,7 @@ as for chat.
 | `GET /v1/registry/info` | Registry summary: roles, VRAM ranking, warnings, degraded conditions |
 | `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, the image and music servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
 | `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image, and music status, plus registry warnings/degraded |
-| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests) |
+| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests, recovered tool calls) |
 | `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
 | `GET /api/version` | Ollama version probe (`{"version": "0.5.0"}`) |
 | `GET /api/tags` | Ollama-compatible model list (one entry per registry model, with `size`, `digest`, `details`) |
@@ -1393,7 +1394,7 @@ localhost.
 
 **Observability.** `GET /metrics` exposes Prometheus text counters
 (model loads/unloads/swaps, load durations, load failures, HTTP requests by
-route/status). `GET /v1/events` streams `model_loaded` / `model_unloaded` /
+route/status, and tool-call outcomes by model). `GET /v1/events` streams `model_loaded` / `model_unloaded` /
 `swap` / `load_failed` as server-sent events. `LLAMASWAP_LOG_JSON=true` emits
 one JSON object per log line for log shippers.
 
@@ -1414,6 +1415,27 @@ is surfaced in `/health`, `/v1/registry/info`, and `GET /metrics`
 **Backpressure.** Set `LLAMASWAP_MAX_CONCURRENCY` to cap in-flight requests;
 when exceeded the proxy answers `429` with a `Retry-After` rather than
 piling up on a slow model load.
+
+**Tool-call recovery.** A chat backend that parses `<tool_call>` blocks validates the
+name against the tools the request declared, and when the model writes a
+name that was not declared it leaves the block in the answer as text
+(Strata reports it as `strata_rejected_tool_calls`) — the agent loop sees
+prose, no call, and spends the turn re-reading files. The common cause is
+prefix drift: clients such as opencode register MCP tools as
+`<serverName>_<toolName>`, so a server whose tools are already called
+`unity_*` is declared as `unity_unity_list_instances` while the project's
+own docs tell the model `unity_list_instances`. `app/tool_reconcile.py`
+maps such a call onto a declared tool when exactly one fits and re-emits it
+as a normal `tool_calls` entry, for both `/v1/chat/completions` modes
+(the streaming path appends the reconciled delta just before the events
+that end the stream, so reasoning still streams at full speed). Nothing is
+invented and no text is rewritten: `reconciled` is the only outcome that
+executes anything, while `ambiguous` / `unmatched` are counted
+(`llamaswap_tool_call_reconciliations_total{model=,outcome=}`) and left to
+the agent. Set `LLAMASWAP_TOOL_RECONCILE=false` to disable, and raise
+`LLAMASWAP_TOOL_RECONCILE_MIN_RATIO` (default `0.75`) to stop trusting
+fuzzy name matches. The Ollama `/api/chat` adapter and the native
+llama.cpp routes are not rewritten.
 
 ## Notes
 

@@ -100,6 +100,10 @@ services:
       LLAMASWAP_API_KEY: "${LLAMASWAP_API_KEY:-}"
       LLAMASWAP_ADMIN_KEY: "${LLAMASWAP_ADMIN_KEY:-}"
       LLAMASWAP_MAX_CONCURRENCY: "${LLAMASWAP_MAX_CONCURRENCY:-0}"
+      # Re-emit tool calls the backend refused because their name was not
+      # declared (see app/tool_reconcile.py); false disables the layer.
+      LLAMASWAP_TOOL_RECONCILE: "${LLAMASWAP_TOOL_RECONCILE:-true}"
+      LLAMASWAP_TOOL_RECONCILE_MIN_RATIO: "${LLAMASWAP_TOOL_RECONCILE_MIN_RATIO:-0.75}"
       # Deploy-time pins for the optional Strata backends. Empty = the
       # entrypoint sniffs them off the mounted install at startup
       # (scripts/docker-entrypoint.sh); set them explicitly only if the

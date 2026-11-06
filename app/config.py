@@ -120,6 +120,15 @@ class Settings(BaseSettings):
     # default human-readable format.
     log_json: bool = False
 
+    # Tool-call recovery. A backend that parses <tool_call> blocks rejects names
+    # the request never declared and leaves them in the answer as text
+    # (Strata reports them as ``strata_rejected_tool_calls``); the agent
+    # loop then burns a step re-reading files. When exactly one declared
+    # name fits, llamaswap re-emits the call. Set false to disable.
+    tool_reconcile: bool = True
+    # Below this similarity a fuzzy name match is not trusted at all.
+    tool_reconcile_min_ratio: float = 0.75
+
 
 @lru_cache
 def get_settings() -> Settings:

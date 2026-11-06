@@ -101,6 +101,7 @@ from .proxy import (
     transcode_audio,
 )
 from .registry import ModelConfig, Registry, RegistryError, UnknownModelError
+from .tool_reconcile import StreamReconciler, apply_reconcile, declared_tool_names
 
 ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("llamaswap")
@@ -631,7 +632,7 @@ async def _resolve_chat_model(
 
 async def _ensure_and_route(
     request: Request, path: str, *, require_model: bool = True,
-    native: bool = False, method: str = "POST",
+    native: bool = False, method: str = "POST", reconcile: bool = False,
 ):
     """Ensure the chat LLM named by the request is loaded, then proxy.
 
@@ -643,6 +644,9 @@ async def _ensure_and_route(
     forwarding (llamaswap uses it only to pick the backend), and
     ``method`` selects GET vs POST forwarding; the incoming query string
     is always preserved (needed by ``/slots/{id}?action=save|restore``).
+    ``reconcile=True`` additionally repairs tool calls the backend parsed
+    but refused because their name was not declared (see
+    ``app/tool_reconcile.py``); only the OpenAI chat route uses it.
     """
     body = await request.body()
     try:
@@ -672,10 +676,15 @@ async def _ensure_and_route(
             port, cfg.host, upstream_path, headers
         )
         return JSONResponse(status_code=status, content=data)
+    settings = get_settings()
+    enabled = reconcile and settings.tool_reconcile
+    declared = declared_tool_names(body) if enabled else []
     if extract_stream_flag(body):
         gen = proxy_stream(
             port, cfg.host, upstream_path, body, cfg.name, headers
         )
+        if enabled:
+            gen = _reconcile_stream(gen, declared, settings.tool_reconcile_min_ratio, cfg.name)
         return StreamingResponse(
             gen,
             media_type="text/event-stream",
@@ -688,12 +697,53 @@ async def _ensure_and_route(
     status, data = await proxy_json(
         port, cfg.host, upstream_path, body, cfg.name, headers
     )
+    if enabled and isinstance(data, dict):
+        _reconcile_json(data, declared, settings.tool_reconcile_min_ratio, cfg.name)
     return JSONResponse(status_code=status, content=data)
+
+
+async def _reconcile_stream(
+    gen, declared: list[str], min_ratio: float, model: str
+):
+    """Pass an SSE stream through a StreamReconciler (see tool_reconcile)."""
+    reconciler = StreamReconciler(declared, min_ratio)
+    try:
+        async for chunk in gen:
+            out = reconciler.feed(chunk)
+            if out:
+                yield out
+        out = reconciler.finish()
+        if out:
+            yield out
+    finally:
+        _count_reconciliations(reconciler.records, model)
+
+
+def _reconcile_json(
+    data: dict, declared: list[str], min_ratio: float, model: str
+) -> None:
+    """Re-emit refused tool calls on a non-streaming response (in place)."""
+    _count_reconciliations(
+        apply_reconcile(data, declared, min_ratio), model,
+    )
+
+
+def _count_reconciliations(records, model: str = "") -> None:
+    """One metrics increment per refused call; log only what was fixed."""
+    for name, matched, outcome in records:
+        metrics.inc_tool_call_reconcile(model, outcome)
+        if outcome == "reconciled":
+            logger.warning(
+                "undeclared tool call %r re-emitted as %r (model %s)",
+                name, matched, model,
+            )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    return await _ensure_and_route(request, "/v1/chat/completions")
+    return await _ensure_and_route(
+        request, "/v1/chat/completions", reconcile=True
+    )
 
 
 @app.post("/v1/completions")

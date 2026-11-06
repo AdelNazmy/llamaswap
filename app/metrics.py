@@ -29,6 +29,8 @@ class Metrics:
         self.swaps: DefaultDict[str, int] = defaultdict(int)
         # (method, route, status) -> count
         self.requests: DefaultDict[Tuple[str, str, int], int] = defaultdict(int)
+        # (model, outcome) -> count for recovered/undeclared tool calls
+        self.tool_calls: DefaultDict[Tuple[str, str], int] = defaultdict(int)
         # gauges (set externally by main.py)
         self.gauges: dict[str, float] = {}
 
@@ -51,6 +53,9 @@ class Metrics:
 
     def inc_request(self, method: str, route: str, status: int) -> None:
         self.requests[(method, route, status)] += 1
+
+    def inc_tool_call_reconcile(self, model: str, outcome: str) -> None:
+        self.tool_calls[(model, outcome)] += 1
 
     def set_gauge(self, name: str, value: float) -> None:
         self.gauges[name] = value
@@ -109,6 +114,14 @@ class Metrics:
         ]
         flush("llamaswap_http_requests_total",
               "HTTP requests received by the proxy.", "counter", family)
+
+        family = [
+            f'llamaswap_tool_call_reconciliations_total{{model="{m}",outcome="{o}"}} {c}'
+            for (m, o), c in sorted(self.tool_calls.items())
+        ]
+        flush("llamaswap_tool_call_reconciliations_total",
+              "Tool calls the backend refused: outcome=reconciled were re-emitted, "
+              "ambiguous/unmatched were left to the agent.", "counter", family)
 
         for name, value in sorted(self.gauges.items()):
             out.append(f"# TYPE {name} gauge")
