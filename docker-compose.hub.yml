@@ -30,10 +30,14 @@
 # standalone `strata serve` first: it holds the same ~15.2 GiB of VRAM.
 #
 # IMAGE STALENESS: the published image must be newer than the Strata
-# backend configs and the registry ${...} env expansion (app/registry.py)
-# — an older image logs
+# backend configs, the registry ${...} env expansion (app/registry.py) and
+# the entrypoint. To keep a checkout working even when the Hub image lags,
+# this file overlays the checkout's app/, backend/ and entrypoint onto the
+# image (no rebuild, binaries stay from the image). An old image without
+# that overlay logs
 # `binary not found: /opt/strata/.../${STRATA_TERMINAL_VERSION}...`
-# warnings; rebuild + republish, or run from the local compose files.
+# warnings; republishing the image remains the fix for consumers who do
+# not run from a checkout.
 #
 # Requirements: Docker with the NVIDIA container runtime (the container
 # reserves all GPUs for CUDA backends) and the model weights volume.
@@ -43,6 +47,11 @@ services:
     # Same image that adelnazmy2002/llamaswap:latest publishes —
     # pulled from Docker Hub, never built locally.
     image: adelnazmy2002/llamaswap:latest
+    # Use the checkout's entrypoint (the published image may predate it);
+    # it sniffs the Strata version pins off the mounted install. Compose
+    # clears the image CMD when an entrypoint is set, so repeat it here.
+    entrypoint: ["/usr/local/bin/docker-entrypoint.sh"]
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11434"]
     init: true
     container_name: llamaswap
     restart: unless-stopped
@@ -98,6 +107,15 @@ services:
       STRATA_TERMINAL_VERSION: "${STRATA_TERMINAL_VERSION:-}"
       STRATA_ENGINE_DIR: "${STRATA_ENGINE_DIR:-}"
     volumes:
+      # Overlay the checkout's proxy code, backend configs and entrypoint
+      # on top of the image. The Hub image is only rebuilt on release, so
+      # without this an older image keeps its baked-in Strata paths (e.g.
+      # an absolute ~/.local/share/.../terminal/current launcher path and
+      # no ${...} env expansion) even though the repo already fixed them.
+      # Read-only: the image provides all compiled binaries and deps.
+      - ./app:/app/app:ro
+      - ./backend:/app/backend:ro
+      - ./scripts/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
       # Model weights on host (/opt/models). rw because the optional
       # models-init services below download into it. Also serves the
       # Strata shards/packs/MTP — they live under the same shared root

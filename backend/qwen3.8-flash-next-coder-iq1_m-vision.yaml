@@ -68,7 +68,7 @@ command:
     # sizing also puts readers on the CPU below its GPU threshold). Flip
     # to true only on a bigger card.
     vision:
-      exe: /opt/strata/.local/share/strata/${STRATA_ENGINE_DIR}/strata-vision
+      exe: /opt/strata/.local/share/strata/components/engine/${STRATA_ENGINE_DIR}/strata-vision
       mmproj: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mmproj-Qwen3.8-Flash-Next-BF16.gguf
       model: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
       gpu: false

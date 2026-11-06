@@ -437,7 +437,10 @@ fight over the internal port.
 
 The published image already contains everything: the proxy, the audio.cpp /
 whisper.cpp / sd-server backends, and ffmpeg — nothing is compiled locally.
-The Strata engine is included too (runtime-only): when the host has a
+When run from a checkout, the compose file overlays its `app/`, `backend/`
+and entrypoint onto the image, so an older Hub image still uses this tree's
+model configs and proxy code. The Strata engine is included too
+(runtime-only): when the host has a
 Strata install at `~/.local/share/strata` (override: `STRATA_HOME`) it is
 bind-mounted read-only at a fixed container path and the entrypoint sniffs
 the installed version pins at startup — zero configuration. Its weights
