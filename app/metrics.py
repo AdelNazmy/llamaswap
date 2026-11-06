@@ -31,6 +31,8 @@ class Metrics:
         self.requests: DefaultDict[Tuple[str, str, int], int] = defaultdict(int)
         # (model, outcome) -> count for recovered/undeclared tool calls
         self.tool_calls: DefaultDict[Tuple[str, str], int] = defaultdict(int)
+        # (model, outcome) -> count for context-window overflow trims
+        self.context_trims: DefaultDict[Tuple[str, str], int] = defaultdict(int)
         # gauges (set externally by main.py)
         self.gauges: dict[str, float] = {}
 
@@ -56,6 +58,9 @@ class Metrics:
 
     def inc_tool_call_reconcile(self, model: str, outcome: str) -> None:
         self.tool_calls[(model, outcome)] += 1
+
+    def inc_context_trim(self, model: str, outcome: str) -> None:
+        self.context_trims[(model, outcome)] += 1
 
     def set_gauge(self, name: str, value: float) -> None:
         self.gauges[name] = value
@@ -122,6 +127,15 @@ class Metrics:
         flush("llamaswap_tool_call_reconciliations_total",
               "Tool calls the backend refused: outcome=reconciled were re-emitted, "
               "ambiguous/unmatched were left to the agent.", "counter", family)
+
+        family = [
+            f'llamaswap_context_trims_total{{model="{m}",outcome="{o}"}} {c}'
+            for (m, o), c in sorted(self.context_trims.items())
+        ]
+        flush("llamaswap_context_trims_total",
+              "Chat requests retried after an upstream context-window overflow: "
+              "outcome=trimmed dropped the oldest turns from the history.",
+              "counter", family)
 
         for name, value in sorted(self.gauges.items()):
             out.append(f"# TYPE {name} gauge")

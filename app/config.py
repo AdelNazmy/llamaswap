@@ -129,6 +129,20 @@ class Settings(BaseSettings):
     # Below this similarity a fuzzy name match is not trusted at all.
     tool_reconcile_min_ratio: float = 0.75
 
+    # Context-window overflow trim. Upstream chat backends refuse a prompt
+    # that leaves no room to answer ("... request exceeds the context
+    # window: prompt (N tokens) ... in the context (M); requests are
+    # never truncated"), so an agent session that grows past n_ctx fails
+    # forever. When the error names both counts, llamaswap drops the oldest
+    # droppable message turns (never the leading system block or the last
+    # message) and retries upstream, so stale history ages out instead of
+    # dead-ending the client. Set false to pass the 400 through unchanged.
+    context_trim: bool = True
+    # Token budget reserved for the completion when trimming. The request's
+    # own max_tokens wins when present; this is the fallback. Clamped to
+    # >= 256.
+    context_trim_margin: int = 1024
+
 
 @lru_cache
 def get_settings() -> Settings:

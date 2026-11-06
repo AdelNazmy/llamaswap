@@ -13,10 +13,18 @@ import logging
 import os
 import re
 import shutil
-from typing import Any, AsyncIterator, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Optional,
+    Tuple,
+)
 from uuid import uuid4
 
 import httpx
+
+from .config import get_settings
+from .metrics import metrics
 
 logger = logging.getLogger("llamaswap.proxy")
 
@@ -37,11 +45,206 @@ def _model_field(obj: Any) -> Optional[str]:
     return None
 
 
+# --------------------------------------------------------------------------
+# Context-window overflow trim
+# --------------------------------------------------------------------------
+# Upstream chat backends (llama.cpp / strata) refuse any prompt that leaves
+# no room for an answer: "request exceeds the context window: prompt (N
+# tokens) leaves no room to answer in the context (M); requests are never
+# truncated". A long-running agent conversation that grows past n_ctx then
+# fails on every turn forever. When the error names both counts, llamaswap
+# drops the oldest droppable message turns and retries upstream, so stale
+# history ages out instead of dead-ending the client. The upstream's own
+# token counts (authoritative) decide HOW MUCH to drop; the chars/4 estimate
+# below only decides WHICH (oldest) turns. Disable via
+# LLAMASWAP_CONTEXT_TRIM=false.
+
+OVERFLOW_RE = re.compile(
+    r"prompt \((\d+) tokens\).*?context(?: window)? \((\d+)\)", re.IGNORECASE,
+)
+
+_TRIM_ATTEMPTS = 4  # upstream calls per request at most: 1 + 3 trim retries
+
+
+def overflow_info(err_text: Any) -> Optional[Tuple[int, int]]:
+    """Parse an upstream overflow error into (prompt_tokens, ctx_tokens).
+
+    Accepts a decoded string or an already-parsed error JSON body.
+    """
+    if isinstance(err_text, (bytes, bytearray)):
+        err_text = err_text.decode(errors="replace")
+    elif not isinstance(err_text, str):
+        err_text = json.dumps(err_text, default=str)
+    m = OVERFLOW_RE.search(err_text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def estimate_tokens(value: Any) -> int:
+    """Cheap chars/4 estimate of the token cost of a JSON payload piece.
+
+    Only used to pick WHICH turns to drop; the upstream token counts in the
+    overflow error decide HOW MUCH must go, so an underestimate just means
+    another (bounded) retry round.
+    """
+    if isinstance(value, str):
+        return len(value) // 4 + 1
+    if isinstance(value, dict):
+        return sum(
+            estimate_tokens(k) + estimate_tokens(v) for k, v in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(estimate_tokens(v) for v in value)
+    return 1
+
+
+def _message_tokens(msg: Any) -> int:
+    if not isinstance(msg, dict):
+        return estimate_tokens(msg)
+    total = 8  # role/separator/chat-template overhead per message
+    for key in ("content", "name", "tool_calls", "function_call"):
+        if msg.get(key) is not None:
+            total += estimate_tokens(msg[key])
+    return total
+
+
+def _turn_groups(messages: list) -> list:
+    """Group messages into indivisible removal units.
+
+    An assistant message carrying tool_calls is grouped together with the
+    consecutive 'tool' messages answering it, so a dropped turn never leaves
+    orphaned tool results (upstream rejects those).
+    """
+    groups = []
+    i, n = 0, len(messages)
+    while i < n:
+        group = [i]
+        msg = messages[i]
+        j = i + 1
+        if (isinstance(msg, dict) and msg.get("tool_calls")
+                and msg.get("role") != "tool"):
+            while j < n and isinstance(messages[j], dict) \
+                    and messages[j].get("role") == "tool":
+                group.append(j)
+                j += 1
+        groups.append(group)
+        i = j
+    return groups
+
+
+def trim_messages(
+    body_obj: dict, prompt_tokens: int, ctx_tokens: int, margin: int,
+) -> Optional[Tuple[dict, int]]:
+    """Drop oldest droppable turns until the prompt fits ctx_tokens - margin.
+
+    Keeps the leading system block, the last message, and the newest turns
+    that fit; drops whole tool-call turns atomically. Inserts one short
+    system marker noting the drop. Returns None when nothing is droppable,
+    in which case the caller must surface the original error unchanged.
+    """
+    messages = body_obj.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    # Leading system block (agents pin it) is never dropped.
+    keep_head = 0
+    while (keep_head < len(messages) - 1
+           and isinstance(messages[keep_head], dict)
+           and messages[keep_head].get("role") == "system"):
+        keep_head += 1
+    # The last message (the live request) is never dropped either.
+    tail_start = len(messages) - 1
+
+    droppable = [
+        g for g in _turn_groups(messages)
+        if g[0] >= keep_head and g[-1] < tail_start
+    ]
+    if not droppable:
+        return None
+
+    marker = "[llamaswap: dropped {} earlier messages to fit the context window]"
+    marker_tokens = 64  # placeholder count for the marker line itself
+    budget = ctx_tokens - margin - marker_tokens
+    # How much upstream says must go; fall back to our own estimate when the
+    # estimate exceeds the budget but upstream's number does not (estimates
+    # can also overcount for non-token-like payloads).
+    needed = prompt_tokens - (ctx_tokens - margin)
+    total_est = sum(_message_tokens(m) for m in messages)
+    needed = max(needed, total_est - (ctx_tokens - margin))
+    if needed <= 0:
+        return None
+
+    dropped = 0
+    keep_from = len(messages)  # everything below keep_from is kept
+    for group in droppable:
+        if dropped >= needed:
+            break
+        dropped += sum(_message_tokens(messages[idx]) for idx in group)
+        keep_from = group[-1] + 1
+    n_dropped = keep_from - keep_head
+    if n_dropped <= 0:
+        return None
+    body = dict(body_obj)
+    body["messages"] = (
+        messages[:keep_head]
+        + [{"role": "system",
+            "content": marker.format(n_dropped)}]
+        + messages[keep_from:]
+    )
+    return body, n_dropped
+
+
+def _trimmed_body(
+    body: Any, err_text: Any, request_model: str,
+) -> Optional[bytes]:
+    """Trim a chat request body after an upstream overflow error.
+
+    Returns the re-serialized (trimmed) body bytes, or None when trimming
+    is disabled, the error is not an overflow, the body carries no chat
+    ``messages`` array, or nothing can be dropped.
+    """
+    settings = get_settings()
+    if not settings.context_trim:
+        return None
+    info = overflow_info(err_text)
+    if info is None:
+        return None
+    prompt_tokens, ctx_tokens = info
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    margin = max(
+        256,
+        int(obj.get("max_tokens") or obj.get("max_completion_tokens")
+            or settings.context_trim_margin),
+    )
+    trimmed = trim_messages(obj, prompt_tokens, ctx_tokens, margin)
+    if trimmed is None:
+        return None
+    body_new, n_dropped = trimmed
+    logger.warning(
+        "upstream context overflow: prompt=%d ctx=%d dropped=%d messages, retrying",
+        prompt_tokens, ctx_tokens, n_dropped,
+    )
+    metrics.inc_context_trim(request_model, "trimmed")
+    return json.dumps(body_new, separators=(",", ":"),
+                      ensure_ascii=False).encode()
+
+
 async def proxy_stream(
     port: int, host: str, path: str, body: Any,
     request_model: str, headers: dict[str, str],
 ) -> AsyncIterator[bytes]:
-    """Stream the response body from llama-server, rewriting the model field."""
+    """Stream the response body from llama-server, rewriting the model field.
+
+    A non-200 is buffered (``aread``) before any live chunk is yielded, so a
+    context-window overflow can be trimmed and the upstream call retried here
+    without the client ever seeing the failed attempt.
+    """
     url = f"http://{host}:{port}{path}"
     fwd_headers = {k: v for k, v in headers.items()
                    if k.lower() not in ("host", "content-length", "accept-encoding")}
@@ -49,16 +252,23 @@ async def proxy_stream(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=10.0)
         ) as client:
-            async with client.stream(
-                "POST", url, content=body, headers=fwd_headers
-            ) as resp:
-                if resp.status_code != 200:
-                    raw = await resp.aread()
-                    yield _error_bytes(resp.status_code, raw)
-                    return
-                async for chunk in resp.aiter_raw():
-                    if chunk:
-                        yield _rewrite_chunk(chunk, request_model)
+            for attempt in range(_TRIM_ATTEMPTS):
+                async with client.stream(
+                    "POST", url, content=body, headers=fwd_headers
+                ) as resp:
+                    if resp.status_code != 200:
+                        raw = await resp.aread()
+                        if attempt < _TRIM_ATTEMPTS - 1:
+                            trimmed = _trimmed_body(body, raw, request_model)
+                            if trimmed is not None:
+                                body = trimmed
+                                continue
+                        yield _error_bytes(resp.status_code, raw)
+                        return
+                    async for chunk in resp.aiter_raw():
+                        if chunk:
+                            yield _rewrite_chunk(chunk, request_model)
+                return
     except httpx.ConnectError:
         yield _error_bytes(503, b"backend llama-server is not reachable")
     except httpx.HTTPError as exc:
@@ -114,21 +324,30 @@ async def proxy_json(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=10.0)
         ) as client:
-            resp = await client.post(url, content=body, headers=fwd_headers)
+            for attempt in range(_TRIM_ATTEMPTS):
+                resp = await client.post(url, content=body, headers=fwd_headers)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        return 200, resp.text
+                    m = _model_field(data)
+                    if isinstance(data, dict) and m is not None \
+                            and m != request_model:
+                        data["model"] = request_model
+                    return 200, data
+                if attempt < _TRIM_ATTEMPTS - 1:
+                    trimmed = _trimmed_body(body, resp.text, request_model)
+                    if trimmed is not None:
+                        body = trimmed
+                        continue
+                return resp.status_code, (
+                    resp.json() if _is_json(resp.content) else resp.text
+                )
     except httpx.ConnectError:
         return 503, {"error": {"message": "backend llama-server is not reachable"}}
     except httpx.HTTPError as exc:
         return 502, {"error": {"message": str(exc)}}
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-        except ValueError:
-            return 200, resp.text
-        m = _model_field(data)
-        if isinstance(data, dict) and m is not None and m != request_model:
-            data["model"] = request_model
-        return 200, data
-    return resp.status_code, resp.json() if _is_json(resp.content) else resp.text
 
 
 async def proxy_raw(
