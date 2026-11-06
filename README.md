@@ -435,24 +435,24 @@ fight over the internal port.
 # Installation
 ## Quick start — from the Docker Hub image (no local build)
 
-The published image already contains everything: the proxy, the audio.cpp /
+The published image already contains the proxy, the llama.cpp / audio.cpp /
 whisper.cpp / sd-server backends, and ffmpeg — nothing is compiled locally.
-When run from a checkout, the compose file overlays its `app/`, `backend/`
-and entrypoint onto the image, so an older Hub image still uses this tree's
-model configs and proxy code. The Strata engine is included too
-(runtime-only): when the host has a
-Strata install at `~/.local/share/strata` (override: `STRATA_HOME`) it is
-bind-mounted read-only at a fixed container path and the entrypoint sniffs
-the installed version pins at startup — zero configuration. Its weights
-(shards, STRATA pack, MTP, mmproj) live under the shared `/opt/models`
-root like every other backend. Without an install the container runs fine
-and the two strata models simply sit unused in the registry.
+Run it from a checkout of this repo: `docker-compose.hub.yml` bind-mounts
+this tree's `app/`, `backend/`, `opencode/`, the entrypoint, and `scripts/`
+over the image, so an older Hub image still uses the current model configs
+and proxy code.
+
+The image does **not** contain model weights. They must exist on the host
+under `/opt/models` (override with `MODEL_ROOT`). The `models-init` one-shot
+downloads the default TTS/ASR/music bundles only; LLM GGUFs are not in that
+script and must be copied or downloaded separately. Image-generation weights
+are a separate optional download.
 
 ```bash
 # 1) pull and start (weights mount + GPU reservation come with the compose file)
 docker compose -f docker-compose.hub.yml up -d
 
-# 2) download the model weights (~30 GB default bundle set: TTS/ASR/music)
+# 2) download the audio/music weights (~30 GB default bundle set: TTS/ASR/music)
 #    into the shared model root (one-shot; needs this repo checkout for ./scripts)
 docker compose -f docker-compose.hub.yml run --rm models-init
 
@@ -461,12 +461,88 @@ MODEL_ROOT=/opt/models ./scripts/download-models.sh flux-schnell flux-vae flux-c
     qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae
 ```
 
-Requirements: Docker with the NVIDIA container runtime on a CUDA host, and
-the model weights volume (default `/opt/models`, override with `MODEL_ROOT`).
-Keys/settings come from the same `.env` surface as the local build
-(`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...).
+Requirements: Docker with the NVIDIA container runtime on a CUDA host, a
+checkout of this repo, and the model weights volume (default `/opt/models`,
+override with `MODEL_ROOT`). Keys/settings come from the same `.env` surface
+as the local build (`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...).
 
-Published ports — one listener (container `11434`), three host aliases:
+### Model weights on a new machine
+
+The two built-in downloaders cover different deployments:
+
+| Deployment | Command | What it downloads |
+|---|---|---|
+| Hub image | `docker compose -f docker-compose.hub.yml run --rm models-init` | default TTS/ASR/music bundle set |
+| From source | `./scripts/deploy.sh` | checks `MODEL_ROOT` and downloads missing TTS/ASR/FLUX weights before starting; the compose `models-init` then fills in the default TTS/ASR/music set on `up` |
+
+`deploy.sh` is for the from-source stack (`docker-compose.yml` + overlays), not
+the Hub image. It skips downloads with `--build-only`; `--no-audio` and
+`--no-image` remove those bundles from the check. Neither downloader fetches
+LLM, embedding, or Strata weights — get LLM/embedding GGUFs with the Hugging
+Face CLI:
+
+```bash
+# one-time: install the HF CLI if you do not have it
+pip install -U huggingface_hub
+mkdir -p /opt/models
+
+# qwen3.5-9b (text + vision projector; backend expects qwen3.5-mmproj.gguf)
+hf download DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF \
+    Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q4_K_M.gguf \
+    mmproj-BF16.gguf --local-dir /opt/models
+mv /opt/models/mmproj-BF16.gguf /opt/models/qwen3.5-mmproj.gguf
+
+# qwen3.6-35b
+hf download unsloth/Qwen3.6-35B-A3B-GGUF \
+    Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --local-dir /opt/models
+
+# qwen3.8-27b-ridge (mmproj is optional; this config uses text only)
+hf download empero-ai/Qwen3.8-27B-Ridge-GGUF \
+    Qwen3.8-27B-Ridge-3.7bpw.gguf \
+    mmproj-Qwen3.8-27B-BF16.gguf --local-dir /opt/models
+
+# octen embedding
+hf download mykor/Octen-Embedding-0.6B-GGUF \
+    Octen-Embedding-0.6B-Q8_0.gguf --local-dir /opt/models
+```
+
+At minimum, provide one chat LLM GGUF. The exact filenames are the ones
+referenced by `backend/*.yaml`; if your download has a different name, either
+rename it or edit the matching YAML. To reuse an existing install, copy the
+same files from its `/opt/models` instead of downloading them again.
+
+### Strata (optional)
+
+llamaswap does **not** install Strata, download its engine or pack, extract
+experts, or create `expert-profile-coder.bin`. Set up Strata with its own
+installer/setup first, then let llamaswap manage the installed copy:
+
+- Install location: `~/.local/share/strata` (override with `STRATA_HOME`),
+  containing `components/` and `terminal/<version>/` (including
+  `data/expert-profile-coder.bin`).
+- Weights: `/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/` containing the
+  two `IQ1_M` shards, `STRATA/packs/coder-iq1_m`, `STRATA/mtp/rt`, and
+  `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (override the model root with
+  `STRATA_MODELS`).
+- Stop any standalone `strata serve` before using the managed model; it holds
+  the same ~15.2 GiB of VRAM.
+
+`docker-compose.hub.yml` mounts the install read-only at a fixed container path
+and the entrypoint sniffs the installed terminal/engine versions. Without the
+install, llamaswap still runs and the two Strata models simply remain unusable;
+`deploy.sh --strata` treats them as a hard requirement, while the default
+deploy auto-skips Strata when its files are missing.
+
+### opencode (optional)
+
+opencode is host-side tooling, not part of the image. When
+`~/.config/opencode` is mounted (the Hub compose does this by default), the
+entrypoint installs/refreshes the llamaswap provider and the artist /
+music-composer skills through `scripts/install-opencode.py`.
+
+### Published ports
+
+One listener (container `11434`), three host aliases:
 
 | Port | Purpose |
 |---|---|
