@@ -466,6 +466,29 @@ checkout of this repo, and the model weights volume (default `/opt/models`,
 override with `MODEL_ROOT`). Keys/settings come from the same `.env` surface
 as the local build (`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...).
 
+### Updating the published image
+
+The Hub image is refreshed, not rebuilt: `Dockerfile.update` layers the
+source that changes between releases (`app/`, `backend/`, `opencode/`, the
+opencode installer, the entrypoint) on top of the existing published image,
+keeping its compiled backend binaries and Python dependency layers. One
+command, from a clean tree:
+
+```bash
+./scripts/update-image.sh            # build + smoke-test + push to Docker Hub
+./scripts/update-image.sh --no-push  # build + smoke-test only
+```
+
+The script refuses a dirty work tree (the image must match a commit),
+warns when `HEAD` is not pushed, smoke-tests the built image itself
+(import + uvicorn boot + `/health`), and pushes `adelnazmy2002/llamaswap:latest`
+(override with `LLAMASWAP_IMAGE` / `LLAMASWAP_TAG`; `--pull` re-pulls the
+base image first so an update builds on the newest published state). A
+genuine rebuild from scratch — new binaries or dependency changes — stays
+with `./scripts/deploy.sh --build-only` on a machine that has the `/opt`
+host builds, then `docker tag llamaswap:local adelnazmy2002/llamaswap:latest
+&& docker push adelnazmy2002/llamaswap:latest`.
+
 ### Model weights on a new machine
 
 The two built-in downloaders cover different deployments:

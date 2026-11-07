@@ -1,0 +1,25 @@
+# update-image.sh builds this file: the published Hub image refreshed with
+# the checkout's current source — no host toolchain, no /opt builds. The
+# binaries (llama-server, audiocpp_server, whisper-server, sd-server) and
+# the Python dependency layers come from the base image; only the layers
+# that change between releases are stamped on top, mirroring the tail of
+# the base Dockerfile so a full rebuild and an update produce the same
+# image layout.
+ARG BASE_IMAGE=adelnazmy2002/llamaswap:latest
+
+FROM ${BASE_IMAGE}
+
+COPY app ./app
+COPY backend ./backend
+
+COPY opencode ./opencode
+COPY scripts/install-opencode.py ./scripts/install-opencode.py
+RUN chmod 0755 ./scripts/install-opencode.py
+
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 1234 11434 9090
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11434"]
