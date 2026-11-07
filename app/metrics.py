@@ -14,6 +14,14 @@ def _label(*parts: str) -> str:
     return "{" + ",".join(parts) + "}"
 
 
+# HELP text for the dynamic gauges set via set_gauge() (main.py); a gauge
+# without an entry still renders, just without a HELP line.
+_GAUGE_HELP = {
+    "llamaswap_registered_models": "Models currently in the registry.",
+    "llamaswap_status": "1.0 when the registry or any backend manager is degraded, 0.0 otherwise.",
+}
+
+
 class Metrics:
     """Thread-unsafe (event-loop-only) metrics collection."""
 
@@ -146,29 +154,44 @@ class Metrics:
               "outcome=trimmed dropped the oldest turns from the history.",
               "counter", family)
 
+        family = [
+            f'llamaswap_tokens_session_total{{model="{m}",direction="{d}"}} {c}'
+            for (m, d), c in sorted(self.tokens.items()) if c > 0
+        ]
+        flush("llamaswap_tokens_session_total",
+              "Chat/completion tokens proxied since proxy start (resets on "
+              "restart): direction=input (prompt) or output (completion).",
+              "counter", family)
+
         combined: DefaultDict[Tuple[str, str], int] = defaultdict(int)
         for key, value in self.token_baseline.items():
             combined[key] += value
         for key, value in self.tokens.items():
             combined[key] += value
         family = [
-            f'llamaswap_tokens_total{{model="{m}",direction="{d}",scope="session"}} {c}'
-            for (m, d), c in sorted(self.tokens.items()) if c > 0
-        ] + [
-            f'llamaswap_tokens_total{{model="{m}",direction="{d}",scope="install"}} {c}'
+            f'llamaswap_tokens_total{{model="{m}",direction="{d}"}} {c}'
             for (m, d), c in sorted(combined.items()) if c > 0
         ]
         flush("llamaswap_tokens_total",
-              "Chat/completion tokens proxied: direction=input (prompt) or "
-              "output (completion); scope=session since proxy start, "
-              "scope=install since installation (persisted in SQLite).",
+              "Chat/completion tokens proxied since installation (persisted "
+              "in SQLite; includes the current session): direction=input "
+              "(prompt) or output (completion).",
               "counter", family)
 
+        # gauges (set externally by main.py)
         for name, value in sorted(self.gauges.items()):
+            help_ = _GAUGE_HELP.get(name)
+            if help_:
+                out.append(f"# HELP {name} {help_}")
             out.append(f"# TYPE {name} gauge")
             out.append(f"{name} {value}")
 
-        out.append(f"llamaswap_uptime_seconds {time.time() - self._started:.1f}")
+        flush(
+            "llamaswap_uptime_seconds",
+            "Seconds since the proxy process started.",
+            "gauge",
+            [f"llamaswap_uptime_seconds {time.time() - self._started:.1f}"],
+        )
         return "\n".join(out) + "\n"
 
 

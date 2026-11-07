@@ -141,23 +141,24 @@ def test_completion_prompt_body_counted(recorded):
     assert m.tokens[("m", "output")] > 0
 
 
-def test_render_session_and_install_scopes():
+def test_render_session_and_install_metrics():
     m = Metrics()
     m.token_baseline[("m", "input")] = 500
     m.inc_tokens("m", "input", 20)
     m.inc_tokens("m", "output", 5)
     text = m.render()
-    values = {}
+    session = {}
+    install = {}
     for line in text.splitlines():
-        if line.startswith("llamaswap_tokens_total{"):
+        if line.startswith("llamaswap_tokens_session_total{"):
             label, value = line.rsplit(" ", 1)
-            scope = "session" if 'scope="session"' in label else "install"
             direction = "input" if 'direction="input"' in label else "output"
-            values[(scope, direction)] = int(value)
-    assert values == {
-        ("session", "input"): 20,
-        ("session", "output"): 5,
-        ("install", "input"): 520,
-        ("install", "output"): 5,
-    }
+            session[direction] = int(value)
+        elif line.startswith("llamaswap_tokens_total{"):
+            label, value = line.rsplit(" ", 1)
+            direction = "input" if 'direction="input"' in label else "output"
+            install[direction] = int(value)
+    assert session == {"input": 20, "output": 5}
+    assert install == {"input": 520, "output": 5}
     assert "# TYPE llamaswap_tokens_total counter" in text
+    assert "# TYPE llamaswap_tokens_session_total counter" in text

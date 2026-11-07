@@ -1420,7 +1420,22 @@ localhost.
 **Observability.** `GET /metrics` exposes Prometheus text counters
 (model loads/unloads/swaps, load durations, load failures, HTTP requests by
 route/status, tool-call outcomes, context-overflow trims, and token usage
-by model).
+by model). Token usage comes as two counter families:
+`llamaswap_tokens_session_total` counts since proxy start (resets on
+restart), and `llamaswap_tokens_total` the total since installation
+(session + SQLite-persisted totals, surviving restarts and container
+recreation) — e.g.
+
+    llamaswap_tokens_session_total{model="qwen3.5-9b",direction="input"} 1054
+    llamaswap_tokens_total{model="qwen3.5-9b",direction="input"} 1793
+
+Scrape with any Prometheus (`/metrics` is unauthenticated, like `/health`):
+
+    scrape_configs:
+      - job_name: llamaswap
+        static_configs:
+          - targets: ["llamaswap-host:11434"]  # LLAMASWAP_PORT (9090 also published)
+
 `GET /v1/events` streams `model_loaded` / `model_unloaded` /
 `swap` / `load_failed` as server-sent events. `LLAMASWAP_LOG_JSON=true` emits
 one JSON object per log line for log shippers.
@@ -1480,10 +1495,11 @@ Retried requests are counted in
 `llamaswap_context_trims_total{model=,outcome=}`.
 
 **Token usage accounting.** Every proxied chat/completion response counts
-its input and output tokens per model, exposed as
-`llamaswap_tokens_total{model=,direction=input|output,scope=session|install}`.
-`scope=session` covers the current proxy run; `scope=install` accumulates
-across restarts in a small SQLite database (`data/llamaswap_tokens.db`,
+its input and output tokens per model, exposed as two counter families on
+`GET /metrics`: `llamaswap_tokens_session_total{model=,direction=input|output}`
+covers the current proxy run, and `llamaswap_tokens_total{model=,direction=}`
+accumulates across restarts in a small SQLite database
+(`data/llamaswap_tokens.db`,
 path override via `LLAMASWAP_TOKENS_DB`, mounted into the container by the
 compose files) — written in debounced batches and flushed at shutdown, so
 totals survive restarts and container recreation. Exact counts come from

@@ -298,9 +298,9 @@ async def lifespan(app: FastAPI):
         "llamaswap ready on %s:%d (%d models)",
         settings.host, settings.port, len(app.state.registry.models),
     )
-    # Install-lifetime token totals: the SQLite baseline behind the
-    # scope=install rows of llamaswap_tokens_total; this session adds its
-    # own counts on top until the next restart.
+    # Install-lifetime token totals: the SQLite baseline behind
+    # llamaswap_tokens_total; this session adds its own counts on top
+    # (llamaswap_tokens_session_total) until the next restart.
     metrics.token_baseline.update(token_store.baseline)
     try:
         yield

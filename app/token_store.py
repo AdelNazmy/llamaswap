@@ -56,8 +56,8 @@ class TokenStore:
         self._path = path
         self._db: Optional[sqlite3.Connection] = None
         self._pending: DefaultDict[Tuple[str, str], int] = defaultdict(int)
-        # Totals already on disk when this process started; the install
-        # scope of a rendered metric is baseline + session, so a value is
+        # Totals already on disk when this process started; the rendered
+        # llamaswap_tokens_total is baseline + session, so a value is
         # never counted twice across the restart boundary.
         self._baseline: DefaultDict[Tuple[str, str], int] = defaultdict(int)
         self._last_flush = time.monotonic()

@@ -107,6 +107,25 @@ command:
     # Keep strata's own idle unload off: llamaswap decides when to unload.
     idle_unload_s: 0
     open_browser: false
+    # Strata 0.1.45 leaves a quarter of max_tokens for the answer by closing
+    # the thinking early (thinking limited to 6144 of max_tokens 8192); that
+    # quarter cap clipped the agent's reasoning. Disabled: the thinking may
+    # now consume the whole cap, so a long-reasoning turn can end mid-answer.
+    answer_room: false
+    # With the quarter-cap off a turn can now stop mid-thinking; strata then
+    # closes the thinking once (</think> injected) and continues, so the turn
+    # still yields an answer instead of an empty reply.
+    reasoning_close_retry: true
+    # #728: the stuck turns repeated whole reasoning passages; "recover" resumes
+    # the same output with the low-effort instruction swapped in instead of
+    # ending the reply ("stop" would truncate the turn). Not applied to
+    # image-bearing prompts.
+    reasoning_loop_recovery: "recover"
+    # #123: cap the thinking of every request at this many tokens — the stuck
+    # turns burned ~5.6k reasoning tokens before the loop detector fired; the
+    # budget closes the thinking cleanly instead (reasoning_close_retry then
+    # still yields an answer). A request's own reasoning_budget_tokens wins.
+    reasoning_budget_tokens: 4096
   env:
     # GEMM tuning table preset the launcher writes for this box.
     STRATA_DEFAULTS: "026"
