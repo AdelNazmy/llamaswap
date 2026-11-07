@@ -50,8 +50,11 @@ command:
       - "auto"
       - "--spec"
       - "4"
-      - "--spec-min-p"
-      - "0.5"
+      # Match the standalone launcher run ($HOME/.local/state/strata/launch/
+      # coder.json): --pool-workers 13, no --spec-min-p. See the text-pack
+      # yaml for the rationale.
+      - "--pool-workers"
+      - "13"
       - "--max-context"
       - "131072"
       - "--kv"

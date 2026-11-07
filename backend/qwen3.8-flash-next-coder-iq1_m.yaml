@@ -82,8 +82,12 @@ command:
       - "auto"
       - "--spec"
       - "4"
-      - "--spec-min-p"
-      - "0.5"
+      # Match the standalone launcher run ($HOME/.local/state/strata/launch/
+      # coder.json): it starts the engine with --pool-workers 13 and no
+      # --spec-min-p; the earlier --spec-min-p 0.5 render differed from the
+      # known-good standalone path and is dropped.
+      - "--pool-workers"
+      - "13"
       - "--max-context"
       - "131072"
       - "--kv"
