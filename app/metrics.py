@@ -33,6 +33,11 @@ class Metrics:
         self.tool_calls: DefaultDict[Tuple[str, str], int] = defaultdict(int)
         # (model, outcome) -> count for context-window overflow trims
         self.context_trims: DefaultDict[Tuple[str, str], int] = defaultdict(int)
+        # (model, direction) -> tokens this process ("session" scope;
+        # resets on restart). Install-lifetime totals are rendered on top
+        # of token_baseline, loaded from the SQLite store at startup.
+        self.tokens: DefaultDict[Tuple[str, str], int] = defaultdict(int)
+        self.token_baseline: DefaultDict[Tuple[str, str], int] = defaultdict(int)
         # gauges (set externally by main.py)
         self.gauges: dict[str, float] = {}
 
@@ -61,6 +66,10 @@ class Metrics:
 
     def inc_context_trim(self, model: str, outcome: str) -> None:
         self.context_trims[(model, outcome)] += 1
+
+    def inc_tokens(self, model: str, direction: str, tokens: int) -> None:
+        if tokens > 0:
+            self.tokens[(model, direction)] += tokens
 
     def set_gauge(self, name: str, value: float) -> None:
         self.gauges[name] = value
@@ -135,6 +144,24 @@ class Metrics:
         flush("llamaswap_context_trims_total",
               "Chat requests retried after an upstream context-window overflow: "
               "outcome=trimmed dropped the oldest turns from the history.",
+              "counter", family)
+
+        combined: DefaultDict[Tuple[str, str], int] = defaultdict(int)
+        for key, value in self.token_baseline.items():
+            combined[key] += value
+        for key, value in self.tokens.items():
+            combined[key] += value
+        family = [
+            f'llamaswap_tokens_total{{model="{m}",direction="{d}",scope="session"}} {c}'
+            for (m, d), c in sorted(self.tokens.items()) if c > 0
+        ] + [
+            f'llamaswap_tokens_total{{model="{m}",direction="{d}",scope="install"}} {c}'
+            for (m, d), c in sorted(combined.items()) if c > 0
+        ]
+        flush("llamaswap_tokens_total",
+              "Chat/completion tokens proxied: direction=input (prompt) or "
+              "output (completion); scope=session since proxy start, "
+              "scope=install since installation (persisted in SQLite).",
               "counter", family)
 
         for name, value in sorted(self.gauges.items()):

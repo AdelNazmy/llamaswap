@@ -143,6 +143,13 @@ class Settings(BaseSettings):
     # >= 256.
     context_trim_margin: int = 1024
 
+    # SQLite file holding the install-lifetime token totals behind the
+    # scope=install rows of llamaswap_tokens_total (GET /metrics). The
+    # session scope stays in memory and resets on restart. Empty = the
+    # data/ directory next to the checkout (mounted into the container by
+    # the compose files, so totals survive recreation).
+    tokens_db: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -25,6 +25,7 @@ import httpx
 
 from .config import get_settings
 from .metrics import metrics
+from .token_store import token_store
 
 logger = logging.getLogger("llamaswap.proxy")
 
@@ -251,6 +252,153 @@ def _trimmed_body(
                       ensure_ascii=False).encode()
 
 
+# --------------------------------------------------------------------------
+# Token usage accounting
+# --------------------------------------------------------------------------
+# Chat/completion tokens are counted per model for two scopes: session
+# (since proxy start, in memory) and install (since installation,
+# SQLite-backed — app/token_store.py). Exact counts come from the
+# upstream's usage object when it carries one — strata puts one on the
+# final stream chunk and non-streaming body, llama-server on
+# stream_options.include_usage — and fall back to the same chars/4
+# estimate the trim logic uses, fed by the request messages and the
+# streamed text. Only chat-shaped bodies (messages / prompt) are counted;
+# embeddings and audio pass through uncounted.
+
+def _body_obj(body: Any) -> Optional[dict]:
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = body.decode("utf-8", errors="replace")
+        except (ValueError, TypeError):
+            return None
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return None
+    return body if isinstance(body, dict) else None
+
+
+def _is_chat_body(obj: dict) -> bool:
+    return (
+        isinstance(obj.get("messages"), list)
+        or isinstance(obj.get("prompt"), str)
+    )
+
+
+def _int_or_zero(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _request_input_estimate(obj: dict) -> int:
+    if isinstance(obj.get("messages"), list):
+        return estimate_tokens(obj["messages"])
+    if isinstance(obj.get("prompt"), str):
+        return estimate_tokens(obj["prompt"])
+    return 0
+
+
+def _record_usage(model: str, prompt: int, completion: int) -> None:
+    if prompt > 0:
+        metrics.inc_tokens(model, "input", prompt)
+        token_store.add(model, "input", prompt)
+    if completion > 0:
+        metrics.inc_tokens(model, "output", completion)
+        token_store.add(model, "output", completion)
+
+
+def _count_response_tokens(model: str, body: Any, data: Any) -> None:
+    """Count one non-streaming chat/completion response."""
+    obj = _body_obj(body)
+    if obj is None or not _is_chat_body(obj) or not isinstance(data, dict):
+        return
+    usage = data.get("usage")
+    prompt = completion = 0
+    if isinstance(usage, dict):
+        prompt = _int_or_zero(usage.get("prompt_tokens"))
+        completion = _int_or_zero(usage.get("completion_tokens"))
+    if prompt <= 0:
+        prompt = _request_input_estimate(obj)
+    if completion <= 0:
+        completion = estimate_tokens(data.get("choices"))
+    _record_usage(model, prompt, completion)
+
+
+class StreamTokenMeter:
+    """Counts tokens for one upstream SSE stream (line-buffered).
+
+    Exact when the upstream carries a usage object on a chunk, otherwise a
+    chars/4 estimate of the streamed text against the request. One
+    instance per upstream attempt: a trim retry counts once, on the
+    attempt that succeeds.
+    """
+
+    def __init__(self, model: str, body: Any) -> None:
+        self._model = model
+        self._buf = b""
+        self._usage: Optional[Tuple[int, int]] = None
+        self._out = 0
+        obj = _body_obj(body)
+        self._input = _request_input_estimate(obj) if obj else 0
+
+    def feed(self, chunk: bytes) -> None:
+        buf = self._buf + chunk
+        lines = buf.split(b"\n")
+        self._buf = lines.pop()
+        for line in lines:
+            if not line.startswith(b"data: "):
+                continue
+            payload = line[6:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            usage = obj.get("usage")
+            if isinstance(usage, dict):
+                prompt = _int_or_zero(usage.get("prompt_tokens"))
+                completion = _int_or_zero(usage.get("completion_tokens"))
+                if prompt > 0 or completion > 0:
+                    self._usage = (prompt, completion)
+                continue
+            for choice in obj.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                text = choice.get("text")
+                if isinstance(text, str):
+                    self._out += estimate_tokens(text)
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                for key in ("content", "reasoning_content"):
+                    piece = delta.get(key)
+                    if isinstance(piece, str):
+                        self._out += estimate_tokens(piece)
+                for call in delta.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        fn = call.get("function")
+                        if isinstance(fn, dict) \
+                                and isinstance(fn.get("arguments"), str):
+                            self._out += estimate_tokens(fn["arguments"])
+
+    def finish(self) -> None:
+        """Record the stream's counts; call once the 200 body is done."""
+        if self._usage is not None:
+            _record_usage(self._model, self._usage[0], self._usage[1])
+        else:
+            _record_usage(self._model, self._input, self._out)
+
+
+def _stream_token_meter(model: str, body: Any) -> Optional[StreamTokenMeter]:
+    obj = _body_obj(body)
+    if obj is None or not _is_chat_body(obj):
+        return None
+    return StreamTokenMeter(model, body)
+
+
 async def proxy_stream(
     port: int, host: str, path: str, body: Any,
     request_model: str, headers: dict[str, str],
@@ -281,9 +429,14 @@ async def proxy_stream(
                                 continue
                         yield _error_bytes(resp.status_code, raw)
                         return
+                    meter = _stream_token_meter(request_model, body)
                     async for chunk in resp.aiter_raw():
                         if chunk:
+                            if meter is not None:
+                                meter.feed(chunk)
                             yield _rewrite_chunk(chunk, request_model)
+                    if meter is not None:
+                        meter.finish()
                 return
     except httpx.ConnectError:
         yield _error_bytes(503, b"backend llama-server is not reachable")
@@ -351,6 +504,7 @@ async def proxy_json(
                     if isinstance(data, dict) and m is not None \
                             and m != request_model:
                         data["model"] = request_model
+                    _count_response_tokens(request_model, body, data)
                     return 200, data
                 if attempt < _TRIM_ATTEMPTS - 1:
                     trimmed = _trimmed_body(body, resp.text, request_model)

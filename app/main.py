@@ -101,6 +101,7 @@ from .proxy import (
     transcode_audio,
 )
 from .registry import ModelConfig, Registry, RegistryError, UnknownModelError
+from .token_store import token_store
 from .tool_reconcile import StreamReconciler, apply_reconcile, declared_tool_names
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -297,9 +298,14 @@ async def lifespan(app: FastAPI):
         "llamaswap ready on %s:%d (%d models)",
         settings.host, settings.port, len(app.state.registry.models),
     )
+    # Install-lifetime token totals: the SQLite baseline behind the
+    # scope=install rows of llamaswap_tokens_total; this session adds its
+    # own counts on top until the next restart.
+    metrics.token_baseline.update(token_store.baseline)
     try:
         yield
     finally:
+        token_store.flush()
         for manager in app.state.audio_managers.values():
             await manager.shutdown()
         await app.state.image_manager.shutdown()

@@ -1007,7 +1007,8 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`, `LLAMASWAP_EMBEDDING_AUTO_START`,
 `LLAMASWAP_API_KEY`, `LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`,
 `LLAMASWAP_TOOL_RECONCILE`, `LLAMASWAP_TOOL_RECONCILE_MIN_RATIO`,
-`LLAMASWAP_CONTEXT_TRIM`, `LLAMASWAP_CONTEXT_TRIM_MARGIN`.
+`LLAMASWAP_CONTEXT_TRIM`, `LLAMASWAP_CONTEXT_TRIM_MARGIN`,
+`LLAMASWAP_TOKENS_DB`.
 
 ## Voice cloning with Qwen3-TTS
 
@@ -1148,7 +1149,7 @@ as for chat.
 | `GET /v1/registry/info` | Registry summary: roles, VRAM ranking, warnings, degraded conditions |
 | `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, the image and music servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
 | `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image, and music status, plus registry warnings/degraded |
-| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests, recovered tool calls, context-overflow trims) |
+| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests, recovered tool calls, context-overflow trims, token usage) |
 | `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
 | `GET /api/version` | Ollama version probe (`{"version": "0.5.0"}`) |
 | `GET /api/tags` | Ollama-compatible model list (one entry per registry model, with `size`, `digest`, `details`) |
@@ -1395,7 +1396,8 @@ localhost.
 
 **Observability.** `GET /metrics` exposes Prometheus text counters
 (model loads/unloads/swaps, load durations, load failures, HTTP requests by
-route/status, tool-call outcomes and context-overflow trims by model).
+route/status, tool-call outcomes, context-overflow trims, and token usage
+by model).
 `GET /v1/events` streams `model_loaded` / `model_unloaded` /
 `swap` / `load_failed` as server-sent events. `LLAMASWAP_LOG_JSON=true` emits
 one JSON object per log line for log shippers.
@@ -1453,6 +1455,20 @@ through unchanged: `LLAMASWAP_CONTEXT_TRIM=false`, and
 `LLAMASWAP_CONTEXT_TRIM_MARGIN` (default `1024`) reserves completion room.
 Retried requests are counted in
 `llamaswap_context_trims_total{model=,outcome=}`.
+
+**Token usage accounting.** Every proxied chat/completion response counts
+its input and output tokens per model, exposed as
+`llamaswap_tokens_total{model=,direction=input|output,scope=session|install}`.
+`scope=session` covers the current proxy run; `scope=install` accumulates
+across restarts in a small SQLite database (`data/llamaswap_tokens.db`,
+path override via `LLAMASWAP_TOKENS_DB`, mounted into the container by the
+compose files) — written in debounced batches and flushed at shutdown, so
+totals survive restarts and container recreation. Exact counts come from
+the upstream `usage` object when the backend provides one (strata always;
+llama-server for non-streaming, and for streams only when the request sets
+`stream_options.include_usage`); otherwise a chars/4 estimate of the
+request messages and the streamed text, the same estimator the overflow
+trim uses. Embeddings, TTS/ASR, image, and music traffic is not counted.
 
 ## Notes
 

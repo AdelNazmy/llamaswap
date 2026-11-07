@@ -73,6 +73,8 @@ services:
     volumes:
       - /opt/models:/opt/models:ro
       - ./backend:/app/backend
+      # Token usage totals (data/llamaswap_tokens.db) survive recreation.
+      - ./data:/app/data
     deploy:
       resources:
         reservations:

@@ -130,6 +130,8 @@ services:
       - ./app:/app/app:ro
       - ./backend:/app/backend:ro
       - ./scripts/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
+      # Token usage totals (data/llamaswap_tokens.db) survive recreation.
+      - ./data:/app/data
       # opencode integration: the bundle + installer, plus the host config
       # dir the entrypoint merges into (provider + artist/music-composer
       # skills). Override the target with OPENCODE_CONFIG_DIR.

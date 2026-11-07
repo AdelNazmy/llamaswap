@@ -13,3 +13,7 @@ linkedin-post.md
 README_local.md
 qwen3-tts-sample.wav
 script_scarlette.wav
+
+# token usage totals (runtime state)
+data/*.db
+data/*.db-*
