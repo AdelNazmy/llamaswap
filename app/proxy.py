@@ -48,19 +48,34 @@ def _model_field(obj: Any) -> Optional[str]:
 # --------------------------------------------------------------------------
 # Context-window overflow trim
 # --------------------------------------------------------------------------
-# Upstream chat backends (llama.cpp / strata) refuse any prompt that leaves
-# no room for an answer: "request exceeds the context window: prompt (N
-# tokens) leaves no room to answer in the context (M); requests are never
-# truncated". A long-running agent conversation that grows past n_ctx then
-# fails on every turn forever. When the error names both counts, llamaswap
-# drops the oldest droppable message turns and retries upstream, so stale
-# history ages out instead of dead-ending the client. The upstream's own
-# token counts (authoritative) decide HOW MUCH to drop; the chars/4 estimate
-# below only decides WHICH (oldest) turns. Disable via
-# LLAMASWAP_CONTEXT_TRIM=false.
+# Upstream chat backends refuse any prompt that leaves no room for an
+# answer — strata: "request exceeds the context window: prompt (N tokens)
+# leaves no room to answer in the context (M); requests are never
+# truncated", llama-server: "input (N tokens) is larger than the max
+# context size (M tokens)". A long-running agent conversation that grows
+# past n_ctx then fails on every turn forever. When the error names both
+# counts, llamaswap drops the oldest droppable message turns and retries
+# upstream, so stale history ages out instead of dead-ending the client.
+# The upstream's own token counts (authoritative) decide HOW MUCH to drop;
+# the chars/4 estimate below only decides WHICH (oldest) turns. Disable
+# via LLAMASWAP_CONTEXT_TRIM=false.
 
-OVERFLOW_RE = re.compile(
-    r"prompt \((\d+) tokens\).*?context(?: window)? \((\d+)\)", re.IGNORECASE,
+# One pattern per server's wording; both capture (prompt_tokens, ctx_tokens).
+OVERFLOW_RES = (
+    # strata: "... prompt (N tokens) leaves no room to answer in the
+    # context (M) ..." / "... prompt (N tokens) + max tokens (X) exceeds
+    # the context (M) ..."
+    re.compile(
+        r"prompt \((\d+) tokens\).*?context(?: window)? \((\d+)\)",
+        re.IGNORECASE,
+    ),
+    # llama-server: "input (N tokens) is larger than the max context size
+    # (M tokens)" / "request (N tokens) exceeds the available context size
+    # (M tokens)"
+    re.compile(
+        r"(?:input|request) \((\d+) tokens\).*?context (?:size|window) \((\d+)",
+        re.IGNORECASE,
+    ),
 )
 
 _TRIM_ATTEMPTS = 4  # upstream calls per request at most: 1 + 3 trim retries
@@ -75,10 +90,11 @@ def overflow_info(err_text: Any) -> Optional[Tuple[int, int]]:
         err_text = err_text.decode(errors="replace")
     elif not isinstance(err_text, str):
         err_text = json.dumps(err_text, default=str)
-    m = OVERFLOW_RE.search(err_text)
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2))
+    for pattern in OVERFLOW_RES:
+        m = pattern.search(err_text)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None
 
 
 def estimate_tokens(value: Any) -> int:

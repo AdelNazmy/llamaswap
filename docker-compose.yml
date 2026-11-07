@@ -65,6 +65,11 @@ services:
       # the ratio raises the bar for trusting a fuzzy name match.
       LLAMASWAP_TOOL_RECONCILE: "${LLAMASWAP_TOOL_RECONCILE:-true}"
       LLAMASWAP_TOOL_RECONCILE_MIN_RATIO: "${LLAMASWAP_TOOL_RECONCILE_MIN_RATIO:-0.75}"
+      # On an upstream context-window overflow 400, drop the oldest turns
+      # and retry upstream instead of dead-ending the client; false passes
+      # the 400 through unchanged (see app/proxy.py).
+      LLAMASWAP_CONTEXT_TRIM: "${LLAMASWAP_CONTEXT_TRIM:-true}"
+      LLAMASWAP_CONTEXT_TRIM_MARGIN: "${LLAMASWAP_CONTEXT_TRIM_MARGIN:-1024}"
     volumes:
       - /opt/models:/opt/models:ro
       - ./backend:/app/backend

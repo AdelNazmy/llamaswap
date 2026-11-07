@@ -1006,7 +1006,8 @@ Environment overrides (prefix `LLAMASWAP_`): `LLAMASWAP_PORT`,
 `LLAMASWAP_AUDIO_VRAM_GUARD`, `LLAMASWAP_BLOCK_AUDIO_ON_BIG_LLM`,
 `LLAMASWAP_UNLOAD_AUDIO_ON_BIG_LLM`, `LLAMASWAP_EMBEDDING_AUTO_START`,
 `LLAMASWAP_API_KEY`, `LLAMASWAP_ADMIN_KEY`, `LLAMASWAP_MAX_CONCURRENCY`,
-`LLAMASWAP_TOOL_RECONCILE`, `LLAMASWAP_TOOL_RECONCILE_MIN_RATIO`.
+`LLAMASWAP_TOOL_RECONCILE`, `LLAMASWAP_TOOL_RECONCILE_MIN_RATIO`,
+`LLAMASWAP_CONTEXT_TRIM`, `LLAMASWAP_CONTEXT_TRIM_MARGIN`.
 
 ## Voice cloning with Qwen3-TTS
 
@@ -1147,7 +1148,7 @@ as for chat.
 | `GET /v1/registry/info` | Registry summary: roles, VRAM ranking, warnings, degraded conditions |
 | `POST /v1/reset` | Unload everything — chat LLM, TTS/ASR audio servers, the image and music servers, and the persistent embedding server (admin). Returns the full post-reset `/health` snapshot; each backend boots again on its next request |
 | `GET /health` | Proxy, chat llama-server, embedding, TTS/ASR, image, and music status, plus registry warnings/degraded |
-| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests, recovered tool calls) |
+| `GET /metrics` | Prometheus text metrics (load/unload/swap counts, durations, failures, HTTP requests, recovered tool calls, context-overflow trims) |
 | `GET /v1/events` | Server-sent events (`model_loaded` / `model_unloaded` / `swap` / `load_failed`) |
 | `GET /api/version` | Ollama version probe (`{"version": "0.5.0"}`) |
 | `GET /api/tags` | Ollama-compatible model list (one entry per registry model, with `size`, `digest`, `details`) |
@@ -1394,7 +1395,8 @@ localhost.
 
 **Observability.** `GET /metrics` exposes Prometheus text counters
 (model loads/unloads/swaps, load durations, load failures, HTTP requests by
-route/status, and tool-call outcomes by model). `GET /v1/events` streams `model_loaded` / `model_unloaded` /
+route/status, tool-call outcomes and context-overflow trims by model).
+`GET /v1/events` streams `model_loaded` / `model_unloaded` /
 `swap` / `load_failed` as server-sent events. `LLAMASWAP_LOG_JSON=true` emits
 one JSON object per log line for log shippers.
 
@@ -1436,6 +1438,21 @@ the agent. Set `LLAMASWAP_TOOL_RECONCILE=false` to disable, and raise
 `LLAMASWAP_TOOL_RECONCILE_MIN_RATIO` (default `0.75`) to stop trusting
 fuzzy name matches. The Ollama `/api/chat` adapter and the native
 llama.cpp routes are not rewritten.
+
+**Context-window overflow trim.** Chat backends refuse any prompt that
+leaves no room for an answer (strata: *"request exceeds the context window:
+prompt (N tokens) leaves no room to answer in the context (M)"*; llama-server
+wording similarly), so an agent conversation that grows past `n_ctx` fails
+on every turn forever. When the upstream error names both counts,
+llamaswap drops the oldest droppable turns — whole tool-call turns, never
+the leading system block or the last message, one short marker noting the
+drop — and retries upstream instead of dead-ending the client with the
+400. The upstream's own token counts decide how much to drop, and the
+retry is bounded (three trim rounds per request). Disabled passes the 400
+through unchanged: `LLAMASWAP_CONTEXT_TRIM=false`, and
+`LLAMASWAP_CONTEXT_TRIM_MARGIN` (default `1024`) reserves completion room.
+Retried requests are counted in
+`llamaswap_context_trims_total{model=,outcome=}`.
 
 ## Notes
 

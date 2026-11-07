@@ -19,7 +19,10 @@ normal ``tool_calls`` entry, with outcomes:
 
 The assistant text is never rewritten, so whatever the client displayed
 stays consistent with what it executes. Nothing is invented: a call is only
-emitted for a name the model itself wrote.
+emitted for a name the model itself wrote. A refused call keeps the model's
+arguments: Strata reports refusals as names only, while the original
+``<tool_call>`` block — arguments included — stays in the content as text,
+so the two are paired up before the call is re-emitted.
 """
 
 import json
@@ -165,6 +168,31 @@ def _assistant_message(data: dict) -> Optional[dict]:
     return None
 
 
+def _merge_arguments(
+    rejected: list[dict], text_calls: list[dict],
+) -> list[dict]:
+    """Arguments for refused calls, taken from the matching text block.
+
+    Strata reports a refusal as names only (``strata_rejected_tool_calls``
+    carries ``{"name": ..., "reason": "undeclared"}``) while the original
+    ``<tool_call>`` block — the model's actual arguments — stays in the
+    content as text. Pair each refused name with its text block, in order;
+    a refused call the backend itself reported with arguments keeps them.
+    """
+    remaining = list(text_calls)
+    merged: list[dict] = []
+    for call in rejected:
+        if _arguments(call) == "{}":
+            name = _norm(str(call.get("name") or ""))
+            for i, tc in enumerate(remaining):
+                if _norm(str(tc.get("name") or "")) == name:
+                    call = {**call, "arguments": tc.get("arguments", "{}")}
+                    del remaining[i]
+                    break
+        merged.append(call)
+    return merged
+
+
 def apply_reconcile(
     data: dict, declared: list[str], min_ratio: float = 0.75,
 ) -> list[tuple[str, Optional[str], str]]:
@@ -172,11 +200,13 @@ def apply_reconcile(
     message = _assistant_message(data)
     if message is None or not declared:
         return []
+    content = message.get("content")
+    text_calls = (
+        text_tool_calls(content)
+        if isinstance(content, str) and content else []
+    )
     calls = rejected_calls(data)
-    if not calls:
-        content = message.get("content")
-        if isinstance(content, str) and content:
-            calls = text_tool_calls(content)
+    calls = _merge_arguments(calls, text_calls) if calls else text_calls
     executed = {
         call.get("function", {}).get("name")
         for call in message.get("tool_calls") or []
@@ -219,6 +249,10 @@ class StreamReconciler:
         self._text: list[str] = []
         self._tail: list[bytes] = []
         self._template: Optional[dict] = None
+        # Highest tool_calls index the backend streamed itself, so a
+        # reconciled delta continues after them instead of colliding with
+        # them (OpenAI clients merge streamed deltas by index).
+        self._next_index = 0
         self._records: list[tuple[str, Optional[str], str]] = []
         self.done = False
 
@@ -269,9 +303,12 @@ class StreamReconciler:
                 if isinstance(content, str):
                     text.append(content)
                 for call in delta.get("tool_calls") or []:
-                    name = call.get("function", {}).get("name") if isinstance(call, dict) else None
-                    if isinstance(name, str) and name in self._declared:
-                        self._records.append((name, name, RECONCILED))
+                    if not isinstance(call, dict):
+                        continue
+                    idx = call.get("index")
+                    if not isinstance(idx, int) or idx < 0:
+                        idx = 0
+                    self._next_index = max(self._next_index, idx + 1)
         self._text.extend(text)
         final = any(
             isinstance(choice, dict) and choice.get("finish_reason") is not None
@@ -284,6 +321,7 @@ class StreamReconciler:
 
     def _synthesized(self) -> list[bytes]:
         text = "".join(self._text)
+        text_calls = text_tool_calls(text) if text else []
         calls: list[dict] = []
         for line in self._tail:
             if line.startswith(b"data: "):
@@ -292,22 +330,23 @@ class StreamReconciler:
                 except (ValueError, TypeError):
                     continue
                 calls.extend(rejected_calls(obj))
-        if not calls and text:
-            calls = text_tool_calls(text)
+        calls = _merge_arguments(calls, text_calls) if calls else text_calls
         out: list[bytes] = []
         delta_calls: list[dict] = []
-        for index, call in enumerate(calls):
+        emitted = 0
+        for call in calls:
             name = str(call.get("name") or "")
             matched, outcome = match_name(name, self._declared, self._min_ratio)
             self._records.append((name, matched, outcome))
             if outcome != RECONCILED:
                 continue
             delta_calls.append({
-                "index": index,
+                "index": self._next_index + emitted,
                 "id": f"call_{uuid4().hex[:24]}",
                 "type": "function",
                 "function": {"name": matched, "arguments": _arguments(call)},
             })
+            emitted += 1
         if delta_calls:
             template = self._template or {"object": "chat.completion.chunk"}
             event = {
