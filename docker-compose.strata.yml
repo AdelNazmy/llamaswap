@@ -49,6 +49,11 @@
 services:
   llamaswap:
     environment:
+      # Fixed container-side prefix the registry YAMLs expand via
+      # ${STRATA_PREFIX} (the dir containing .local/share/strata — the
+      # mount target above). A direct host run (no docker) sets it to
+      # $HOME instead; see .env.example.
+      STRATA_PREFIX: /opt/strata
       # The IQ1_M pack reloads in ~2.5 min warm (135 s measured), but the
       # FIRST boot after a reboot is much slower (cold page cache; 807 s
       # once measured while the weights still lived on a WSL drive mount)

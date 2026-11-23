@@ -23,13 +23,14 @@
 #     big llama.cpp model before loading this one — the card fits one
 #     176.9B pack.
 #
-# HOST LAYOUT: this box runs Strata from the user install under
-# ~/.local/share/strata (its setup.sh), not from the docker overlay in
-# docker-compose.strata.yml — docker is not installed here. The paths
-# below are host paths: `terminal/current` is the installed version dir.
-# A docker deployment would need the container paths back
-# (/opt/strata/... + the ${STRATA_TERMINAL_VERSION} expansion from
-# deploy.sh).
+# PATHS: the Strata install is referenced through env expansion —
+# ${STRATA_PREFIX} is the dir containing .local/share/strata (/opt/strata
+# in the container deployment, set by docker-compose.strata.yml; $HOME for
+# a direct host run) and ${STRATA_TERMINAL_VERSION} the version pin
+# (sniffed off the install by deploy.sh / the container entrypoint).
+# Never use `terminal/current` here: that symlink carries an absolute host
+# path that does not exist inside the container, and the launcher's
+# `cd -P` dies on it.
 #
 # Strata's admin endpoints (/v1/vram, /v1/load, /v1/unload) are NOT
 # proxied — lifecycle belongs to llamaswap; use
@@ -38,10 +39,10 @@ name: qwen3.8-flash-next-coder-iq1_m
 description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — text chat"
 command:
   # The `strata` launcher is a /bin/sh script that resolves its own install
-  # dir, so it must stay inside the bundle. `terminal/current` is a
-  # symlink to the installed version dir; it works on the host (the docker
-  # overlay avoided it because its target is an absolute host path).
-  binary: /home/adnathan/.local/share/strata/terminal/current/bin/strata
+  # dir, so it must stay inside the bundle; the version dir is referenced
+  # directly via ${STRATA_TERMINAL_VERSION} (never `terminal/current` — see
+  # the PATHS note above).
+  binary: ${STRATA_PREFIX}/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/bin/strata
   args:
     - "serve"
     - "--profile"
@@ -70,7 +71,7 @@ command:
       - "--ple-gguf"
       - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
       - "--expert-profile"
-      - "/home/adnathan/.local/share/strata/terminal/current/data/expert-profile-coder.bin"
+      - "${STRATA_PREFIX}/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/data/expert-profile-coder.bin"
       - "--expert-cache"
       - "auto"
       - "--prefill"
@@ -103,7 +104,7 @@ command:
     # stdout, which llamaswap tails into its log under
     # llama-server[<model>]:.
     log: "{config_path}.engine.log"
-    cwd: /home/adnathan/.local/share/strata/terminal/current
+    cwd: ${STRATA_PREFIX}/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}
     tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/packs/coder-iq1_m/tokenizer
     model_name: "{name}"
     # Keep strata's own idle unload off: llamaswap decides when to unload.
@@ -134,9 +135,9 @@ command:
     # HIP + CUDA spelling: the engine honours both.
     HIP_VISIBLE_DEVICES: "0"
     CUDA_VISIBLE_DEVICES: "0"
-    # Strata resolves its install (~/.local/share/strata: components, bundle
-    # data, state) via $HOME.
-    HOME: /home/adnathan
+    # Strata resolves its install ($STRATA_PREFIX/.local/share/strata:
+    # components, bundle data, state) via $HOME.
+    HOME: ${STRATA_PREFIX}
 # internal binding, enforced by the proxy; one model at a time
 host: 127.0.0.1
 port: 8101

@@ -5,14 +5,15 @@
 # messages are embedded by the reader (mmproj) and answered by the text
 # engine.
 #
-# HOST LAYOUT: this box runs Strata from the user install under
-# ~/.local/share/strata (its setup.sh), not from the docker overlay in
-# docker-compose.strata.yml — docker is not installed here. The paths
-# below are host paths: `terminal/current` is the installed version dir,
-# and the engine / reader binaries live under components/engine/<tag>/.
-# A docker deployment would need the container paths back
-# (/opt/strata/... + the ${STRATA_TERMINAL_VERSION}/${STRATA_ENGINE_DIR}
-# expansion from deploy.sh).
+# PATHS: the Strata install is referenced through env expansion —
+# ${STRATA_PREFIX} is the dir containing .local/share/strata (/opt/strata
+# in the container deployment, set by docker-compose.strata.yml; $HOME for
+# a direct host run), ${STRATA_TERMINAL_VERSION} the version pin and
+# ${STRATA_ENGINE_DIR} the engine/reader component tag (sniffed off the
+# install by deploy.sh / the container entrypoint). Never use
+# `terminal/current` here: that symlink carries an absolute host path that
+# does not exist inside the container, and the launcher's `cd -P` dies on
+# it.
 #
 # The reader needs the mmproj file and the text model path (opened
 # vocab-only). Image GENERATION is unrelated and stays on the sd-server
@@ -25,10 +26,10 @@ name: qwen3.8-flash-next-coder-iq1_m-vision
 description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — chat + picture reading"
 command:
   # The `strata` launcher is a /bin/sh script that resolves its own install
-  # dir, so it must stay inside the bundle. `terminal/current` is a
-  # symlink to the installed version dir; it works on the host (the docker
-  # overlay avoided it because its target is an absolute host path).
-  binary: /opt/strata/.local/share/strata/terminal/current/bin/strata
+  # dir, so it must stay inside the bundle; the version dir is referenced
+  # directly via ${STRATA_TERMINAL_VERSION} (never `terminal/current` — see
+  # the PATHS note above).
+  binary: ${STRATA_PREFIX}/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/bin/strata
   args:
     - "serve"
     - "--profile"
@@ -47,7 +48,7 @@ command:
       - "--ple-gguf"
       - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
       - "--expert-profile"
-      - "/opt/strata/.local/share/strata/terminal/current/data/expert-profile-coder.bin"
+      - "${STRATA_PREFIX}/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/data/expert-profile-coder.bin"
       - "--expert-cache"
       - "auto"
       - "--prefill"
@@ -78,14 +79,14 @@ command:
     # starts when it decides the reader does not fit. On this 32 GB card
     # the GPU reader is proven (1.3 GiB free, measured).
     vision:
-      exe: /opt/strata/.local/share/strata/components/engine/0.1.64-linux-x86_64-hip-rx9070/strata-vision-hip
-      cpu_exe: /opt/strata/.local/share/strata/components/engine/0.1.64-linux-x86_64-hip-rx9070/strata-vision
+      exe: ${STRATA_PREFIX}/.local/share/strata/components/engine/${STRATA_ENGINE_DIR}/strata-vision-hip
+      cpu_exe: ${STRATA_PREFIX}/.local/share/strata/components/engine/${STRATA_ENGINE_DIR}/strata-vision
       mmproj: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf
       model: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
       gpu: true
       max_tokens: 1024
     log: "{config_path}.engine.log"
-    cwd: /opt/strata/.local/share/strata/terminal/current
+    cwd: ${STRATA_PREFIX}/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}
     tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/packs/coder-iq1_m/tokenizer
     model_name: "{name}"
     idle_unload_s: 0
@@ -115,9 +116,9 @@ command:
     # the reader share GPU 0.
     HIP_VISIBLE_DEVICES: "0"
     CUDA_VISIBLE_DEVICES: "0"
-    # Strata resolves its install (~/.local/share/strata: components, bundle
-    # data, state) via $HOME.
-    HOME: /opt/strata
+    # Strata resolves its install ($STRATA_PREFIX/.local/share/strata:
+    # components, bundle data, state) via $HOME.
+    HOME: ${STRATA_PREFIX}
 host: 127.0.0.1
 port: 8101
 meta:
