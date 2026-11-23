@@ -235,9 +235,10 @@ def apply_reconcile(
 class StreamReconciler:
     """Passes an SSE stream through untouched, appending the reconciled delta.
 
-    Only the events that end the stream (the one carrying ``finish_reason``
-    and ``[DONE]``) are held back, so reasoning and content keep streaming
-    at full speed; the synthesized chunk is inserted just before them.
+    Only the events that end the stream (the one carrying ``finish_reason``,
+    the include_usage chunk that follows it, and ``[DONE]``) are held back,
+    so reasoning and content keep streaming at full speed; the synthesized
+    chunk is inserted just before them, in the upstream's own order.
     """
 
     def __init__(
@@ -254,6 +255,9 @@ class StreamReconciler:
         # them (OpenAI clients merge streamed deltas by index).
         self._next_index = 0
         self._records: list[tuple[str, Optional[str], str]] = []
+        # Set once the finish_reason chunk is held back: every later line
+        # belongs to the tail too (see _route).
+        self._sealing = False
         self.done = False
 
     def feed(self, chunk: bytes) -> bytes:
@@ -277,6 +281,14 @@ class StreamReconciler:
         return b"".join(out)
 
     def _route(self, line: bytes, out: list[bytes]) -> None:
+        if self._sealing:
+            # Past the terminal chunk everything stays in the tail. In
+            # particular the include_usage chunk arrives *after* the
+            # finish_reason chunk (OpenAI's order), and clients that treat
+            # the usage chunk as the end of the stream would otherwise
+            # never see finish_reason.
+            self._tail.append(line + b"\n")
+            return
         if not line.startswith(b"data: "):
             out.append(line + b"\n")
             return
@@ -292,7 +304,8 @@ class StreamReconciler:
         if not isinstance(obj, dict):
             out.append(line + b"\n")
             return
-        self._template = obj
+        if obj.get("choices"):
+            self._template = obj
         text: list[str] = []
         for choice in obj.get("choices") or []:
             if not isinstance(choice, dict):
@@ -316,6 +329,8 @@ class StreamReconciler:
         )
         if final or rejected_calls(obj):
             self._tail.append(line + b"\n")
+            if final:
+                self._sealing = True
         else:
             out.append(line + b"\n")
 

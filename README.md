@@ -64,7 +64,9 @@ llamaswap (FastAPI)
         ├── sd-server image     (127.0.0.1:8109, on-demand, swappable)
         └── audiocpp_server music (127.0.0.1:8110, on-demand, swappable)
 ```
+
 ## The flow, simplified
+
 ![llamaswapv2.2 — five tenants incl. music](docs/images/llamaswap-v22-simplified.png)
 Read it left to right:
 
@@ -89,6 +91,7 @@ Read it left to right:
    the GPU evicts the right thing.
 
 ### The VRAM guard — complete behavior
+
 **One invariant drives everything, Heaviness decides who loses.**
 The image
 server (FLUX ≈ 12 GB) is the heaviest tenant — it evicts whoever is
@@ -103,13 +106,13 @@ image or music servers (or a failed big-LLM load).
 
 #### The five residents
 
-| Tenant | Manager | Lifetime |
-|---|---|---|
-| Embedding | `EmbeddingManager` | on-demand by default; persistent when `LLAMASWAP_EMBEDDING_AUTO_START=true` |
-| Chat LLM | `ProcessManager` | on-demand, one at a time, idle-unloaded |
-| TTS / ASR | `RoleServerManager` ×2 | on-demand per role, idle-unloaded |
-| Image | `RoleServerManager` ×1 | on-demand, idle-unloaded |
-| Music | `RoleServerManager` ×1 | on-demand, idle-unloaded |
+| Tenant    | Manager                   | Lifetime                                                                      |
+| --------- | ------------------------- | ----------------------------------------------------------------------------- |
+| Embedding | `EmbeddingManager`      | on-demand by default; persistent when `LLAMASWAP_EMBEDDING_AUTO_START=true` |
+| Chat LLM  | `ProcessManager`        | on-demand, one at a time, idle-unloaded                                       |
+| TTS / ASR | `RoleServerManager` ×2 | on-demand per role, idle-unloaded                                             |
+| Image     | `RoleServerManager` ×1 | on-demand, idle-unloaded                                                      |
+| Music     | `RoleServerManager` ×1 | on-demand, idle-unloaded                                                      |
 
 `LLAMASWAP_IDLE_UNLOAD_SECONDS` (default **300**) is the baseline: except
 embedding, every loaded server is shut down after that many seconds with no
@@ -177,18 +180,18 @@ never disturbs anything; if it was evicted it self-heals via
 
 #### The ten toggles
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `unload_audio_on_big_llm` | `true` | big LLM request → evict TTS/ASR first |
-| `audio_vram_guard` | `true` | TTS + ASR both loaded → serve smallest LLM only |
-| `block_audio_on_big_llm` | `true` | big LLM loaded → audio gets `409` |
-| `unload_on_image` | `true` | image load → evict chat + audio + embedding |
-| `unload_image_on_llm` | `true` | chat request → evict image |
-| `unload_image_on_audio` | `true` | audio request → evict image |
-| `unload_on_music` | `true` | music load → evict chat + audio + embedding; also evicted by image loads |
-| `unload_music_on_llm` | `true` | chat request → evict music |
-| `unload_music_on_audio` | `true` | audio request → evict music |
-| `unload_image_on_music` | `true` | music request → evict image |
+| Setting                     | Default  | Meaning                                                                   |
+| --------------------------- | -------- | ------------------------------------------------------------------------- |
+| `unload_audio_on_big_llm` | `true` | big LLM request → evict TTS/ASR first                                    |
+| `audio_vram_guard`        | `true` | TTS + ASR both loaded → serve smallest LLM only                          |
+| `block_audio_on_big_llm`  | `true` | big LLM loaded → audio gets `409`                                      |
+| `unload_on_image`         | `true` | image load → evict chat + audio + embedding                              |
+| `unload_image_on_llm`     | `true` | chat request → evict image                                               |
+| `unload_image_on_audio`   | `true` | audio request → evict image                                              |
+| `unload_on_music`         | `true` | music load → evict chat + audio + embedding; also evicted by image loads |
+| `unload_music_on_llm`     | `true` | chat request → evict music                                               |
+| `unload_music_on_audio`   | `true` | audio request → evict music                                              |
+| `unload_image_on_music`   | `true` | music request → evict image                                              |
 
 #### Embedding server — the special case
 
@@ -220,6 +223,7 @@ either supported by an explicit rule, evicted by an explicit rule, or
 refused with `409`.
 
 ## The flow detailed
+
 - **One chat LLM at a time.** A 13 GB model does not fit twice on a 16 GB
   GPU, so when a request names a different chat model than the one currently
   loaded, the proxy gracefully stops the running chat `llama-server`, spawns
@@ -292,7 +296,6 @@ refused with `409`.
 ### Request flow
 
 ![llamaswap request flow](docs/images/llamaswap-request-flow.png)
-
 
 ## Layout
 
@@ -369,14 +372,14 @@ run concurrently on different cards of a multi-GPU box.
 
 `role` can be:
 
-| role | manager | swaps per request | example |
-|---|---|---|---|
-| `llm` | ProcessManager | yes | `qwen3.8-27b` |
-| `embedding` | EmbeddingManager | no (single) | `octen-embedding-0.6b` |
-| `tts` | RoleServerManager | yes (among tts models) | `outetts`, `qwen3-tts`, `supertonic-3` |
-| `asr` | RoleServerManager | yes (among asr models) | `whisper-asr`, `qwen3-asr`, `nemotron-asr` |
-| `image` | RoleServerManager | yes (among image models) | `flux-schnell` |
-| `music` | RoleServerManager | yes (among music models) | `minimax-music3` |
+| role          | manager           | swaps per request        | example                                          |
+| ------------- | ----------------- | ------------------------ | ------------------------------------------------ |
+| `llm`       | ProcessManager    | yes                      | `qwen3.8-27b`                                  |
+| `embedding` | EmbeddingManager  | no (single)              | `octen-embedding-0.6b`                         |
+| `tts`       | RoleServerManager | yes (among tts models)   | `outetts`, `qwen3-tts`, `supertonic-3`     |
+| `asr`       | RoleServerManager | yes (among asr models)   | `whisper-asr`, `qwen3-asr`, `nemotron-asr` |
+| `image`     | RoleServerManager | yes (among image models) | `flux-schnell`                                 |
+| `music`     | RoleServerManager | yes (among music models) | `minimax-music3`                               |
 
 `role: llm` models are swapped on request by the normal path. A single
 `role: embedding` model runs persistently on its own port (usually `8102`)
@@ -397,8 +400,7 @@ diffusion model never shares the GPU.
 
 `role: music` works through `/v1/audio/music`, a small JSON dialect
 translated to audio.cpp's generic `POST /v1/tasks/run`:
-`{"model": "minimax-music3", "input": "<music caption>", "lyrics": "...",
-"duration": 30, "response_format": "wav"}` — any other field (seed,
+`{"model": "minimax-music3", "input": "<music caption>", "lyrics": "...", "duration": 30, "response_format": "wav"}` — any other field (seed,
 num_inference_steps, guidance_scale, ...) passes through to the backend
 request. The response is binary audio (`audio/wav` by default; other
 `response_format` codecs are transcoded via ffmpeg like `/v1/audio/speech`).
@@ -433,6 +435,7 @@ the backend stops.
 fight over the internal port.
 
 # Installation
+
 ## Quick start — from the Docker Hub image (no local build)
 
 The published image already contains the proxy, the llama.cpp / audio.cpp /
@@ -486,17 +489,16 @@ warns when `HEAD` is not pushed, smoke-tests the built image itself
 base image first so an update builds on the newest published state). A
 genuine rebuild from scratch — new binaries or dependency changes — stays
 with `./scripts/deploy.sh --build-only` on a machine that has the `/opt`
-host builds, then `docker tag llamaswap:local adelnazmy2002/llamaswap:latest
-&& docker push adelnazmy2002/llamaswap:latest`.
+host builds, then `docker tag llamaswap:local adelnazmy2002/llamaswap:latest && docker push adelnazmy2002/llamaswap:latest`.
 
 ### Model weights on a new machine
 
 The two built-in downloaders cover different deployments:
 
-| Deployment | Command | What it downloads |
-|---|---|---|
-| Hub image | `docker compose -f docker-compose.hub.yml run --rm models-init` | default TTS/ASR/music bundle set |
-| From source | `./scripts/deploy.sh` | checks `MODEL_ROOT` and downloads missing TTS/ASR/FLUX weights before starting; the compose `models-init` then fills in the default TTS/ASR/music set on `up` |
+| Deployment  | Command                                                           | What it downloads                                                                                                                                                   |
+| ----------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hub image   | `docker compose -f docker-compose.hub.yml run --rm models-init` | default TTS/ASR/music bundle set                                                                                                                                    |
+| From source | `./scripts/deploy.sh`                                           | checks `MODEL_ROOT` and downloads missing TTS/ASR/FLUX weights before starting; the compose `models-init` then fills in the default TTS/ASR/music set on `up` |
 
 `deploy.sh` is for the from-source stack (`docker-compose.yml` + overlays), not
 the Hub image. It skips downloads with `--build-only`; `--no-audio` and
@@ -567,11 +569,11 @@ music-composer skills through `scripts/install-opencode.py`.
 
 One listener (container `11434`), three host aliases:
 
-| Port | Purpose |
-|---|---|
+| Port      | Purpose                                                                                         |
+| --------- | ----------------------------------------------------------------------------------------------- |
 | `11434` | OpenAI-compatible API + admin dashboard (Ollama-style port; overridable via `LLAMASWAP_PORT`) |
-| `1234` | llama.cpp's default port — point llama.cpp clients straight at it |
-| `9090` | legacy graphify port kept for existing integrations |
+| `1234`  | llama.cpp's default port — point llama.cpp clients straight at it                              |
+| `9090`  | legacy graphify port kept for existing integrations                                             |
 
 Verify:
 
@@ -605,6 +607,7 @@ Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
 (`nvcc`) and your GPU driver, then:
 
 For Bonsai low weights Models
+
 ```bash
 mkdir
 git clone https://github.com/PrismML-Eng/llama.cpp.git
@@ -615,6 +618,7 @@ cmake --build build --config Release -j 16
 ```
 
 For Normal GGUF Models
+
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
@@ -628,6 +632,7 @@ Install [ROCm](https://rocm.docs.amd.com/) (`hipcc`) and your GPU driver,
 then:
 
 For Bonsai low weights Models
+
 ```bash
 git clone https://github.com/PrismML-Eng/llama.cpp.git
 mv llama.cpp llama_prism.cpp
@@ -637,6 +642,7 @@ cmake --build build --config Release -j 16
 ```
 
 For Normal GGUF Models
+
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
@@ -645,6 +651,7 @@ cmake --build build --config Release -j 16
 ```
 
 ### Embedding model tensores download amd GGUF convert
+
 ```bash
 hf download Octen/Octen-Embedding-0.6B --local-dir /opt/models/Octen-Embedding-0.6B
 
@@ -683,13 +690,26 @@ git submodule update --init --recursive
 # Only the compiled model loaders below ship in the binary, which keeps
 # the build time and binary small. Drop AUDIOCPP_MODEL_SET /
 # AUDIOCPP_MODELS to build the full model set instead.
+
+#For CDUA
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENGINE_ENABLE_CUDA=ON \
     -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS="outetts,qwen3_asr,qwen3_tts,supertonic,nemotron_asr"
+
+
+# For Rocm 
+cmake -B build -DGGML_HIP=1  -DCMAKE_BUILD_TYPE=Release   -DBUILD_SHARED_LIBS=OFF \
+-DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS="outetts,qwen3_asr,qwen3_tts,supertonic,nemotron_asr"
 # Cap at 70% of available cores so nvcc does not saturate the host
 # (28 threads -> -j19; 20 cores -> -j14).
 cmake --build build --parallel $(($(nproc) * 7 / 10)) --target audiocpp_server
 ```
 
+> The `backend:` field in `command.config_json` of every audio.cpp YAML
+> must match the build: `rocm` (alias `hip`) for a ROCm build, `cuda` for a
+> CUDA build. `audiocpp_server --version` prints the enabled backends, and
+> a mismatch fails the launch with *"CUDA backend requested but it is not
+> registered in this build"*. The YAMLs in this tree are set to `rocm`.
+>
 > The custom model set above only compiles the `outetts` + `qwen3_tts` + `qwen3_asr` + `supertonic` + `nemotron_asr`
 > loaders (small binary, fast build). To use the higher-quality families
 > below (Higgs Audio, IndexTTS, VibeVoice, VoxCPM2, Nemotron/Parakeet ASR,
@@ -714,27 +734,27 @@ the same way through `request_format: json_path`.
 
 **TTS — top naturalness / expressiveness (larger, needs VRAM):**
 
-| Family | Model | Notes |
-|---|---|---|
-| `higgs_audio_tts` | Higgs Audio v3 TTS 4B | Flagship TTS+clone+control; best overall naturalness |
-| `voxcpm2` | VoxCPM2-2B | 48 kHz output, Clone/Design/Ctrl, multilingual |
-| `vibevoice` | VibeVoice 1.5B / 7B | Dialogue-grade expressive TTS (en, zh) |
-| `index_tts2` | IndexTTS-2 / 2.5 | Strong clone + style control (zh,en,ja,es,ar) |
-| `fish_audio` | Fish Audio S2 Pro | auto/en/zh, Clone + Ctrl |
-| `fireredtts3` | FireRedTTS3 Base/Instruct | 24 langs + 21 zh dialects, Designs voices |
+| Family              | Model                     | Notes                                                |
+| ------------------- | ------------------------- | ---------------------------------------------------- |
+| `higgs_audio_tts` | Higgs Audio v3 TTS 4B     | Flagship TTS+clone+control; best overall naturalness |
+| `voxcpm2`         | VoxCPM2-2B                | 48 kHz output, Clone/Design/Ctrl, multilingual       |
+| `vibevoice`       | VibeVoice 1.5B / 7B       | Dialogue-grade expressive TTS (en, zh)               |
+| `index_tts2`      | IndexTTS-2 / 2.5          | Strong clone + style control (zh,en,ja,es,ar)        |
+| `fish_audio`      | Fish Audio S2 Pro         | auto/en/zh, Clone + Ctrl                             |
+| `fireredtts3`     | FireRedTTS3 Base/Instruct | 24 langs + 21 zh dialects, Designs voices            |
 
 **TTS — best quality per GB / small-footprint (VRAM-friendly):**
 
-| Family | Model | Notes |
-|---|---|---|
-| `qwen3_tts` | Qwen3-TTS 12Hz 0.6B/1.7B Base | Best size/quality ratio; the 12Hz 0.6B Base config here is a voice-clone model (reference audio required, no preset voice) (script: `tts-qwen3`) |
-| `omnivoice` | OmniVoice (Qwen3-0.6B) | 646+ languages, Clone/Design/Ctrl |
-| `magpie_tts` | NVIDIA MagpieTTS 357M | Tiny, crisp, multilingual (12 langs) |
-| `supertonic` | Supertonic 3 | Very fast (200x+ real-time on CUDA), en + 31 langs |
-| `miotts` | MioTTS-1.7B | Clean en/ja voice, Clone |
-| `neutts` | NeuTTS 2E | Emotion control, streaming |
-| `pocket_tts` | PocketTTS-100M | Tiniest TTS that still sounds good (en,de,it,pt,es) |
-| `outetts` | OuteTTS 1.0 1B | Current default (script: `tts`); community port, Clone |
+| Family         | Model                         | Notes                                                                                                                                              |
+| -------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `qwen3_tts`  | Qwen3-TTS 12Hz 0.6B/1.7B Base | Best size/quality ratio; the 12Hz 0.6B Base config here is a voice-clone model (reference audio required, no preset voice) (script: `tts-qwen3`) |
+| `omnivoice`  | OmniVoice (Qwen3-0.6B)        | 646+ languages, Clone/Design/Ctrl                                                                                                                  |
+| `magpie_tts` | NVIDIA MagpieTTS 357M         | Tiny, crisp, multilingual (12 langs)                                                                                                               |
+| `supertonic` | Supertonic 3                  | Very fast (200x+ real-time on CUDA), en + 31 langs                                                                                                 |
+| `miotts`     | MioTTS-1.7B                   | Clean en/ja voice, Clone                                                                                                                           |
+| `neutts`     | NeuTTS 2E                     | Emotion control, streaming                                                                                                                         |
+| `pocket_tts` | PocketTTS-100M                | Tiniest TTS that still sounds good (en,de,it,pt,es)                                                                                                |
+| `outetts`    | OuteTTS 1.0 1B                | Current default (script: `tts`); community port, Clone                                                                                           |
 
 **TTS — community ports (also very high quality):** `glm_tts` (GLM-TTS,
 zh/en clone), `f5_tts` (F5-TTS flow-matching DiT, en/ar), `vietneu_tts`
@@ -821,6 +841,10 @@ git clone https://github.com/ggml-org/whisper.cpp .
 # GGML_CUDA is the current CUDA flag (WHISPER_CUBLAS is a deprecated alias).
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
 # Cap at 70% of available cores so nvcc does not saturate the host.
+
+#For ROCm
+cmake -B build -DGGML_HIP=1  -DCMAKE_BUILD_TYPE=Release   -DBUILD_SHARED_LIBS=OFF
+
 cmake --build build --config Release --target whisper-server \
     --parallel $(($(nproc) * 9 / 10))
 
@@ -848,7 +872,7 @@ binary, which natively speaks the OpenAI image API (`/v1/images/generations`,
   (`ggml`, `thirdparty/libwebp`, `thirdparty/libwebm`, the server webui).
 * ~25 GB free disk space for the FLUX weights plus build artifacts.
 
-```bash
+```
 mkdir -p /opt/stable-diffusion.cpp
 cd /opt/stable-diffusion.cpp
 git clone https://github.com/leejet/stable-diffusion.cpp .
@@ -857,9 +881,14 @@ git clone https://github.com/leejet/stable-diffusion.cpp .
 # "does not contain a CMakeLists.txt".
 git submodule update --init --recursive
 
-# CUDA build. The server example builds as `sd-server`; the web frontend is
-# optional (off below, which skips the pnpm toolchain).
+#CUDA build. The server example builds as `sd-server`; the web frontend is
+#optional (off below, which skips the pnpm toolchain).
+
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DSD_SERVER_BUILD_FRONTEND=OFF
+
+#For ROCm
+cmake -S . -B build -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release  -DBUILD_SHARED_LIBS=OFF  -DSD_SERVER_BUILD_FRONTEND=OFF
+
 # Cap at 70% of available cores so nvcc does not saturate the host.
 cmake --build build --config Release --target sd-server \
     --parallel $(($(nproc) * 9 / 10))
@@ -867,44 +896,40 @@ cmake --build build --config Release --target sd-server \
 # FLUX.1-schnell q8_0 GGUF + VAE + text encoders
 ./scripts/download-models.sh flux-schnell flux-vae flux-clip_l flux-t5xxl
 ```
->Note: if any model download failed it may reuire your login
-The 401 Unauthorized error occurs because the FLUX.1-dev model is a gated repository on Hugging Face, requiring you to accept their terms and authenticate your download request.
+
+> Note: if any model download failed it may reuire your login
+> The 401 Unauthorized error occurs because the FLUX.1-dev model is a gated repository on Hugging Face, requiring you to accept their terms and authenticate your download request.
+
 * Step 1: Accept the Terms on Hugging Face
 
-   1. Log into your Hugging Face account.
-   2. Visit the [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) repository page.
-   3. Agree to the user conditions and submit the access request form.
-
+  1. Log into your Hugging Face account.
+  2. Visit the [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) repository page.
+  3. Agree to the user conditions and submit the access request form.
 * Step 2: Create a Read Token
 
-   1. Go to your Hugging Face Account Settings.
-   2. Click on Access Tokens in the left sidebar.
-   3. Generate a new token with Read permissions.
-   4. Copy the generated token string.
-
+  1. Go to your Hugging Face Account Settings.
+  2. Click on Access Tokens in the left sidebar.
+  3. Generate a new token with Read permissions.
+  4. Copy the generated token string.
 * Step 3: Pass the Token via wget
-Modify your wget command to include an authorization header containing your token:
+  Modify your wget command to include an authorization header containing your token:
 
   wget --header="Authorization: Bearer YOUR_HF_TOKEN_HERE" https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors
 
 > Alternative: Use the huggingface-cli (Recommended)
-Since you are already working inside a virtual environment (.venv), using the official Hugging Face CLI tool handles authentication and large downloads much more reliably than wget.
+> Since you are already working inside a virtual environment (.venv), using the official Hugging Face CLI tool handles authentication and large downloads much more reliably than wget.
 
-   1. Install the CLI tool:
+1. Install the CLI tool:
 
-    pip install huggingface_hub
+   pip install huggingface_hub
+2. Log into your account:
 
-   2. Log into your account:
+   huggingface-cli login
 
-    huggingface-cli login
+   (Paste your Read token when prompted)
+3. Download the specific file directly to your current directory:
 
-    (Paste your Read token when prompted)
-
-
-   3. Download the specific file directly to your current directory:
-
-    huggingface-cli download black-forest-labs/FLUX.1-dev ae.safetensors --local-dir .
-
+   huggingface-cli download black-forest-labs/FLUX.1-dev ae.safetensors --local-dir .
 
 The binary ends up at `build/bin/sd-server`. The Docker overlay (below)
 stamps this host-built binary into the image — nothing is compiled inside
@@ -973,12 +998,14 @@ its (missing) binary — the proxy keeps running and reports the image role
 as stopped in `/health`. Delete the image YAML to hide it from `/v1/models`.
 
 ### LlamaSwap Docker Installation
+
 ```bash
 cd ~
 git clone https://github.com/AdelNazmy/llamaswap.git
 cd llamaswap
 docker compose up --build
 ```
+
 The container publishes the proxy on **two host ports**:
 
 - `11434` — the repo default (overridable via `LLAMASWAP_PORT`);
@@ -1000,7 +1027,9 @@ Notes:
   instead, so the steps above are only for building it locally.
 
 ## Local Run
+
 ### Install Prerequisites
+
 ```bash
 cd ~
 pip install uv
@@ -1010,6 +1039,7 @@ uv pip install -r ~/llamaswap/requirements.txt
 ```
 
 ### Launch Application
+
 ```bash
 cd ~/llamaswap
 ~/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 11434
@@ -1131,26 +1161,26 @@ the reference, and `-o`/`--out` sets the output. Run
 
 ## API
 
-| Endpoint | Description |
-|---|---|
-| `GET /` | Admin dashboard (live model states, one-click load/unload) |
-| `GET /v1/models` | List models from the registry (OpenAI shape) with live `state`/`loaded` |
-| `GET /v1/models/{model}` | One model entry (with live `state`/`loaded`) |
-| `POST /v1/models/{model}/load` | Preload/warm a model (admin) |
-| `POST /v1/models/{model}/unload` | Unload the model resident for this model's role (admin) |
-| `POST /v1/chat/completions` | Chat; `stream: true` for SSE. `X-Pin-Seconds` suppresses idle unload |
-| `POST /v1/completions` | Text completions |
-| `POST /v1/responses` | OpenAI Responses API; proxies to llama-server's `/v1/responses` (streaming via `stream: true`). Requires a llama-server build that exposes the responses route |
-| `POST /v1/embeddings` | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path |
-| `POST /v1/messages` | Anthropic Messages API passthrough (llama.cpp speaks it natively; `model` is required as usual) |
-| `POST /v1/rerank` (also `/v1/reranking`, `/rerank`) | Rerank documents against a query — served by a `role: llm` reranker entry (launched with `--embedding --pooling rank`); `model` is optional |
-| `POST /completion` | llama.cpp native completion with the full option set (token arrays, `n_probs`, `id_slot`, per-request LoRA, …); `stream: true` for SSE |
-| `POST /tokenize` · `POST /detokenize` | Convert between text and tokens (native) |
-| `POST /apply-template` | Apply the model's chat template without running inference (native) |
-| `POST /infill` | Fill-in-the-middle completion (native; deprecated upstream) |
-| `GET /props` · `POST /props` | Server/model properties (context size, chat template, modalities); POST changes overridable props (requires `--props` upstream) |
-| `GET /slots` · `POST /slots/{id_slot}?action=save\|restore\|erase` | Slot monitoring and KV-cache management (save/restore need `--slot-save-path` upstream) |
-| `GET /lora-adapters` · `POST /lora-adapters` | List and set LoRA adapter scales at runtime |
+| Endpoint                                                              | Description                                                                                                                                                        |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /`                                                             | Admin dashboard (live model states, one-click load/unload)                                                                                                         |
+| `GET /v1/models`                                                    | List models from the registry (OpenAI shape) with live `state`/`loaded`                                                                                        |
+| `GET /v1/models/{model}`                                            | One model entry (with live `state`/`loaded`)                                                                                                                   |
+| `POST /v1/models/{model}/load`                                      | Preload/warm a model (admin)                                                                                                                                       |
+| `POST /v1/models/{model}/unload`                                    | Unload the model resident for this model's role (admin)                                                                                                            |
+| `POST /v1/chat/completions`                                         | Chat; `stream: true` for SSE. `X-Pin-Seconds` suppresses idle unload                                                                                           |
+| `POST /v1/completions`                                              | Text completions                                                                                                                                                   |
+| `POST /v1/responses`                                                | OpenAI Responses API; proxies to llama-server's `/v1/responses` (streaming via `stream: true`). Requires a llama-server build that exposes the responses route |
+| `POST /v1/embeddings`                                               | Embeddings; uses the persistent embedding server if configured, otherwise the normal model-swap path                                                               |
+| `POST /v1/messages`                                                 | Anthropic Messages API passthrough (llama.cpp speaks it natively; `model` is required as usual)                                                                  |
+| `POST /v1/rerank` (also `/v1/reranking`, `/rerank`)             | Rerank documents against a query — served by a `role: llm` reranker entry (launched with `--embedding --pooling rank`); `model` is optional                 |
+| `POST /completion`                                                  | llama.cpp native completion with the full option set (token arrays, `n_probs`, `id_slot`, per-request LoRA, …); `stream: true` for SSE                      |
+| `POST /tokenize` · `POST /detokenize`                            | Convert between text and tokens (native)                                                                                                                           |
+| `POST /apply-template`                                              | Apply the model's chat template without running inference (native)                                                                                                 |
+| `POST /infill`                                                      | Fill-in-the-middle completion (native; deprecated upstream)                                                                                                        |
+| `GET /props` · `POST /props`                                     | Server/model properties (context size, chat template, modalities); POST changes overridable props (requires `--props` upstream)                                  |
+| `GET /slots` · `POST /slots/{id_slot}?action=save\|restore\|erase` | Slot monitoring and KV-cache management (save/restore need `--slot-save-path` upstream)                                                                          |
+| `GET /lora-adapters` · `POST /lora-adapters`                     | List and set LoRA adapter scales at runtime                                                                                                                        |
 
 **Native-endpoint model selection.** The llama.cpp native routes
 (`/completion`, `/tokenize`, `/detokenize`, `/apply-template`, `/infill`,
@@ -1159,7 +1189,6 @@ the reference, and `-o`/`--out` sets the output. Run
 string, then the currently loaded chat LLM, then the first configured LLM
 (booting it on demand). All VRAM guards and `X-Pin-Seconds` apply exactly
 as for chat.
-
 
 | `POST /v1/audio/speech` | TTS (`role: tts`); JSON in, binary audio out. `response_format` (mp3/opus/aac/flac/pcm/wav) is transcoded from WAV internally via ffmpeg |
 | `POST /v1/audio/speech/stream` | Streaming TTS: relays audio.cpp's OpenAI-shaped audio SSE (`speech.audio.delta` base64-PCM chunks → `speech.audio.done`) unbuffered; needs a `mode: streaming` backend (e.g. `supertonic-3-stream`) — offline backends get a clear refusal |
@@ -1570,4 +1599,5 @@ trim uses. Embeddings, TTS/ASR, image, and music traffic is not counted.
   `llama-server[embed <model>]: ...`.
 
 ## Utilization and logs
+
   ![llama-server starting with the CUDA backend](docs/images/llama-server-cuda.png)

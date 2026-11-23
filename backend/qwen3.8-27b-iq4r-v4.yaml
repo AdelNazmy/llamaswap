@@ -1,0 +1,39 @@
+# Text chat model: Qwen3.8 27B (IQ4_R v4), served by the Radiance engine.
+#
+# Radiance is a managed backend like any other: llamaswap spawns
+# start.sh (which reapplies the 230 W power cap and execs
+# `radiance --config qwen.yaml`), waits for /v1/health, and forwards chat
+# traffic to the entry port.
+#
+# IMPORTANT:
+#   * start.sh is the front binary on purpose: the radiance CLI refuses
+#     unknown flags, so it cannot take the --host/--port llamaswap appends
+#     to every launch argv — start.sh never forwards them to radiance.
+#   * The port below is fixed by qwen.yaml's server.port (8000); the two
+#     must agree because the health probes target the entry port.
+#   * /v1/health answers 503 "loading" until every required fleet model is
+#     resident (a single-model fleet preloads and gates on its model), and
+#     ready_path additionally polls /admin/fleet so a multi-model fleet
+#     (after qwen3.6-35b joins) still waits for THIS model's residency.
+#   * The engine is a multi-model fleet: every fleet model gets its own
+#     registry entry with the SAME command (identical launch argv), and the
+#     process manager treats same-argv entries as aliases of one running
+#     process — switching aliases never restarts the engine.
+#   * Stop contract: SIGTERM drains in-flight work; llamaswap escalates to
+#     SIGKILL after the stop timeout. idle_unload_seconds: 0 keeps the
+#     fleet resident (its reload costs minutes, not seconds).
+name: qwen3.8-27b-iq4r-v4
+description: "Qwen3.8 27B IQ4_R v4, Radiance, text chat 262k"
+command:
+  binary: /home/adnathan/radiance/start.sh
+  args: []
+host: 127.0.0.1
+port: 8000
+meta:
+  context_length: 262144
+  family: qwen
+  capabilities: [chat]
+  health_path: /v1/health
+  ready_path: /admin/fleet
+  vram_gb: 30.5
+  idle_unload_seconds: 0

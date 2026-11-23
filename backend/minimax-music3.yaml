@@ -46,7 +46,9 @@ command:
   config_json:
     host: "{host}"
     port: "{port}"
-    backend: cuda
+    # audio.cpp backend: "rocm" (alias "hip") on this AMD build; use "cuda"
+    # on an NVIDIA build (audiocpp_server --version lists enabled backends).
+    backend: rocm
     device: 0
     threads: 1
     models:

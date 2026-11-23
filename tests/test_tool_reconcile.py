@@ -175,6 +175,31 @@ def test_stream_healthy_call_makes_no_records():
     assert r.records == []
 
 
+def test_stream_keeps_usage_chunk_after_finish():
+    """OpenAI puts the include_usage chunk last, after finish_reason.
+    Holding the terminal chunk back must not let usage jump ahead of it:
+    strict clients end the stream at the usage chunk and then report a
+    missing finish_reason (OpenCode: "stream ended without finish_reason")."""
+    r = StreamReconciler([])
+    usage = chunk({}, extra={
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}})
+    usage["choices"] = []
+    out = r.feed(
+        sse(chunk({"content": "hi"}))
+        + sse(chunk({}, finish="stop"))
+        + sse(usage)
+        + b"data: [DONE]\n\n"
+    )
+    out += r.finish()
+    payloads = [line for line in out.decode().splitlines()
+                if line.startswith("data: ")]
+    assert payloads[-1] == "data: [DONE]"
+    assert json.loads(payloads[-2][6:])["usage"]["total_tokens"] == 5
+    finish = json.loads(payloads[-3][6:])
+    assert finish["choices"][0]["finish_reason"] == "stop"
+    assert r.records == []
+
+
 def test_text_tool_calls_parses_json_block():
     calls = text_tool_calls(f"before {BLOCK} after")
     assert calls == [{"name": "unity_read", "arguments": '{"path": "/a/b"}'}]

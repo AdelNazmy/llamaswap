@@ -18,6 +18,16 @@ LLAMA_REQUEST = (
     'request (2500 tokens) exceeds the available context size (3000 tokens), '
     'try increasing it'
 )
+RADIANCE_REQUEST = (
+    "This model's maximum context length is 262144 tokens: the request "
+    "(262200 tokens) exceeds the available context size (262144 tokens) and "
+    "leaves nothing to generate into; shorten the prompt by at least 56 tokens"
+)
+RADIANCE_POOL_FULL = (
+    "This model's maximum context length is 262144 tokens, all the KV cache "
+    "holds for one sequence: the prompt exceeds the available context size; "
+    "shorten it or give the cache more room"
+)
 
 
 def test_overflow_info_strata_variants():
@@ -28,6 +38,25 @@ def test_overflow_info_strata_variants():
 def test_overflow_info_llama_variants():
     assert overflow_info(LLAMA_INPUT) == (2500, 3000)
     assert overflow_info(LLAMA_REQUEST) == (2500, 3000)
+
+
+def test_overflow_info_radiance_variants():
+    # The request-too-long error names both counts (same wording shape as
+    # llama-server's, beside OpenAI's "maximum context length is M tokens").
+    assert overflow_info(RADIANCE_REQUEST) == (262200, 262144)
+    # The KV-pool-full refusal names only the cap: the prompt count is
+    # reported 0 so trim_messages falls back to its chars/4 estimate.
+    assert overflow_info(RADIANCE_POOL_FULL) == (0, 262144)
+    # Both also arrive wrapped in an OpenAI-style error JSON body.
+    body = json.dumps({"error": {"type": "invalid_request_error",
+                                 "code": "context_length_exceeded",
+                                 "message": RADIANCE_POOL_FULL}})
+    assert overflow_info(body) == (0, 262144)
+    assert overflow_info(body.encode()) == (0, 262144)
+    body = json.dumps({"error": {"type": "invalid_request_error",
+                                 "code": "context_length_exceeded",
+                                 "message": RADIANCE_REQUEST}})
+    assert overflow_info(body) == (262200, 262144)
 
 
 def test_overflow_info_json_and_bytes():

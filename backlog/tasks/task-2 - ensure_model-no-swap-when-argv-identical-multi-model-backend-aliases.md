@@ -1,7 +1,7 @@
 ---
 id: TASK-2
 title: 'ensure_model: no swap when argv identical (multi-model backend aliases)'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-11-22T09:14:50Z'
 labels:
@@ -29,3 +29,17 @@ Then register one registry entry per radiance fleet model (entry name == radianc
 
 Add a unit test: alias switch must not send SIGTERM / must not restart the process.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation
+
+Built 2026-11-23 in `app/process_manager.py`:
+- `ensure_model` now checks, for a READY current process, whether the
+  requested entry's `build_argv` equals the running entry's argv
+  (`_same_argv`, which rebuilds the running argv with the rendered config
+  path of the process actually spawned). On a match it only updates the
+  bookkeeping name — the entry name follows the alias — and returns
+  `(name, cfg.port)`: no SIGTERM, no restart, no swap metric/event.
+- Tests: `tests/test_process_manager.py` — same name (no restart), alias
+  switch (no SIGTERM / no restart / name follows / same process object),
+  alias back-and-forth, genuinely different argv (still SIGTERM + restart),
+  non-READY (LOADING) current (still replaced).

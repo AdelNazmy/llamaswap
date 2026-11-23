@@ -63,6 +63,9 @@ class ProcessManager:
         self._config_dir = Path(config_dir)
         self._lock = asyncio.Lock()
         self._current: Optional[RunningModel] = None
+        # (id(entry), line) last echoed by _log_lines; consecutive
+        # duplicates of a heartbeat are suppressed (see _log_lines).
+        self._log_dedup: Optional[tuple[int, str]] = None
         self._last_activity: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         # Timestamp until which idle unload is suppressed (X-Pin-Seconds).
@@ -104,6 +107,23 @@ class ProcessManager:
     def _health_url(self, cfg: ModelConfig) -> str:
         return cfg.health_url()
 
+    def _ready_url(self, cfg: ModelConfig) -> Optional[str]:
+        """The optional fleet readiness probe URL (meta.ready_path), if any."""
+        if not cfg.meta.ready_path:
+            return None
+        return f"http://{cfg.host}:{cfg.port}{cfg.meta.ready_path}"
+
+    @staticmethod
+    def _same_argv(cur: "RunningModel", cfg: ModelConfig) -> bool:
+        """Whether `cfg` launches with the identical argv as the running
+        entry — the fleet alias test used by ensure_model. The running
+        entry's argv is rebuilt from ITS config and rendered config file
+        (the one actually spawned); the requested entry has no rendered
+        file yet, so its placeholder renders to the empty string and only
+        truly identical commands can match."""
+        return (cur.config.build_argv(config_path=cur.config_file)
+                == cfg.build_argv())
+
     def _render_config(self, cfg: ModelConfig) -> Optional[str]:
         """Write the per-model config JSON for a structured-config backend
         (Strata's ``strata serve --profile``), if the YAML declares one."""
@@ -120,10 +140,21 @@ class ProcessManager:
         return str(path)
 
     def _log_lines(self, entry: RunningModel, chunk: bytes) -> None:
+        # A heartbeat backend (Radiance's live view: one key=value line per
+        # ~250 ms, values unchanged while idle) would otherwise echo ~4
+        # lines/s for the process's whole life. Log each distinct line
+        # once and skip consecutive duplicates — the line reappears in the
+        # log the moment any value changes.
         for line in chunk.decode(errors="replace").splitlines():
             line = line.strip()
-            if line:
-                logger.info("llama-server[%s]: %s", entry.name, line)
+            if not line:
+                continue
+            if self._log_dedup is not None \
+                    and self._log_dedup[0] == id(entry) \
+                    and self._log_dedup[1] == line:
+                continue
+            self._log_dedup = (id(entry), line)
+            logger.info("llama-server[%s]: %s", entry.name, line)
 
     async def _tail(self, entry: RunningModel) -> None:
         """Drain both pipes of the subprocess for its whole lifetime.
@@ -184,6 +215,7 @@ class ProcessManager:
     async def _wait_healthy(self, cfg: ModelConfig,
                             proc: asyncio.subprocess.Process) -> None:
         deadline = asyncio.get_running_loop().time() + self._startup_timeout
+        ready_url = self._ready_url(cfg)
         async with httpx.AsyncClient(timeout=5.0) as client:
             while True:
                 if proc.returncode is not None:
@@ -191,19 +223,47 @@ class ProcessManager:
                         f"llama-server for '{cfg.name}' exited (code "
                         f"{proc.returncode}) during startup; see logs above"
                     )
+                healthy = False
                 try:
                     r = await client.get(self._health_url(cfg))
                     if r.status_code == 200 and self._load_reported(
                             r.content) is not False:
-                        return
+                        # A fleet engine's /v1/health can answer 200 before
+                        # the named model is resident (multi-model fleets);
+                        # the ready probe waits for the residency itself.
+                        if ready_url is None:
+                            healthy = True
+                        else:
+                            healthy = self._fleet_resident(
+                                (await client.get(ready_url)).content,
+                                cfg.name,
+                            )
                 except httpx.HTTPError:
                     pass
+                if healthy:
+                    return
                 if asyncio.get_running_loop().time() > deadline:
                     raise ModelLoadError(
                         f"llama-server for '{cfg.name}' did not become "
                         f"healthy within {self._startup_timeout:.0f}s"
                     )
                 await asyncio.sleep(self._health_interval)
+
+    @staticmethod
+    def _fleet_resident(body: bytes, name: str) -> bool:
+        """Whether a fleet status object (Radiance's /admin/fleet) reports
+        `name` resident."""
+        try:
+            obj = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        if not isinstance(obj, dict):
+            return False
+        for m in obj.get("models") or []:
+            if isinstance(m, dict) and m.get("id") == name \
+                    and m.get("state") == "resident":
+                return True
+        return False
 
     async def _stop_current(self) -> None:
         cur = self._current
@@ -242,8 +302,23 @@ class ProcessManager:
         async with self._lock:
             self._last_activity = asyncio.get_running_loop().time()
             cur = self._current
-            if cur is not None and cur.name == name and cur.state is ModelState.READY:
-                return name, cfg.port
+            if cur is not None and cur.state is ModelState.READY:
+                if cur.name == name:
+                    return name, cfg.port
+                # A fleet engine (Radiance) serves N registered names from
+                # one process, selected by the client's model field. When
+                # the requested entry was launched with the identical argv,
+                # its weights are already resident: switch the bookkeeping
+                # instead of SIGTERM + restart (a reload costs minutes and
+                # drops the live sessions' state).
+                if self._same_argv(cur, cfg):
+                    logger.info(
+                        "alias switch: '%s' is served by the running process "
+                        "launched as '%s' (identical argv); no restart",
+                        name, cur.name,
+                    )
+                    cur.name = name
+                    return name, cfg.port
             prev = cur.name if cur is not None and cur.state is ModelState.READY else None
             if cur is not None:
                 await self._stop_current()

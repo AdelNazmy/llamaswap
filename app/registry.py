@@ -47,6 +47,14 @@ class ModelMeta(BaseModel):
     request_format: str = "json"
     # Health endpoint checked by the process manager (default: /health).
     health_path: str = "/health"
+    # Optional extra readiness probe for multi-model fleet engines: a
+    # fleet's /v1/health can answer 200 as soon as the port binds, before
+    # any model's weights are resident. When set, the process manager
+    # additionally polls this path on the same host:port until the JSON
+    # body's "models" array carries an entry with "id" equal to this
+    # model's name and "state" == "resident" (Radiance's /admin/fleet
+    # object). Empty disables the probe.
+    ready_path: str = ""
     # Declared VRAM footprint (GiB) used by the VRAM scheduler/guards. When
     # unset, the registry falls back to the on-disk weights-file size.
     vram_gb: Optional[float] = None
@@ -179,10 +187,20 @@ class ModelConfig(BaseModel):
 
         def _sub(value: Any) -> Any:
             if isinstance(value, str):
-                out = value.format(
-                    host=self.host, port=self.port, name=self.name,
-                    config_path=config_path,
-                )
+                try:
+                    out = value.format(
+                        host=self.host, port=self.port, name=self.name,
+                        config_path=config_path,
+                    )
+                except (KeyError, IndexError, ValueError):
+                    # A ``${VAR}`` left unexpanded by ``_expand_env`` (the
+                    # variable is unset, e.g. a Strata YAML on a machine
+                    # without the bundle) would be read by ``str.format`` as
+                    # a field name and raise KeyError — a 500 on every load
+                    # attempt. Leave the string verbatim instead: the launch
+                    # then fails with a plain "binary not found", matching
+                    # the registry's non-fatal warning.
+                    return value
                 if placeholder.fullmatch(value):
                     return _coerce_num_strings(out)
                 return out

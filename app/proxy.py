@@ -53,15 +53,21 @@ def _model_field(obj: Any) -> Optional[str]:
 # answer — strata: "request exceeds the context window: prompt (N tokens)
 # leaves no room to answer in the context (M); requests are never
 # truncated", llama-server: "input (N tokens) is larger than the max
-# context size (M tokens)". A long-running agent conversation that grows
-# past n_ctx then fails on every turn forever. When the error names both
-# counts, llamaswap drops the oldest droppable message turns and retries
-# upstream, so stale history ages out instead of dead-ending the client.
-# The upstream's own token counts (authoritative) decide HOW MUCH to drop;
-# the chars/4 estimate below only decides WHICH (oldest) turns. Disable
-# via LLAMASWAP_CONTEXT_TRIM=false.
+# context size (M tokens)", Radiance: "the request (N tokens) exceeds the
+# available context size (M tokens)" (or, when the KV pool itself cannot
+# hold the prompt, only the cap is named: "maximum context length is M
+# tokens, all the KV cache holds for one sequence"). A long-running agent
+# conversation that grows past n_ctx then fails on every turn forever.
+# When the error names both counts, llamaswap drops the oldest droppable
+# message turns and retries upstream, so stale history ages out instead of
+# dead-ending the client. When the upstream names only the cap, the
+# chars/4 estimate below stands in for the missing prompt count. The
+# upstream's own token counts (authoritative) decide HOW MUCH to drop; the
+# chars/4 estimate also decides WHICH (oldest) turns. Disable via
+# LLAMASWAP_CONTEXT_TRIM=false.
 
-# One pattern per server's wording; both capture (prompt_tokens, ctx_tokens).
+# One pattern per server's wording; each captures the context size, and
+# (where the server says so) the prompt size as well.
 OVERFLOW_RES = (
     # strata: "... prompt (N tokens) leaves no room to answer in the
     # context (M) ..." / "... prompt (N tokens) + max tokens (X) exceeds
@@ -72,9 +78,23 @@ OVERFLOW_RES = (
     ),
     # llama-server: "input (N tokens) is larger than the max context size
     # (M tokens)" / "request (N tokens) exceeds the available context size
-    # (M tokens)"
+    # (M tokens)". Radiance's request-too-long error reuses the same
+    # numbers beside OpenAI's "maximum context length is M tokens"
+    # ("the request (N tokens) exceeds the available context size (M
+    # tokens)"), so this pattern covers it as well.
     re.compile(
         r"(?:input|request) \((\d+) tokens\).*?context (?:size|window) \((\d+)",
+        re.IGNORECASE,
+    ),
+    # Radiance's KV-pool-full refusal (and any OpenAI-style engine that
+    # only names the cap): "This model's maximum context length is M
+    # tokens, all the KV cache holds for one sequence: the prompt exceeds
+    # the available context size; shorten it or give the cache more
+    # room". The prompt's size is not in the message, so this captures
+    # the context size only and trim_messages falls back to the chars/4
+    # estimate (its own fallback for a missing upstream count).
+    re.compile(
+        r"maximum context length is (\d+) tokens",
         re.IGNORECASE,
     ),
 )
@@ -94,6 +114,11 @@ def overflow_info(err_text: Any) -> Optional[Tuple[int, int]]:
     for pattern in OVERFLOW_RES:
         m = pattern.search(err_text)
         if m:
+            # The last pattern captures the context size only (the server
+            # names no prompt size): report 0 so trim_messages falls back
+            # to its own estimate of the request.
+            if m.lastindex == 1:
+                return 0, int(m.group(1))
             return int(m.group(1)), int(m.group(2))
     return None
 

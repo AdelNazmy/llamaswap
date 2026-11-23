@@ -5,28 +5,30 @@
 # messages are embedded by the reader (mmproj) and answered by the text
 # engine.
 #
+# HOST LAYOUT: this box runs Strata from the user install under
+# ~/.local/share/strata (its setup.sh), not from the docker overlay in
+# docker-compose.strata.yml — docker is not installed here. The paths
+# below are host paths: `terminal/current` is the installed version dir,
+# and the engine / reader binaries live under components/engine/<tag>/.
+# A docker deployment would need the container paths back
+# (/opt/strata/... + the ${STRATA_TERMINAL_VERSION}/${STRATA_ENGINE_DIR}
+# expansion from deploy.sh).
+#
 # The reader needs the mmproj file and the text model path (opened
-# vocab-only); both live on the model disk mounted by
-# docker-compose.strata.yml. Image GENERATION is unrelated and stays on
-# the sd-server tenants (role: image) — this variant only READS pictures.
+# vocab-only). Image GENERATION is unrelated and stays on the sd-server
+# tenants (role: image) — this variant only READS pictures.
 #
 # Same role (llm) and same port as the text-only variant: swapping between
-# them is an ordinary model swap. The picture reader runs on the CPU (see
-# the vision section below), so it adds no VRAM on top of the pack's
-# ~15.2 GiB (meta.vram_gb covers the pack).
-#
-# NOTE: an engine update changes the components folder name — deploy.sh
-# sniffs it into ${STRATA_ENGINE_DIR} on every deploy (deploy-time env
-# expansion, see app/registry.py), so no edit is needed; the top-level
-# engine itself is "component:strata-engine" and never needed one.
+# them is an ordinary model swap. On this 32 GB card the reader runs on
+# the GPU (see the vision section below).
 name: qwen3.8-flash-next-coder-iq1_m-vision
 description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — chat + picture reading"
 command:
-  # Fixed container mount (docker-compose.strata.yml) + deploy-time version
-  # pin; terminal/current is deliberately NOT used — it is an absolute
-  # symlink into the HOST home and dies inside the container (see the
-  # text-only variant).
-  binary: /opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/bin/strata
+  # The `strata` launcher is a /bin/sh script that resolves its own install
+  # dir, so it must stay inside the bundle. `terminal/current` is a
+  # symlink to the installed version dir; it works on the host (the docker
+  # overlay avoided it because its target is an absolute host path).
+  binary: /opt/strata/.local/share/strata/terminal/current/bin/strata
   args:
     - "serve"
     - "--profile"
@@ -36,14 +38,16 @@ command:
     - "20"
   config_json:
     exe: "component:strata-engine"
+    # hip: this is the ROCm/HIP build of the engine (no CUDA backend here).
+    backend: hip
     args:
       - "--vision"
       - "--native"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
       - "--ple-gguf"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
       - "--expert-profile"
-      - "/opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/data/expert-profile-coder.bin"
+      - "/opt/strata/.local/share/strata/terminal/current/data/expert-profile-coder.bin"
       - "--expert-cache"
       - "auto"
       - "--prefill"
@@ -51,8 +55,8 @@ command:
       - "--spec"
       - "4"
       # Match the standalone launcher run ($HOME/.local/state/strata/launch/
-      # coder.json): --pool-workers 13, no --spec-min-p. See the text-pack
-      # yaml for the rationale.
+      # iq1_m-256k.json): --pool-workers 13. See the text-pack yaml for the
+      # rest of the rationale.
       - "--pool-workers"
       - "13"
       - "--max-context"
@@ -62,25 +66,27 @@ command:
       - "--kv-resident"
       - "32768"
       - "--mtp"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/mtp/rt"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mtp/rt"
       - "--pack"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/packs/coder-iq1_m"
+      # Same reserve as the standalone profile: keeps room for the desktop
+      # on this card (without it ~1.3 GiB is left with the pack resident).
+      - "--vram-reserve-mib"
+      - "700"
     # The picture reader. "model" is the text gguf (vocab-only read).
-    # gpu: false → the reader runs on the CPU: the pack alone takes
-    # ~15.2 GiB of the 16 GB card, so the GPU reader (~1.1 GB more) would
-    # not fit — and the reader on the CPU takes no VRAM (strata's own
-    # sizing also puts readers on the CPU below its GPU threshold). Flip
-    # to true only on a bigger card.
+    # gpu: true → the HIP reader; cpu_exe is the fallback copy strata
+    # starts when it decides the reader does not fit. On this 32 GB card
+    # the GPU reader is proven (1.3 GiB free, measured).
     vision:
-      exe: /opt/strata/.local/share/strata/components/engine/${STRATA_ENGINE_DIR}/strata-vision
-      mmproj: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mmproj-Qwen3.8-Flash-Next-BF16.gguf
-      model: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
-      gpu: false
-      max_tokens: 300
+      exe: /opt/strata/.local/share/strata/components/engine/0.1.64-linux-x86_64-hip-rx9070/strata-vision-hip
+      cpu_exe: /opt/strata/.local/share/strata/components/engine/0.1.64-linux-x86_64-hip-rx9070/strata-vision
+      mmproj: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+      model: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
+      gpu: true
+      max_tokens: 1024
     log: "{config_path}.engine.log"
-    # versioned terminal dir, not terminal/current (see binary, above)
-    cwd: /opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}
-    tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m/tokenizer
+    cwd: /opt/strata/.local/share/strata/terminal/current
+    tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/packs/coder-iq1_m/tokenizer
     model_name: "{name}"
     idle_unload_s: 0
     open_browser: false
@@ -105,14 +111,22 @@ command:
     reasoning_budget_tokens: 4096
   env:
     STRATA_DEFAULTS: "026"
+    # HIP + CUDA spelling: the engine honours both, and the CLI profile and
+    # the reader share GPU 0.
+    HIP_VISIBLE_DEVICES: "0"
     CUDA_VISIBLE_DEVICES: "0"
-    # Strata resolves its install via $HOME; see the text-only variant.
+    # Strata resolves its install (~/.local/share/strata: components, bundle
+    # data, state) via $HOME.
     HOME: /opt/strata
 host: 127.0.0.1
 port: 8101
 meta:
-  context_length: 131072
+  context_length: 153750
   family: qwen
   capabilities: [chat, vision]
-  vram_gb: 15.2
+  # Measured with the pack + expert cache resident on this box's 31.9 GiB
+  # card (~30.6 GiB). Declared because the shards (29.6 GB + 28.8 GB; the
+  # PLE table never enters VRAM) would make any file-size estimate
+  # meaningless — and would wrongly disable the audio/image VRAM guards.
+  vram_gb: 30.6
   idle_unload_seconds: 14400

@@ -17,3 +17,4 @@ script_scarlette.wav
 # token usage totals (runtime state)
 data/*.db
 data/*.db-*
+backlog/

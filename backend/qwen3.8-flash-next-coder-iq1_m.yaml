@@ -5,8 +5,8 @@
 # Strata is a managed backend like any other: llamaswap renders the run
 # config (command.config_json) to a temp file, spawns `strata serve`,
 # waits for /health to report the model loaded, and forwards chat traffic.
-# SIGTERM unloads the pack and frees VRAM (~15.2 GiB of 16 GiB measured on
-# the RTX 4070 Ti SUPER).
+# SIGTERM unloads the pack and frees VRAM (~30.6 GiB of 31.9 GiB measured
+# on this box's card).
 #
 # IMPORTANT:
 #   * Strata's own lifecycle knobs stay off in the rendered config
@@ -15,19 +15,21 @@
 #     server binds its port with loaded: false and llamaswap (correctly)
 #     waits for the real load.
 #   * A warm reload of the 176.9B pack takes ~2.5 min (measured 135 s); the
-#     first boot after a reboot is slower (cold page cache; 807 s once
-#     measured while the weights still lived on a WSL drive mount). The
-#     model still overrides the idle window with
-#     meta.idle_unload_seconds: 14400 (4 h): a reload is minutes of disk
-#     thrash, so the pack stays resident across idle pauses and only swaps
-#     or a manual unload free the VRAM.
-#   * Stop the standalone strata instance (it holds the same ~15.2 GiB)
-#     and any big llama.cpp model before loading this one — the card fits
-#     one 176.9B pack.
+#     first boot after a reboot is slower (cold page cache). The model still
+#     overrides the idle window with meta.idle_unload_seconds: 14400 (4 h):
+#     a reload is minutes of disk thrash, so the pack stays resident across
+#     idle pauses and only swaps or a manual unload free the VRAM.
+#   * Stop the standalone strata instance (it holds the same VRAM) and any
+#     big llama.cpp model before loading this one — the card fits one
+#     176.9B pack.
 #
-# Requires the strata compose overlay (bind-mounts the terminal bundle and
-# the model disk, read-only):
-#   docker compose -f docker-compose.yml -f docker-compose.strata.yml up -d
+# HOST LAYOUT: this box runs Strata from the user install under
+# ~/.local/share/strata (its setup.sh), not from the docker overlay in
+# docker-compose.strata.yml — docker is not installed here. The paths
+# below are host paths: `terminal/current` is the installed version dir.
+# A docker deployment would need the container paths back
+# (/opt/strata/... + the ${STRATA_TERMINAL_VERSION} expansion from
+# deploy.sh).
 #
 # Strata's admin endpoints (/v1/vram, /v1/load, /v1/unload) are NOT
 # proxied — lifecycle belongs to llamaswap; use
@@ -36,18 +38,10 @@ name: qwen3.8-flash-next-coder-iq1_m
 description: "Qwen3.8 Flash Next coder, 176.9B MoE 50% expert-pruned (GSQ-RCO), Strata IQ1_M pack (MTP, 128k ctx) — text chat"
 command:
   # The `strata` launcher is a /bin/sh script that resolves its own install
-  # dir (preferring the bundled python). docker-compose.strata.yml
-  # bind-mounts the install read-only at a FIXED container path
-  # (/opt/strata/.local/share/strata) — chosen here so no host username
-  # ever appears in this file. Do NOT copy/symlink the launcher elsewhere:
-  # bundle resolution breaks.
-  #
-  # The version directory is referenced DIRECTLY, never via
-  # terminal/current: that symlink carries an ABSOLUTE host path
-  # (<home>/<user>/.../terminal/<version>), which does not exist inside the
-  # container — the launcher's `cd -P` symlink resolution would die on it.
-  # deploy.sh sniffs ${STRATA_TERMINAL_VERSION} off the installed bundle.
-  binary: /opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/bin/strata
+  # dir, so it must stay inside the bundle. `terminal/current` is a
+  # symlink to the installed version dir; it works on the host (the docker
+  # overlay avoided it because its target is an absolute host path).
+  binary: /home/adnathan/.local/share/strata/terminal/current/bin/strata
   args:
     - "serve"
     - "--profile"
@@ -62,20 +56,21 @@ command:
   # Rendered to <llm_tmp_dir>/llm-<name>.json and passed via --profile.
   # Shape mirrors the launcher's own run configs (the strata state dir,
   # $HOME/.local/state/strata/launch/*.json); the enforced host/port are
-  # overwritten by the proxy after rendering, and --host/--port are added
-  # to the CLI (CLI beats config).
+  # added to the CLI (CLI beats config).
   config_json:
     # "component:strata-engine" is resolved (and SHA-256 checked) by the
     # strata server itself against the installed component — survives
     # engine updates without touching this file.
     exe: "component:strata-engine"
+    # hip: this is the ROCm/HIP build of the engine (no CUDA backend here).
+    backend: hip
     args:
       - "--native"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
       - "--ple-gguf"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
       - "--expert-profile"
-      - "/opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}/data/expert-profile-coder.bin"
+      - "/home/adnathan/.local/share/strata/terminal/current/data/expert-profile-coder.bin"
       - "--expert-cache"
       - "auto"
       - "--prefill"
@@ -83,9 +78,9 @@ command:
       - "--spec"
       - "4"
       # Match the standalone launcher run ($HOME/.local/state/strata/launch/
-      # coder.json): it starts the engine with --pool-workers 13 and no
-      # --spec-min-p; the earlier --spec-min-p 0.5 render differed from the
-      # known-good standalone path and is dropped.
+      # iq1_m-256k.json): it starts the engine with --pool-workers 13; the
+      # earlier --spec-min-p 0.5 render differed from the known-good path
+      # and is dropped.
       - "--pool-workers"
       - "13"
       - "--max-context"
@@ -95,18 +90,21 @@ command:
       - "--kv-resident"
       - "32768"
       - "--mtp"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/mtp/rt"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/mtp/rt"
       - "--pack"
-      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m"
+      - "/opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/packs/coder-iq1_m"
+      # Same reserve as the standalone profile: keeps room for the desktop
+      # on this card (without it ~1.3 GiB is left with the pack resident).
+      - "--vram-reserve-mib"
+      - "700"
     # The engine's own log file, colocated with the rendered profile
     # ({config_path} = the profile file llamaswap just wrote, so its
     # directory is guaranteed to exist). Strata also prints everything to
     # stdout, which llamaswap tails into its log under
     # llama-server[<model>]:.
     log: "{config_path}.engine.log"
-    # versioned terminal dir, not terminal/current (see binary, above)
-    cwd: /opt/strata/.local/share/strata/terminal/${STRATA_TERMINAL_VERSION}
-    tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/STRATA/packs/coder-iq1_m/tokenizer
+    cwd: /home/adnathan/.local/share/strata/terminal/current
+    tokenizer: /opt/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M/packs/coder-iq1_m/tokenizer
     model_name: "{name}"
     # Keep strata's own idle unload off: llamaswap decides when to unload.
     idle_unload_s: 0
@@ -133,14 +131,12 @@ command:
   env:
     # GEMM tuning table preset the launcher writes for this box.
     STRATA_DEFAULTS: "026"
+    # HIP + CUDA spelling: the engine honours both.
+    HIP_VISIBLE_DEVICES: "0"
     CUDA_VISIBLE_DEVICES: "0"
-    # Strata resolves its install (~/.local/share/strata: components,
-    # bundle data) via $HOME; the container runs as root, so HOME is pinned
-    # to the parent of the fixed read-only mount in
-    # docker-compose.strata.yml (/opt/strata/.local/share/strata). Strata's
-    # own state then lands under /opt/strata/.local/state — the container's
-    # writable layer; nothing in the mounts is written.
-    HOME: /opt/strata
+    # Strata resolves its install (~/.local/share/strata: components, bundle
+    # data, state) via $HOME.
+    HOME: /home/adnathan
 # internal binding, enforced by the proxy; one model at a time
 host: 127.0.0.1
 port: 8101
@@ -148,11 +144,11 @@ meta:
   context_length: 131072
   family: qwen
   capabilities: [chat]
-  # Measured with the pack resident: 15536 MiB of 16376 MiB. Declared
-  # because the shards (29.6 GB + 28.8 GB; the PLE table never enters
-  # VRAM) would make any file-size estimate meaningless — and would
-  # wrongly disable the audio/image VRAM guards.
-  vram_gb: 15.2
+  # Measured with the pack + expert cache resident on this box's 31.9 GiB
+  # card (~30.6 GiB). Declared because the shards (29.6 GB + 28.8 GB; the
+  # PLE table never enters VRAM) would make any file-size estimate
+  # meaningless — and would wrongly disable the audio/image VRAM guards.
+  vram_gb: 30.6
   # Reload ~2.5 min warm (135 s measured; cold-cache first boot after a
   # reboot took 807 s once): keep it resident far longer than the default
   # window. 0 would mean "never unload".

@@ -12,7 +12,8 @@
 # natively, so llamaswap is a near pass-through here.
 #
 # VRAM: Q8_0 needs ~12 GB for the diffusion model + a ~0.4 GB VAE. The
-# diffusion model and VAE run on the GPU (--backend diffusion=cuda0,vae=cuda0)
+# diffusion model and VAE run on the GPU (--backend diffusion=rocm,vae=rocm;
+# use cuda0 on an NVIDIA build)
 # while the text encoders stay on CPU (te=cpu, so ~10 GB of T5-XXL lives in
 # RAM), plus flash attention (--diffusion-fa) — this fits a 16 GB card once
 # the image VRAM guard unloads the chat LLM + audio + embedding servers
@@ -66,7 +67,7 @@ command:
     # next to the resident Q8_0 diffusion model on a 16 GB card.
     - "--vae-tiling"
     - "--backend"
-    - "diffusion=cuda0,vae=cuda0,te=cpu"
+    - "diffusion=rocm,vae=rocm,te=cpu"
     - "-v"
   env:
     CUDA_VISIBLE_DEVICES: "0"
