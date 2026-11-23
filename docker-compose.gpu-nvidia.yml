@@ -1,0 +1,19 @@
+# GPU overlay for NVIDIA hosts: reserves every NVIDIA GPU for the
+# llamaswap container (requires nvidia-container-toolkit).
+# scripts/deploy.sh stacks this automatically when it detects an NVIDIA
+# host; direct `docker compose` users add it with -f:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu-nvidia.yml up -d
+#
+# Without a GPU overlay the stack still runs — the GPU backends just start
+# CPU-only.
+services:
+  llamaswap:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu

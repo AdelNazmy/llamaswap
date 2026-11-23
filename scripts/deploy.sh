@@ -20,9 +20,20 @@
 # backend; a machine without the Strata files skips it automatically
 # (--no-strata silences the check, --strata makes missing files an error).
 #
+# GPU: docker-compose.yml reserves no GPU itself — GPU exposure is a
+# vendor-specific overlay. deploy.sh detects the host's GPU (nvidia-smi /
+# rocm-smi) and stacks docker-compose.gpu-nvidia.yml (device reservations,
+# needs nvidia-container-toolkit) or docker-compose.gpu-rocm.yml (/dev/kfd +
+# /dev/dri only — the ROCm userland is baked into the image from the pinned
+# stage, so the overlay must NOT mount the host's /opt/rocm over it).
+# Direct `docker compose` users add the matching -f; without an overlay the
+# GPU backends start CPU-only.
+#
 # Nothing is compiled inside the image — every backend is built on the HOST
 # first and stamped in via compose `additional_contexts` (see the README
-# "Building ..." sections). A missing binary aborts the matching build.
+# "Building ..." sections). A missing binary aborts the matching build —
+# except the optional Prism fork (llama_prism.cpp): when it is not built,
+# the plain llama-server is stamped in as llama-prism-server instead.
 #
 # Model weights: before starting (skipped by --build-only), deploy.sh checks
 # the shared model root (MODEL_ROOT, default /opt/models) and downloads any
@@ -180,6 +191,20 @@ if ! docker compose version >/dev/null 2>&1; then
     echo "deploy: 'docker compose' (Docker Compose v2) is required" >&2
     exit 1
 fi
+# The daemon must be reachable BY THIS USER: 'command -v docker' only proves
+# the client is installed. Without socket access every docker call below
+# dies with 'permission denied ... /var/run/docker.sock'.
+if ! docker info >/dev/null 2>&1; then
+    if docker info 2>&1 | grep -q 'permission denied'; then
+        echo "deploy: cannot access the Docker socket as '$USER'" >&2
+        echo "       add your user to the 'docker' group (then log out/in):" >&2
+        echo "         sudo usermod -aG docker $USER" >&2
+        echo "       or run this script with sudo" >&2
+    else
+        echo "deploy: cannot reach the Docker daemon (is it running?)" >&2
+    fi
+    exit 1
+fi
 
 # --- prerequisites: host-built backend binaries -----------------------------
 # These are NOT compiled by the build; they are stamped in from these paths.
@@ -192,7 +217,40 @@ require_x() {
 }
 
 require_x /opt/llama.cpp/build/bin/llama-server
-require_x /opt/llama_prism.cpp/build/bin/llama-server
+
+# The Prism fork (llama_prism.cpp) is OPTIONAL. The Dockerfile always copies
+# a llama-server from the prism context (docker-compose*.yml point it at
+# /opt/llama_prism.cpp/build/bin), so that context must resolve — when the
+# fork is not built on this host, stamp the plain llama-server in instead,
+# so the image's llama-prism-server exists (it simply lacks the fork's
+# low-precision quantization support).
+PRISM_CTX=/opt/llama_prism.cpp/build/bin
+if [ ! -x "$PRISM_CTX/llama-server" ]; then
+    echo "deploy: note: llama_prism.cpp is not built on this host; stamping the"
+    echo "        plain llama-server as llama-prism-server instead"
+    if ! mkdir -p "$PRISM_CTX" || ! cp /opt/llama.cpp/build/bin/llama-server "$PRISM_CTX/llama-server"; then
+        echo "deploy: could not populate $PRISM_CTX (permissions?); build" >&2
+        echo "        llama_prism.cpp (README 'Manual build') or create it manually" >&2
+        MISSING=1
+    fi
+fi
+
+# Radiance (qwen3.8-27b backend): the base Dockerfile stamps the engine
+# binary + runtime plugin tree from its install dir and the front launcher +
+# fleet config from its source tree (the radiance-bin / radiance-src build
+# contexts in docker-compose.yml). All five must exist or the base build
+# fails mid-COPY.
+require_x /opt/radiance/bin/radiance
+if [ ! -d /opt/radiance/share/radiance ]; then
+    echo "deploy: missing radiance plugin tree: /opt/radiance/share/radiance" >&2
+    MISSING=1
+fi
+for f in start.sh qwen.yaml; do
+    if [ ! -f "$HOME/radiance/$f" ]; then
+        echo "deploy: missing radiance source file: $HOME/radiance/$f" >&2
+        MISSING=1
+    fi
+done
 
 if [ "$INCLUDE_AUDIO" = 1 ]; then
     require_x /opt/audio.cpp/build/bin/audiocpp_server
@@ -217,24 +275,31 @@ if [ "$INCLUDE_STRATA" = 1 ]; then
     STRATA_MODELS="${STRATA_MODELS:-$MODEL_ROOT}"
     STRATA_PACK="$STRATA_MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M"
 
-    require_x "$STRATA_HOME/terminal/current/bin/strata"
+    # Strata misses are tracked in their OWN flag: the auto-skip below must
+    # not fire (or clear MISSING) on errors from other backends, and a
+    # missing binary above must not be masked by strata being skipped.
+    STRATA_MISSING=0
+    if [ ! -x "$STRATA_HOME/terminal/current/bin/strata" ]; then
+        echo "deploy: missing host-built binary: $STRATA_HOME/terminal/current/bin/strata" >&2
+        STRATA_MISSING=1
+    fi
     for shard in 00001 00002; do
-        f="$STRATA_PACK/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-$shard-of-00002.gguf"
+        f="$STRATA_PACK/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-$shard-of-00002.gguf"
         [ -f "$f" ] || {
             echo "deploy: missing strata weights shard: $f" >&2
-            MISSING=1
+            STRATA_MISSING=1
         }
     done
-    [ -d "$STRATA_PACK/STRATA/packs/coder-iq1_m" ] || {
-        echo "deploy: missing strata pack dir: $STRATA_PACK/STRATA/packs/coder-iq1_m" >&2
-        MISSING=1
+    [ -d "$STRATA_PACK/packs/coder-iq1_m" ] || {
+        echo "deploy: missing strata pack dir: $STRATA_PACK/packs/coder-iq1_m" >&2
+        STRATA_MISSING=1
     }
-    [ -d "$STRATA_PACK/STRATA/mtp/rt" ] || {
-        echo "deploy: missing strata MTP dir: $STRATA_PACK/STRATA/mtp/rt" >&2
-        MISSING=1
+    [ -d "$STRATA_PACK/mtp/rt" ] || {
+        echo "deploy: missing strata MTP dir: $STRATA_PACK/mtp/rt" >&2
+        STRATA_MISSING=1
     }
 
-    if [ "$MISSING" = 1 ]; then
+    if [ "$STRATA_MISSING" = 1 ]; then
         if [ "$STRATA_EXPLICIT" = 1 ]; then
             echo "deploy: --strata requested but the files above are missing" >&2
             exit 1
@@ -243,7 +308,6 @@ if [ "$INCLUDE_STRATA" = 1 ]; then
         echo "        overlay (--no-strata silences this check, --strata makes" >&2
         echo "        it an error)" >&2
         INCLUDE_STRATA=0
-        MISSING=0
     fi
 
     # A standalone strata instance holds the same ~15.2 GiB the managed
@@ -275,13 +339,22 @@ if [ "$MISSING" = 1 ]; then
     exit 1
 fi
 
-# GPU visibility is a runtime concern (nvidia container runtime), warn only.
-if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi -L >/dev/null 2>&1 || \
-        echo "deploy: warning: no NVIDIA GPU visible; GPU backends will not run" >&2
+# GPU exposure is a per-vendor overlay (docker-compose.gpu-nvidia.yml /
+# docker-compose.gpu-rocm.yml); detect the vendor and remember the overlay
+# for the FILES assembly below. Probe with the canonical SMI of each vendor:
+# 'amd-smi -L' does not exist (ROCm's amd-smi takes subcommands, and a venv
+# 'amd-smi' may shadow it on PATH), so use rocm-smi for AMD. No GPU found
+# -> no overlay; the GPU backends would start CPU-only.
+GPU_OVERLAY=
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    GPU_OVERLAY=gpu-nvidia
+elif command -v rocm-smi >/dev/null 2>&1 \
+        && rocm-smi --showproductname >/dev/null 2>&1; then
+    GPU_OVERLAY=gpu-rocm
+elif command -v amd-smi >/dev/null 2>&1 && amd-smi list >/dev/null 2>&1; then
+    GPU_OVERLAY=gpu-rocm
 else
-    echo "deploy: warning: nvidia-smi not found; GPU backends need the NVIDIA" \
-        "container runtime" >&2
+    echo "deploy: warning: no GPU visible; GPU backends will run CPU-only" >&2
 fi
 
 # --- build in order: base -> audio -> image ---------------------------------
@@ -418,16 +491,22 @@ fi
 
 # --- start ------------------------------------------------------------------
 FILES="-f docker-compose.yml"
+[ -n "$GPU_OVERLAY" ] && FILES="$FILES -f docker-compose.$GPU_OVERLAY.yml"
 [ "$INCLUDE_AUDIO" = 1 ] && FILES="$FILES -f docker-compose.audio.yml"
 [ "$INCLUDE_IMAGE" = 1 ] && FILES="$FILES -f docker-compose.image.yml"
 [ "$INCLUDE_STRATA" = 1 ] && FILES="$FILES -f docker-compose.strata.yml"
 
 if [ "$DO_UP" = 1 ]; then
-    echo "==> start stack (docker compose up -d)"
+    echo "==> start stack (docker compose up -d --force-recreate)"
     echo "    (first run may block while the init services download missing"
     echo "     model weights into /opt/models)"
+    # --force-recreate: `up` never re-points an existing container at a
+    # same-tag image that was just rebuilt (it compares the image STRING,
+    # not the digest), so a deploy after an image change would silently
+    # keep the old image running. The stack keeps no container-local state
+    # (everything is host-mounted), so a forced recreate is always safe.
     # shellcheck disable=SC2086  # fixed, space-free file names -> intentional split
-    docker compose $FILES up -d
+    docker compose $FILES up -d --force-recreate
 
     echo
     echo "llamaswap is starting. Endpoints:"

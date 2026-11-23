@@ -1,0 +1,22 @@
+# GPU overlay for AMD/ROCm hosts: exposes the GPU device nodes to the
+# llamaswap container. scripts/deploy.sh stacks this automatically when it
+# detects a ROCm host; direct `docker compose` users add it with -f:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu-rocm.yml up -d
+#
+# The ROCm userland is NOT bind-mounted: the image bakes the ROCm 7.2.3
+# runtime closure (pinned in the Dockerfile) at /opt/rocm/lib, which the
+# stamped binaries' RUNPATH resolves and which the host kernel accepts.
+# Mounting the host's /opt/rocm instead shadows those copies with a tree of
+# /etc/alternatives symlinks (dangling in-container) and breaks every
+# binary whose RPATH does not also list the host's versioned lib dir
+# (verified: radiance's libamdhip64.so.7 went "not found" with the mount).
+#
+# The container runs as root, so no --group-add video/render is needed.
+# Without a GPU overlay the stack still runs — the GPU backends just start
+# CPU-only.
+services:
+  llamaswap:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri

@@ -440,6 +440,10 @@ fight over the internal port.
 
 The published image already contains the proxy, the llama.cpp / audio.cpp /
 whisper.cpp / sd-server backends, and ffmpeg — nothing is compiled locally.
+It bases on `ubuntu:26.04` (the deployment host's distro: the host-built
+backend binaries are glibc-2.43-linked and refuse to load on older glibc),
+and ships the ROCm runtime libs the HIP builds load at start — GPU access
+itself comes from the per-vendor overlay (see below).
 Run it from a checkout of this repo: `docker-compose.hub.yml` bind-mounts
 this tree's `app/`, `backend/`, `opencode/`, the entrypoint, and `scripts/`
 over the image, so an older Hub image still uses the current model configs
@@ -452,7 +456,8 @@ script and must be copied or downloaded separately. Image-generation weights
 are a separate optional download.
 
 ```bash
-# 1) pull and start (weights mount + GPU reservation come with the compose file)
+# 1) pull and start (weights mount come with the compose file; GPU access is
+#    the per-vendor overlay — see "GPU access (per-vendor overlay)")
 docker compose -f docker-compose.hub.yml up -d
 
 # 2) download the audio/music weights (~30 GB default bundle set: TTS/ASR/music)
@@ -464,10 +469,13 @@ MODEL_ROOT=/opt/models ./scripts/download-models.sh flux-schnell flux-vae flux-c
     qwen-image-2.1-uc qwen-image-2.1-te qwen-image-2.1-vae
 ```
 
-Requirements: Docker with the NVIDIA container runtime on a CUDA host, a
-checkout of this repo, and the model weights volume (default `/opt/models`,
-override with `MODEL_ROOT`). Keys/settings come from the same `.env` surface
-as the local build (`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...).
+Requirements: Docker, a checkout of this repo, and the model weights volume
+(default `/opt/models`, override with `MODEL_ROOT`). For GPU inference stack
+the vendor overlay (`docker-compose.gpu-rocm.yml` on AMD/ROCm hosts,
+`docker-compose.gpu-nvidia.yml` + nvidia-container-toolkit on NVIDIA hosts);
+without one the image still runs, its GPU backends start CPU-only.
+Keys/settings come from the same `.env` surface as the local build
+(`LLAMASWAP_API_KEY`, `LLAMASWAP_PORT`, ...).
 
 ### Updating the published image
 
@@ -670,17 +678,21 @@ llama-server, but for audio). The project lives at
 
 **Prerequisites**
 
-* NVIDIA GPU with Compute Capability ≥ 7.5 (Turing / RTX 20-series or
-  newer) + current NVIDIA driver; verify with `nvidia-smi`.
-* [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) (`nvcc`) —
-  required to compile the ggml CUDA kernels (`ENGINE_ENABLE_CUDA=ON`);
-  verify with `nvcc --version`. The same toolkit as for llama.cpp works.
+* GPU + current driver, one of:
+  * NVIDIA: Compute Capability ≥ 7.5 (Turing / RTX 20-series or newer);
+    verify with `nvidia-smi`.
+  * AMD/ROCm: [ROCm](https://rocm.docs.amd.com/) (`hipcc`) installed, e.g.
+    at `/opt/rocm`; verify with `rocm-smi`.
+* The matching toolkit to compile the ggml kernels:
+  * NVIDIA: [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+    (`nvcc`), `ENGINE_ENABLE_CUDA=ON`.
+  * AMD: ROCm's `hipcc`, `-DGGML_HIP=1`.
 * CMake ≥ 3.24 (older versions lack the `native` CUDA-arch fallback that
   audio.cpp's build uses).
 * A C++20 compiler: `g++-13` or newer (or `clang++-17+`).
 * `git` + `curl` (audio.cpp pulls its submodules from GitHub).
-* ~10 GB free disk space for clone + CUDA build artifacts.
-* ~16 GB RAM (CUDA compilation is memory-hungry; 32 GB is comfortable).
+* ~10 GB free disk space for clone + build artifacts.
+* ~16 GB RAM (kernel compilation is memory-hungry; 32 GB is comfortable).
 
 ```bash
 mkdir -p /opt/audio.cpp
@@ -997,12 +1009,32 @@ Without the overlay the `flux-schnell.yaml` model simply fails to spawn
 its (missing) binary — the proxy keeps running and reports the image role
 as stopped in `/health`. Delete the image YAML to hide it from `/v1/models`.
 
+### GPU access (per-vendor overlay)
+
+`docker-compose.yml` reserves no GPU by itself — the host-built binaries are
+compiled for exactly one vendor, so GPU exposure is a vendor-specific
+overlay (stacked with `-f`, like the audio/image overlays):
+
+```bash
+# NVIDIA host (needs nvidia-container-toolkit):
+docker compose -f docker-compose.yml -f docker-compose.gpu-nvidia.yml up -d
+# AMD/ROCm host (GPU device nodes + the host ROCm install the host-built
+# binaries link against; ROCM_ROOT moves the host side if ROCm lives
+# elsewhere):
+docker compose -f docker-compose.yml -f docker-compose.gpu-rocm.yml up -d
+```
+
+`./scripts/deploy.sh` detects the vendor automatically (nvidia-smi /
+rocm-smi) and stacks the right overlay. Without one the stack still runs —
+the GPU backends just start CPU-only.
+
 ### LlamaSwap Docker Installation
 
 ```bash
 cd ~
 git clone https://github.com/AdelNazmy/llamaswap.git
 cd llamaswap
+# GPU overlay per "GPU access" above; deploy.sh picks it automatically
 docker compose up --build
 ```
 
@@ -1023,8 +1055,9 @@ Notes:
   `CUDA is initialized` (or the ROCm equivalent) on startup. The proxy
   mirrors those lines into its own log, so a missing/wrong backend shows up
   there as `llama-server[<model>]: ...`.
-- The Docker image in this repo ships a prebuilt CUDA `llama-server`
-  instead, so the steps above are only for building it locally.
+- The Docker image in this repo ships the `llama-server` built on the
+  deployment host (ROCm/HIP or CUDA depending on the vendor, see the
+  "Building ..." sections), so the steps above are only for that host build.
 
 ## Local Run
 

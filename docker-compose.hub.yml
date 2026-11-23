@@ -39,8 +39,11 @@
 # warnings; republishing the image remains the fix for consumers who do
 # not run from a checkout.
 #
-# Requirements: Docker with the NVIDIA container runtime (the container
-# reserves all GPUs for CUDA backends) and the model weights volume.
+# Requirements: Docker, the model weights volume, and — for GPU inference —
+# the vendor overlay: docker-compose.gpu-rocm.yml on AMD/ROCm hosts,
+# docker-compose.gpu-nvidia.yml on NVIDIA hosts (this file reserves no GPU
+# itself; the image ships the ROCm runtime libs, so the ROCm overlay only
+# adds the device nodes + the host's ROCm install).
 
 services:
   llamaswap:
@@ -152,14 +155,11 @@ services:
       # its sniff and the two strata models simply sit unusable in the
       # registry, like any backend with missing weights.
       - ${STRATA_HOME:-$HOME/.local/share/strata}:/opt/strata/.local/share/strata:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities:
-                - gpu
+    # GPU access is a per-vendor overlay (the image ships the ROCm runtime
+    # libs, so on AMD/ROCm hosts only the device nodes + host ROCm install
+    # need exposing):
+    #   docker compose -f docker-compose.hub.yml -f docker-compose.gpu-rocm.yml up -d
+    #   docker compose -f docker-compose.hub.yml -f docker-compose.gpu-nvidia.yml up -d
 
   # One-shot weight download (tts/asr/music default bundle set) into the
   # shared model root. Not wired as a dependency — run it explicitly before

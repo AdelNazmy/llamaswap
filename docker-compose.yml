@@ -7,6 +7,20 @@ services:
       additional_contexts:
         llamacpp-bin: /opt/llama.cpp/build/bin
         llamacpp_prism-bin: /opt/llama_prism.cpp/build/bin
+        # Radiance engine (qwen3.8-27b backend): the engine binary from its
+        # install dir, and the front launcher + fleet config from its source
+        # tree (that .dockerignore keeps build*/.git out of the context).
+        # They are stamped into the image at /opt/radiance (engine bin/ +
+        # start.sh + qwen.yaml side by side).
+        radiance-bin: /opt/radiance
+        radiance-src: /home/adnathan/radiance
+        # LLVM OpenMP runtime for the radiance CPU kernel plugins
+        # (share/radiance/kernels/libavx.so, libref.so), which NEEDED the
+        # unversioned libomp.so. The pinned ROCm 7.2.3 stage does not ship
+        # it, so it is stamped from the host's ROCm LLVM dir (same 7.2.3
+        # release the host binaries were built against). Path follows the
+        # ROCm 7.2.3 host layout; adjust for other installs.
+        rocm-llvm-libs: /opt/rocm/core-10.2/lib/llvm/lib/x86_64-unknown-linux-gnu
     init: true
     container_name: llamaswap
     restart: unless-stopped
@@ -72,14 +86,17 @@ services:
       LLAMASWAP_CONTEXT_TRIM_MARGIN: "${LLAMASWAP_CONTEXT_TRIM_MARGIN:-1024}"
     volumes:
       - /opt/models:/opt/models:ro
+      # Radiance model weights (the .rad fleet models pinned by
+      # /opt/radiance/qwen.yaml). Host-only path; ignored by other backends.
+      - /opt/rad_models:/opt/rad_models:ro
       - ./backend:/app/backend
       # Token usage totals (data/llamaswap_tokens.db) survive recreation.
       - ./data:/app/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities:
-                - gpu
+    # GPU exposure is vendor-specific (the stamped host binaries are built
+    # for exactly one vendor) — stack the matching overlay, which
+    # scripts/deploy.sh does automatically after detecting the host's GPU:
+    #   docker-compose.gpu-nvidia.yml — NVIDIA: device reservations
+    #   docker-compose.gpu-rocm.yml   — AMD/ROCm: /dev/kfd + /dev/dri +
+    #                                           the host ROCm install
+    # Without a GPU overlay the stack still runs, but the GPU backends
+    # start CPU-only.

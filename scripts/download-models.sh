@@ -48,7 +48,10 @@
 
 set -u
 
-MODEL_ROOT="${MODEL_ROOT:-.}"
+# Default matches the header docs and every caller (deploy.sh exports it;
+# the compose models-init service sets it). A '.' default would dump
+# multi-GB weights into whatever directory the script is run from.
+MODEL_ROOT="${MODEL_ROOT:-/opt/models}"
 
 # bundle -> "url|relative/path"
 BUNDLES='

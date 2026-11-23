@@ -25,7 +25,7 @@
 name: qwen3.8-27b-iq4r-v4
 description: "Qwen3.8 27B IQ4_R v4, Radiance, text chat 262k"
 command:
-  binary: /home/adnathan/radiance/start.sh
+  binary: /opt/radiance/start.sh
   args: []
 host: 127.0.0.1
 port: 8000
