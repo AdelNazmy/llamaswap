@@ -1,14 +1,18 @@
-# Vendor GPU runtime stage: the host-built backend binaries are compiled for
-# exactly one vendor and NEEDED-link its GPU runtime at LOAD time (llama-server
-# -> libhipblas.so.3 + libamdhip64.so.7, audiocpp_server additionally
+# GPU runtime: the host-built backend binaries are compiled for exactly one
+# vendor and NEEDED-link its GPU runtime at LOAD time (llama-server ->
+# libhipblas.so.3 + libamdhip64.so.7, audiocpp_server additionally
 # libhipblaslt.so.1), so those libs must be inside the image regardless of the
-# gpu overlay. Pinned to the ROCm release the host binaries were built against
-# (ROCm 7.2.3 — the rocm-smi driver version of this deployment). For an
-# NVIDIA build, replace this stage with
-#   FROM nvidia/cuda:<ver>-runtime-ubuntu24.04 AS cuda-libs
-# and stamp the CUDA libs from it instead (libcudart/libcublas/libcublasLt).
-ARG ROCM_VERSION=7.2.3
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete AS rocm-libs
+# gpu overlay. They are stamped from the HOST's ROCm install via the
+# 'rocm-closure' build context (build/rocm-closure/, materialized by
+# scripts/stamp-rocm-closure.sh — deploy.sh calls it before every build).
+# The host build is custom (TensileLite hipBLASLt, librocm_kpack, compressed
+# .dat.zlib kernel data under hipblaslt/library/gfx1201/) and shares only the
+# version number with the stock rocm/dev stage — mixing the two aborts
+# llama-server at the first GEMM ("Cannot read TensileLibrary_lazy_gfx1201.dat"
+# -> CUBLAS_STATUS_INTERNAL_ERROR). Every GPU lib in the image must come from
+# the same host build as the binaries. Re-stamp on ROCm upgrades. For an
+# NVIDIA build, stage the closure from a CUDA runtime image instead
+# (libcudart/libcublas/libcublasLt + device kernels).
 
 # Base: the host-built backend binaries are compiled on the deployment host
 # (Ubuntu 26.04, glibc 2.43) and refuse to load on older glibc, so the image
@@ -48,33 +52,37 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 RUN mkdir -p /opt/rocm/lib /opt/llama.cpp/build/bin
 
-# The ROCm runtime closure the stamped binaries load: the direct NEEDED libs
-# (libamdhip64.so.7, libhipblas.so.3, libhipblaslt.so.1) plus their
-# transitive deps from the pinned stage. AMD's official builds link their
-# sysdeps (elf/drm/numa/z/zstd) straight against the system — the apt
-# packages above provide those. The HIP libs carry $ORIGIN RUNPATHs, so they
-# must keep sitting in one flat dir (/opt/rocm/lib). Verified: full GPU
-# inference runs with ONLY these baked libs (the official libs embed their
-# per-GPU kernels, no host mount needed) — the gpu-rocm overlay therefore
-# exposes only the device nodes; bind-mounting the host's /opt/rocm would
-# shadow these copies with dangling /etc/alternatives symlinks and break
-# binaries whose RPATH lacks the host's versioned lib dir (radiance).
-COPY --from=rocm-libs /opt/rocm/lib/libamdhip64.so.7          /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/libhsa-runtime64.so.1     /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/librocprofiler-register.so.0 /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/libamd_comgr.so.3         /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/librocroller.so.1         /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/libroctx64.so.4           /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/libhipblas.so.3           /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/libhipblaslt.so.1         /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/librocblas.so.5           /opt/rocm/lib/
-COPY --from=rocm-libs /opt/rocm/lib/librocsolver.so.0         /opt/rocm/lib/
-# LLVM OpenMP runtime: the radiance CPU kernel plugins
-# (share/radiance/kernels/libavx.so, libref.so) NEEDED the unversioned
-# libomp.so, which the pinned ROCm stage does not ship. Stamped from the
-# host's ROCm LLVM dir (same 7.2.3 release the host binaries were built
-# against) via the rocm-llvm-libs build context.
-COPY --from=rocm-llvm-libs ./libomp.so                        /opt/rocm/lib/
+# The ROCm runtime closure the stamped binaries load — flat libs plus the
+# vendored $ORIGIN-relative dirs (rocm_sysdeps/, llvm/lib, host-math/lib)
+# their RPATHs resolve. Staged from the HOST by scripts/stamp-rocm-closure.sh
+# (see the header there for the custom-build vs stock-stage rationale).
+COPY --from=rocm-closure ./                                     /opt/rocm/lib/
+# The radiance CPU kernel plugins (share/radiance/kernels/libavx.so,
+# libref.so) NEEDED the unversioned libomp.so and resolve it via ldconfig —
+# which only scans the flat /opt/rocm/lib, not the llvm/lib subdir the HIP
+# libs' RPATH uses. Keep a flat copy for them.
+COPY --from=rocm-closure ./llvm/lib/libomp.so                   /opt/rocm/lib/
+# The HIP libs carry $ORIGIN RUNPATHs, so they keep sitting in one flat dir
+# (/opt/rocm/lib) next to their vendored subdirs. AMD's official builds link
+# their sysdeps (elf/drm/numa/z/zstd) through rocm_sysdeps — staged above;
+# the apt zlib1g/zstd1 packages stay as a fallback for system-linked libs.
+
+# GEMM kernel data for gfx1200/gfx1201 (RDNA4): rocBLAS and hipBLASLt do NOT
+# embed their kernels in the .so — they load TensileLibrary*.dat/.hsaco/.co
+# from these libdir subdirs at first GEMM (the model warmup run). Without
+# them llama-server dies during startup: "rocblaslt error: Cannot read
+# TensileLibrary_lazy_gfx1201.dat" + "rocBLAS error: Cannot read .../library/
+# TensileLibrary.dat" + "directory iterator cannot open directory
+# [/opt/rocm/lib/rocblas/library]" -> exit -6 -> llama-swap 503. Stamped from
+# the host's ROCm 7.2.3 install (same release as the .so closure above; the
+# contexts point at the host dirs, see docker-compose.yml additional_contexts).
+# rocblas/library carries the per-type fallback kernels + per-arch lazy index
+# (~11 MB), hipblaslt/library the gfx1201 contraction kernels (~163 MB);
+# rocisa is hipBLASLt's kernel-DSL runtime module. Re-stamp on ROCm upgrades,
+# same as the host-built binaries.
+COPY --from=rocm-rocblas-tensile   ./library /opt/rocm/lib/rocblas/library/
+COPY --from=rocm-hipblaslt-tensile ./library /opt/rocm/lib/hipblaslt/library/
+COPY --from=rocm-hipblaslt-tensile ./rocisa  /opt/rocm/lib/hipblaslt/rocisa/
 
 RUN printf '/opt/rocm/lib\n' > /etc/ld.so.conf.d/rocm.conf && ldconfig
 

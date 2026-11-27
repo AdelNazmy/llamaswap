@@ -1,0 +1,30 @@
+# Text chat model: Inkling-2-Mini
+name: Inkling-2-Mini
+description: "Inkling-2-Mini 26.2B-3.4B active MoE with image,text chat"
+command:
+  binary: /opt/lucebox/server/build-hip/luce_server
+  args:
+    - "/opt/models/inkling2/Inkling-2-Mini-Fast-IQ4_NL.gguf"
+    - "--target-device"
+    - "hip:0"
+    - "--max-ctx"
+    - "262144"
+    - "--kv-cache-dir"
+    - "~/kvcache"
+    - "--kv-cache-budget"
+    - "20480"
+    - "--no-tool-checks"
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+    GGML_CUDA_FORCE_MMQ: "1"
+    HSA_ENABLE_SDMA: "0"
+    GPU_MAX_HW_QUEUES: "1"
+
+
+host: 127.0.0.1
+port: 8101
+meta:
+  context_length: 262144
+  family: inkling
+  capabilities: [chat,vision]
+  vram_gb: 30

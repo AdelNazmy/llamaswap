@@ -35,7 +35,8 @@
 # except the optional Prism fork (llama_prism.cpp): when it is not built,
 # the plain llama-server is stamped in as llama-prism-server instead.
 #
-# Model weights: before starting (skipped by --build-only), deploy.sh checks
+# Model weights: before starting (skipped by --build-only and --no-download),
+# deploy.sh checks
 # the shared model root (MODEL_ROOT, default /opt/models) and downloads any
 # missing TTS/ASR/FLUX weights by running ./scripts/download-models.sh. The
 # one-shot init services (models-init / image-models-init) still run on
@@ -125,6 +126,12 @@ INCLUDE_IMAGE=1
 INCLUDE_STRATA=1
 STRATA_EXPLICIT=0
 DO_UP=1
+# Check/download model weights before starting (LLAMASWAP_NO_DOWNLOAD=1 or
+# --no-download skips — assumes weights are already in place).
+DO_DOWNLOAD=1
+case "${LLAMASWAP_NO_DOWNLOAD:-0}" in
+    1|true|yes|on) DO_DOWNLOAD=0 ;;
+esac
 VERIFY=0
 # Install/refresh llamaswap's provider + skills in the user's opencode
 # config (LLAMASWAP_INSTALL_OPENCODE=0 or --no-opencode disables).
@@ -154,6 +161,8 @@ Options:
   --strata        require the Strata overlay (missing files abort instead
                   of auto-skipping)
   --build-only    build the images without starting the stack
+  --no-download   skip the model-weights check/download (weights assumed
+                  present under MODEL_ROOT)
   --verify        smoke-test /health and /v1/models after starting
   --no-opencode   skip installing the llamaswap provider + skills into the
                   default opencode config (~/.config/opencode)
@@ -174,6 +183,7 @@ while [ $# -gt 0 ]; do
         --strata)     INCLUDE_STRATA=1; STRATA_EXPLICIT=1 ;;
         --no-strata)  INCLUDE_STRATA=0 ;;
         --build-only) DO_UP=0 ;;
+        --no-download) DO_DOWNLOAD=0 ;;
         --verify)     VERIFY=1 ;;
         --no-opencode) INSTALL_OPENCODE=0 ;;
         -h|--help)    usage 0 ;;
@@ -357,6 +367,21 @@ else
     echo "deploy: warning: no GPU visible; GPU backends will run CPU-only" >&2
 fi
 
+# --- ROCm runtime closure staging --------------------------------------------
+# The image's GPU runtime libs are stamped from the HOST's ROCm install — the
+# host build is custom (TensileLite hipBLASLt, librocm_kpack, compressed
+# kernel data) and does NOT match the stock rocm/dev stage of the same
+# version number. scripts/stamp-rocm-closure.sh materializes the ldd closure
+# into build/rocm-closure/ (the 'rocm-closure' build context). Non-ROCm
+# hosts stage an empty context; builds stay green.
+if [ -d /opt/rocm/lib ]; then
+    echo "==> staging ROCm runtime closure"
+    sh "$ROOT/scripts/stamp-rocm-closure.sh"
+else
+    echo "==> no host ROCm; skipping runtime closure staging"
+    mkdir -p "$ROOT/build/rocm-closure"
+fi
+
 # --- build in order: base -> audio -> image ---------------------------------
 # (strata builds nothing — it is a runtime-only overlay, see --strata)
 echo "==> [1/3] build base image (llama.cpp)"
@@ -439,11 +464,11 @@ ensure_aria2c() { # -> 0 once aria2c is on PATH
 }
 
 # --- model weights ---------------------------------------------------------
-# Runtime concern only; --build-only skips this. download-models.sh is
-# idempotent (skips files that already exist), but we ask it which of our
-# required bundles are missing and only invoke the download when there is
-# work to do.
-if [ "$DO_UP" = 1 ]; then
+# Runtime concern only; --build-only and --no-download skip this.
+# download-models.sh is idempotent (skips files that already exist), but we
+# ask it which of our required bundles are missing and only invoke the
+# download when there is work to do.
+if [ "$DO_UP" = 1 ] && [ "$DO_DOWNLOAD" = 1 ]; then
     NEEDED=
     if [ "$INCLUDE_AUDIO" = 1 ]; then
         NEEDED="$NEEDED tts asr whisper whisper-multi tts-qwen3 nemotron_asr supertonic_3"

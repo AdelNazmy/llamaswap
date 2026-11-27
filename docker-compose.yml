@@ -21,6 +21,25 @@ services:
         # release the host binaries were built against). Path follows the
         # ROCm 7.2.3 host layout; adjust for other installs.
         rocm-llvm-libs: /opt/rocm/core-10.2/lib/llvm/lib/x86_64-unknown-linux-gnu
+        # rocBLAS + hipBLASLt GEMM kernel data (Tensile .dat/.hsaco/.co). The
+        # libs do NOT embed their kernels: rocBLAS loads TensileLibrary*.dat
+        # from <libdir>/rocblas/library and hipBLASLt from
+        # <libdir>/hipblaslt/library at first GEMM (model warmup) — without
+        # them llama-server aborts on gfx1201 with "Cannot read
+        # TensileLibrary_lazy_gfx1201.dat" / "directory iterator cannot open
+        # directory [/opt/rocm/lib/rocblas/library]". Stamped from the host's
+        # 7.2.3 install (same release as the .so closure and the known-good
+        # host runtime set, gfx1200+gfx1201 only). Same rebuild-on-upgrade
+        # caveat as the host-built binaries.
+        rocm-rocblas-tensile: /opt/rocm/lib/rocblas
+        rocm-hipblaslt-tensile: /opt/rocm/lib/hipblaslt
+        # GPU runtime closure (libamdhip64, libhipblas{,lt}, librocblas,
+        # librocsolver + TensileLite/origami/kpack + rocm_sysdeps + libomp),
+        # staged by scripts/stamp-rocm-closure.sh (called from deploy.sh)
+        # from the HOST's custom ROCm build. The stock rocm/dev stage of the
+        # same version is a different build — mixing them aborts llama-server
+        # at the first GEMM. Never stamp these libs from a registry stage.
+        rocm-closure: ./build/rocm-closure
     init: true
     container_name: llamaswap
     restart: unless-stopped
